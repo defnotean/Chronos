@@ -41,6 +41,7 @@ from chronos_1t.models.chronos_moe_block import (
     unbind_2d_permuted_hadamard,
     unpack_nvfp4,
 )
+from chronos_1t.models.vllm_chronos_moe import dequantize_mxfp8
 
 MODEL_DIR = Path("/home/defnotean/pb27/hf/flash_next_nvfp4")
 OUT_CKPT_DIR = Path("/home/defnotean/pb27/hf/flash_next_chronos_v6")
@@ -65,22 +66,55 @@ def unpack_nvfp4_batched(
 
 
 @torch.no_grad()
-def batched_subspace_eckart_young(
+def batched_full_spectrum_row_gram_smw_healer(
     targets: torch.Tensor,
-    v_act: torch.Tensor,
-    s_act: torch.Tensor,
-    svd_rank: int = 32,
+    v_rt: torch.Tensor,
+    s_rt: torch.Tensor,
+    expert_router_vecs: torch.Tensor,
+    svd_rank: int = 64,
+    alpha_global: float = 6.0,
+    alpha_local: float = 8.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Batched Subspace Eckart-Young Rank-r Healer for `targets` of shape (B, 1280, 2560)."""
-    # targets @ v_act -> (B, 1280, 64)
-    w_sub = torch.matmul(targets, v_act) * s_act.view(1, 1, -1)
-    u_sub, s_sub, vh_sub = torch.linalg.svd(w_sub, full_matrices=False)
-    r = min(svd_rank, u_sub.shape[-1])
-    u_r = (u_sub[:, :, :r] * s_sub[:, :r].unsqueeze(1)).to(torch.float8_e4m3fn)
-    v_unscaled = vh_sub[:, :r, :] / (s_act.view(1, 1, -1) + 1e-8)
-    v_r = torch.matmul(v_unscaled, v_act.T).to(torch.float8_e4m3fn)
-    h_full = torch.bmm(u_r.float(), v_r.float())
-    return u_r, v_r, h_full
+    """
+    v6.8 Whitened-Spectrum 2560-dim SMW Healer for `gate_up_proj` of shape (B=8, 1280, 2560):
+    1. Preserves all 2560 input dimensions via `I_2560 + V_rt diag(g) V_rt^T` (zero subspace blindness).
+    2. Normalizes `s_rt` against `s_rt[2]` with a flat `0.30` exponent so capability domains in
+       `vh_rt[36:128]` receive full SVD priority above the Marchenko-Pastur noise floor.
+    3. Uses fast batched subspace iteration (`torch.svd_lowrank`) + compact r x r re-orthogonalization
+       and balanced sqrt(Sigma) scaling into `float8_e4m3fn`.
+    """
+    _, rows, _ = targets.shape
+    s_ref = s_rt[2].clamp_min(1e-8)
+    g_glob = alpha_global * (s_rt / s_ref).clamp(max=1.2).pow(0.30).view(1, 1, -1)
+    inv_glob = g_glob / (1.0 + g_glob)
+
+    t_proj = torch.matmul(targets, v_rt)
+    t_w = targets + torch.matmul(t_proj * g_glob, v_rt.T)
+
+    r_unit = F.normalize(expert_router_vecs, dim=-1).unsqueeze(-1)
+    t_loc = torch.bmm(t_w, r_unit)
+    t_w = t_w + alpha_local * torch.bmm(t_loc, r_unit.transpose(1, 2))
+
+    q_rank = min(svd_rank + 16, rows)
+    u_sub, _, _ = torch.svd_lowrank(t_w, q=q_rank, niter=2)
+    u_top = u_sub[:, :, :svd_rank].contiguous()
+
+    v_w = torch.bmm(u_top.transpose(1, 2), t_w)
+
+    inv_loc = alpha_local / (1.0 + alpha_local)
+    v_loc_proj = torch.bmm(v_w, r_unit)
+    v_unw = v_w - inv_loc * torch.bmm(v_loc_proj, r_unit.transpose(1, 2))
+
+    v_glob_proj = torch.matmul(v_unw, v_rt)
+    v_true = v_unw - torch.matmul(v_glob_proj * inv_glob, v_rt.T)
+
+    u_v, s_v, vh_v = torch.linalg.svd(v_true, full_matrices=False)
+    u_opt = torch.bmm(u_top, u_v)
+    sqrt_s = s_v.clamp_min(1e-8).sqrt().unsqueeze(-1)
+    u_bal = (u_opt * sqrt_s.transpose(1, 2)).to(torch.float8_e4m3fn)
+    v_bal = (vh_v * sqrt_s).to(torch.float8_e4m3fn)
+    h_full = torch.bmm(u_bal.float(), v_bal.float())
+    return u_bal, v_bal, h_full
 
 
 @torch.no_grad()
@@ -88,29 +122,34 @@ def batched_exact_gram_smw_healer(
     targets: torch.Tensor,
     v_acts: torch.Tensor,
     s_acts: torch.Tensor,
-    svd_rank: int = 32,
-    alpha: float = 16.0,
+    svd_rank: int = 64,
+    alpha: float = 6.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Batched Exact Gram Eigendecomposition Rank-r SMW Healer for `down_proj` (B, 2560, 640).
-    Uses exact symmetric eigendecomposition on G = T^T T in R^{B x 640 x 640} instead of iterative svd_lowrank!
-    """
-    # targets: (B, 2560, 640), v_acts: (B, 640, K), s_acts: (B, K)
-    gain = alpha * (s_acts / (s_acts[:, 0:1] + 1e-12)).unsqueeze(1)  # (B, 1, K)
+    """v6.8 Whitened-Spectrum Balanced-FP8 Full-Spectrum SMW Healer for `down_proj` (B, 2560, 640)."""
+    s_ref = s_acts[:, 2:3].clamp_min(1e-8)
+    gain = alpha * (s_acts / s_ref).clamp(max=1.2).pow(0.30).unsqueeze(1)
     inv_gain = gain / (1.0 + gain)
-    t_proj = torch.bmm(targets, v_acts)  # (B, 2560, K)
-    t_weighted = targets + torch.bmm(t_proj * gain, v_acts.transpose(1, 2))  # (B, 2560, 640)
+    t_proj = torch.bmm(targets, v_acts)
+    t_weighted = targets + torch.bmm(t_proj * gain, v_acts.transpose(1, 2))
 
-    # Exact symmetric Gram matrix (B, 640, 640)
-    gram = torch.bmm(t_weighted.transpose(1, 2), t_weighted)
-    evals, evecs = torch.linalg.eigh(gram)  # ascending order
-    vh_top = evecs[:, :, -svd_rank:].flip(dims=[-1]).transpose(1, 2).contiguous()  # (B, r, 640)
-    u_scaled = torch.bmm(t_weighted, vh_top.transpose(1, 2))  # (B, 2560, r)
-    u_r = u_scaled.to(torch.float8_e4m3fn)
+    q_rank = min(svd_rank + 16, targets.shape[-1])
+    u_sub, s_sub, v_sub = torch.svd_lowrank(t_weighted, q=q_rank, niter=2)
+    vh_top = v_sub[:, :, :svd_rank].transpose(1, 2).contiguous()
+    u_true = u_sub[:, :, :svd_rank] * s_sub[:, :svd_rank].unsqueeze(1)
 
-    vh_proj = torch.bmm(vh_top, v_acts)  # (B, r, K)
-    v_r = (vh_top - torch.bmm(vh_proj * inv_gain, v_acts.transpose(1, 2))).to(torch.float8_e4m3fn)
-    h_full = torch.bmm(u_r.float(), v_r.float())
-    return u_r, v_r, h_full
+    vh_proj = torch.bmm(vh_top, v_acts)
+    v_true = vh_top - torch.bmm(vh_proj * inv_gain, v_acts.transpose(1, 2))
+
+    u_u, s_u, vh_u = torch.linalg.svd(u_true, full_matrices=False)
+    v_rot = torch.bmm(vh_u, v_true)
+    v_norms = torch.linalg.norm(v_rot, dim=-1, keepdim=True).clamp_min(1e-8)
+    v_unit = v_rot / v_norms
+    s_eff = s_u.unsqueeze(-1) * v_norms
+    sqrt_s = s_eff.clamp_min(1e-8).sqrt()
+    u_bal = (u_u * sqrt_s.transpose(1, 2)).to(torch.float8_e4m3fn)
+    v_bal = (v_unit * sqrt_s).to(torch.float8_e4m3fn)
+    h_full = torch.bmm(u_bal.float(), v_bal.float())
+    return u_bal, v_bal, h_full
 
 
 @torch.no_grad()
@@ -119,12 +158,24 @@ def pack_tail_batched(
     bits: int,
     block_size: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Batched tail lattice packer & unpacker for shape (B, rows, cols)."""
+    """Batched tail lattice packer & unpacker with 2-iteration Least-Squares Optimal Block Scale."""
     bsz, rows, cols = res_tail.shape
     device = res_tail.device
     if bits == 2:
+        lut = torch.tensor(LLOYD_MAX_2BIT_LUT, dtype=torch.float32, device=device)
         blocks = res_tail.reshape(bsz, -1, block_size)
         sigma = blocks.pow(2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-6, max=448.0)
+
+        for _ in range(2):
+            z_blk = blocks / sigma.clamp_min(1e-8)
+            codes_blk = torch.zeros_like(z_blk, dtype=torch.uint8)
+            codes_blk = torch.where(z_blk >= -0.981599, torch.ones_like(codes_blk), codes_blk)
+            codes_blk = torch.where(z_blk >= 0.0, torch.full_like(codes_blk, 2), codes_blk)
+            codes_blk = torch.where(z_blk >= 0.981599, torch.full_like(codes_blk, 3), codes_blk)
+            q_blk = lut[codes_blk.long()]
+            sigma_opt = (blocks * q_blk).sum(dim=-1, keepdim=True) / (q_blk.pow(2).sum(dim=-1, keepdim=True) + 1e-12)
+            sigma = sigma_opt.clamp(min=1e-6, max=448.0)
+
         sigma_fp8 = sigma.to(torch.float8_e4m3fn)
         z = (blocks / sigma_fp8.float().clamp_min(1e-8)).reshape(bsz, rows, cols)
 
@@ -140,7 +191,6 @@ def pack_tail_batched(
         packed_u8 = (c0 | c1 | c2 | c3).to(torch.uint8)
         scales_out = sigma_fp8.view(bsz, rows, cols // block_size)
 
-        lut = torch.tensor(LLOYD_MAX_2BIT_LUT, dtype=torch.float32, device=device)
         vals = lut[codes.long()].view(bsz, rows, cols // block_size, block_size)
         deq = (vals * scales_out.float().unsqueeze(-1)).view(bsz, rows, cols)
         return packed_u8, scales_out, deq
@@ -189,12 +239,13 @@ def convert_expert_group_batched(
     gate_w: torch.Tensor,
     up_w: torch.Tensor,
     down_w: torch.Tensor,
+    router_group_w: torch.Tensor,
     x_cal: torch.Tensor,
-    v_act_x: torch.Tensor,
-    s_act_x: torch.Tensor,
+    v_rt_256: torch.Tensor,
+    s_rt_256: torch.Tensor,
     h128: torch.Tensor,
-    svd_rank: int = 32,
-    gu_tail_bits: int = 16,
+    svd_rank: int = 48,
+    gu_tail_bits: int = 2,
     down_tail_bits: int = 2,
 ) -> dict[str, torch.Tensor]:
     """Batched GPU conversion of K=8 experts (`gate_w`: (8, 640, 2560), `down_w`: (8, 2560, 640))."""
@@ -206,7 +257,9 @@ def convert_expert_group_batched(
         generate_expert_1d_keys(1280, 2560, m, seed_base=101 + group_idx * 8, device=device)
         for m in range(m_cnt)
     ]
-    _, _, init_healers_gu = batched_subspace_eckart_young(gu_experts, v_act_x, s_act_x, svd_rank=svd_rank)
+    _, _, init_healers_gu = batched_full_spectrum_row_gram_smw_healer(
+        gu_experts, v_rt_256, s_rt_256, router_group_w, svd_rank=svd_rank
+    )
 
     s_gu_accum = torch.zeros((1280, 2560), device=device, dtype=torch.float32)
     smooth_gu = gu_experts - init_healers_gu
@@ -225,39 +278,65 @@ def convert_expert_group_batched(
         dim=0,
     )  # (8, 1280, 2560)
 
-    # Batched projection on x_cal[:256] to compute beta_gu
-    x_sub = x_cal[:256]  # (256, 2560)
-    y_tail_gu = torch.matmul(x_sub.unsqueeze(0), smooth_gu.transpose(1, 2))    # (8, 256, 1280)
-    y_holo_gu = torch.matmul(x_sub.unsqueeze(0), h_unbind_gu.transpose(1, 2))  # (8, 256, 1280)
-    beta_gu = (y_tail_gu * y_holo_gu).sum(dim=(1, 2)) / ((y_holo_gu * y_holo_gu).sum(dim=(1, 2)) + 1e-12)  # (8,)
+    x_sub = x_cal  # all 512 exact normalized router centroids
+    y_tail_gu = torch.matmul(x_sub.unsqueeze(0), smooth_gu.transpose(1, 2))
+    y_holo_gu = torch.matmul(x_sub.unsqueeze(0), h_unbind_gu.transpose(1, 2))
+    beta_gu = (y_tail_gu * y_holo_gu).sum(dim=(1, 2)) / ((y_holo_gu * y_holo_gu).sum(dim=(1, 2)) + 1e-12)
 
     res_gu = gu_experts - beta_gu.view(m_cnt, 1, 1) * h_unbind_gu
-    u_gu, v_gu, h_gu_final = batched_subspace_eckart_young(res_gu, v_act_x, s_act_x, svd_rank=svd_rank)
-    gu_tail_packed, gu_tail_scale, e_gu_deq = pack_tail_batched(res_gu - h_gu_final, bits=gu_tail_bits, block_size=32)
+    tail_target_gu = res_gu - init_healers_gu
+    gu_tail_packed, gu_tail_scale, e_gu_deq = pack_tail_batched(
+        tail_target_gu, bits=gu_tail_bits, block_size=32
+    )
+
+    u_gu, v_gu, h_gu_final = batched_full_spectrum_row_gram_smw_healer(
+        res_gu - e_gu_deq, v_rt_256, s_rt_256, router_group_w, svd_rank=svd_rank
+    )
+
+    rem_after_gu = gu_experts - (h_gu_final + e_gu_deq)
+    y_rem_gu = torch.matmul(x_sub.unsqueeze(0), rem_after_gu.transpose(1, 2))
+    beta_gu = (y_rem_gu * y_holo_gu).sum(dim=(1, 2)) / ((y_holo_gu * y_holo_gu).sum(dim=(1, 2)) + 1e-12)
+
+    gu_hat_raw = beta_gu.view(m_cnt, 1, 1) * h_unbind_gu + h_gu_final + e_gu_deq
+    z_true_gu = torch.matmul(x_sub.unsqueeze(0), gu_experts.transpose(1, 2))
+    z_hat_gu = torch.matmul(x_sub.unsqueeze(0), gu_hat_raw.transpose(1, 2))
+    gamma_gu = (
+        torch.linalg.norm(z_true_gu.reshape(m_cnt, -1), dim=-1)
+        / (torch.linalg.norm(z_hat_gu.reshape(m_cnt, -1), dim=-1) + 1e-12)
+    ).clamp(0.98, 1.12)
+
+    beta_gu = beta_gu * gamma_gu
+    u_gu = (u_gu.float() * gamma_gu.view(m_cnt, 1, 1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    gu_tail_scale = (gu_tail_scale.float() * gamma_gu.view(m_cnt, 1, 1)).clamp(1e-6, 448.0).to(torch.float8_e4m3fn)
+    h_gu_final = torch.bmm(u_gu.float(), v_gu.float())
+    e_gu_deq = e_gu_deq * gamma_gu.view(m_cnt, 1, 1)
 
     gu_hat = beta_gu.view(m_cnt, 1, 1) * h_unbind_gu + h_gu_final + e_gu_deq
     rec_g = gu_hat[:, :640, :]
     rec_u = gu_hat[:, 640:, :]
 
-    # 2. Batched Coupled SwiGLU Drift Target + Exact Gram SMW Healer for down_proj (8, 2560, 640)
-    h_true_c = F.silu(torch.matmul(x_sub.unsqueeze(0), gate_w.transpose(1, 2))) * torch.matmul(x_sub.unsqueeze(0), up_w.transpose(1, 2))  # (8, 256, 640)
-    h_hat_c = F.silu(torch.matmul(x_sub.unsqueeze(0), rec_g.transpose(1, 2))) * torch.matmul(x_sub.unsqueeze(0), rec_u.transpose(1, 2))    # (8, 256, 640)
+    # 2. Expert-Affinity Weighted SwiGLU Calibration + MP-Denoised Post-Tail SMW Healer for down_proj (8, 2560, 640)
+    aff_logits = torch.matmul(router_group_w, x_sub.T)
+    aff_weights = (F.softmax(aff_logits * 2.0, dim=-1) * float(x_sub.shape[0])).clamp(min=0.25, max=6.0).sqrt().unsqueeze(-1)
 
-    _, s_h_all, vh_h_all = torch.linalg.svd(h_hat_c, full_matrices=False)  # vh_h_all: (8, 256, 640)
-    v_h_batch = vh_h_all[:, :192, :].transpose(1, 2).contiguous()          # (8, 640, 192)
-    s_h_batch = s_h_all[:, :192].contiguous()                              # (8, 192)
+    h_true_c = (F.silu(torch.matmul(x_sub.unsqueeze(0), gate_w.transpose(1, 2))) * torch.matmul(x_sub.unsqueeze(0), up_w.transpose(1, 2))) * aff_weights
+    h_hat_c = (F.silu(torch.matmul(x_sub.unsqueeze(0), rec_g.transpose(1, 2))) * torch.matmul(x_sub.unsqueeze(0), rec_u.transpose(1, 2))) * aff_weights
 
-    y_true_d = torch.bmm(h_true_c, down_w.transpose(1, 2))                 # (8, 256, 2560)
-    u_hm = vh_h_all[:, :64, :].transpose(1, 2).contiguous()                # (8, 640, 64)
-    hm_sub = torch.bmm(h_hat_c, u_hm)                                      # (8, 256, 64)
-    delta_y = y_true_d - torch.bmm(h_hat_c, down_w.transpose(1, 2))        # (8, 256, 2560)
-    gram_h = torch.bmm(hm_sub.transpose(1, 2), hm_sub)                     # (8, 64, 64)
+    _, s_h_all, vh_h_all = torch.linalg.svd(h_hat_c, full_matrices=False)
+    v_h_batch = vh_h_all[:, :256, :].transpose(1, 2).contiguous()
+    s_h_batch = s_h_all[:, :256].contiguous()
+
+    y_true_d = torch.bmm(h_true_c, down_w.transpose(1, 2))
+    u_hm = vh_h_all[:, :48, :].transpose(1, 2).contiguous()
+    hm_sub = torch.bmm(h_hat_c, u_hm)
+    delta_y = y_true_d - torch.bmm(h_hat_c, down_w.transpose(1, 2))
+    gram_h = torch.bmm(hm_sub.transpose(1, 2), hm_sub)
     diag_mean = torch.diagonal(gram_h, dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).unsqueeze(-1)
-    reg_eye = 0.03 * diag_mean * torch.eye(64, device=device).unsqueeze(0)
-    delta_w = torch.bmm(torch.bmm(delta_y.transpose(1, 2), hm_sub), torch.linalg.inv(gram_h + reg_eye))  # (8, 2560, 64)
-    down_targets = down_w + torch.bmm(delta_w, u_hm.transpose(1, 2))       # (8, 2560, 640)
+    reg_eye = 0.20 * diag_mean * torch.eye(48, device=device).unsqueeze(0)
+    delta_w = torch.bmm(torch.bmm(delta_y.transpose(1, 2), hm_sub), torch.linalg.inv(gram_h + reg_eye))
+    down_targets = down_w + 0.30 * torch.bmm(delta_w, u_hm.transpose(1, 2))
 
-    _, _, init_healers_down = batched_exact_gram_smw_healer(down_targets, v_h_batch, s_h_batch, svd_rank=svd_rank, alpha=16.0)
+    _, _, init_healers_down = batched_exact_gram_smw_healer(down_w, v_h_batch, s_h_batch, svd_rank=svd_rank)
 
     down_keys = [
         generate_expert_1d_keys(2560, 640, m, seed_base=303 + group_idx * 8, device=device)
@@ -278,16 +357,39 @@ def convert_expert_group_batched(
             for m in range(m_cnt)
         ],
         dim=0,
-    )  # (8, 2560, 640)
+    )
 
-    rem_t_down = down_targets - init_healers_down
+    rem_t_down = down_w - init_healers_down
     y_tail_d = torch.bmm(h_hat_c, rem_t_down.transpose(1, 2))
     y_holo_d = torch.bmm(h_hat_c, h_unbind_down.transpose(1, 2))
-    beta_down = (y_tail_d * y_holo_d).sum(dim=(1, 2)) / ((y_holo_d * y_holo_d).sum(dim=(1, 2)) + 1e-12)  # (8,)
+    beta_down = (y_tail_d * y_holo_d).sum(dim=(1, 2)) / ((y_holo_d * y_holo_d).sum(dim=(1, 2)) + 1e-12)
 
-    res_down = down_targets - beta_down.view(m_cnt, 1, 1) * h_unbind_down
-    u_down, v_down, h_down_final = batched_exact_gram_smw_healer(res_down, v_h_batch, s_h_batch, svd_rank=svd_rank, alpha=16.0)
-    down_tail_packed, down_tail_scale, _ = pack_tail_batched(res_down - h_down_final, bits=down_tail_bits, block_size=32)
+    res_down_clean = down_w - beta_down.view(m_cnt, 1, 1) * h_unbind_down
+    tail_target_d = res_down_clean - init_healers_down
+    down_tail_packed, down_tail_scale, e_down_deq = pack_tail_batched(
+        tail_target_d, bits=down_tail_bits, block_size=32
+    )
+
+    u_down, v_down, h_down_final = batched_exact_gram_smw_healer(
+        (down_targets - beta_down.view(m_cnt, 1, 1) * h_unbind_down) - e_down_deq,
+        v_h_batch,
+        s_h_batch,
+        svd_rank=svd_rank,
+    )
+    rem_after_d = down_targets - (h_down_final + e_down_deq)
+    y_rem_d = torch.bmm(h_hat_c, rem_after_d.transpose(1, 2))
+    beta_down = (y_rem_d * y_holo_d).sum(dim=(1, 2)) / ((y_holo_d * y_holo_d).sum(dim=(1, 2)) + 1e-12)
+
+    down_hat_raw = beta_down.view(m_cnt, 1, 1) * h_unbind_down + h_down_final + e_down_deq
+    y_hat_d = torch.bmm(h_hat_c, down_hat_raw.transpose(1, 2))
+    gamma_down = (
+        torch.linalg.norm(y_true_d.reshape(m_cnt, -1), dim=-1)
+        / (torch.linalg.norm(y_hat_d.reshape(m_cnt, -1), dim=-1) + 1e-12)
+    ).clamp(0.98, 1.12)
+
+    beta_down = beta_down * gamma_down
+    u_down = (u_down.float() * gamma_down.view(m_cnt, 1, 1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    down_tail_scale = (down_tail_scale.float() * gamma_down.view(m_cnt, 1, 1)).clamp(1e-6, 448.0).to(torch.float8_e4m3fn)
 
     return {
         "s_gu.weight": s_gu_packed.contiguous().cpu(),
@@ -317,8 +419,9 @@ def convert_single_layer(
     out_dir: Path,
     device: torch.device,
     h128: torch.Tensor,
-    gu_bits: int = 1,
+    gu_bits: int = 2,
     down_bits: int = 2,
+    svd_rank: int = 48,
     force: bool = False,
 ) -> tuple[str, float, float]:
     shard_name = f"chronos-layer-{l_idx:05d}-of-00048.safetensors"
@@ -338,16 +441,10 @@ def convert_single_layer(
         return st_cache[sf].get_tensor(key)
 
     router_w = get_t(f"{prefix}.gate.weight").to(device=device, dtype=torch.float32)
-    torch.manual_seed(2026 + l_idx)
     _, s_rt, vh_rt = torch.linalg.svd(router_w, full_matrices=False)
-    u_ctx = vh_rt[:48, :].T
-    w_ctx = ((s_rt[:48] / s_rt[0]) ** 1.5).unsqueeze(0)
-
-    z_cal = torch.randn(512, 48, device=device) * w_ctx
-    x_cal = F.rms_norm(z_cal @ u_ctx.T + torch.randn(512, 2560, device=device) * 0.01, (2560,), eps=1e-6)
-    _, s_act_x, vh_act_x = torch.linalg.svd(x_cal, full_matrices=False)
-    v_act_x = vh_act_x[:64, :].T.contiguous()
-    s_act_x_sub = s_act_x[:64].contiguous()
+    v_rt_256 = vh_rt[:256, :].T.contiguous()
+    s_rt_256 = s_rt[:256].contiguous()
+    x_cal = F.rms_norm(router_w, (2560,), eps=1e-6)
 
     layer_shard_dict: dict[str, torch.Tensor] = {
         f"{prefix}.gate.weight": get_t(f"{prefix}.gate.weight"),
@@ -392,11 +489,12 @@ def convert_single_layer(
             gate_w=gate_w,
             up_w=up_w,
             down_w=down_w,
+            router_group_w=router_w[e_start : e_start + 8],
             x_cal=x_cal,
-            v_act_x=v_act_x,
-            s_act_x=s_act_x_sub,
+            v_rt_256=v_rt_256,
+            s_rt_256=s_rt_256,
             h128=h128,
-            svd_rank=32,
+            svd_rank=svd_rank,
             gu_tail_bits=gu_bits,
             down_tail_bits=down_bits,
         )
@@ -417,8 +515,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--start-layer", type=int, default=0)
     parser.add_argument("--end-layer", type=int, default=47)
-    parser.add_argument("--gu-bits", type=int, default=1, help="1=1-bit Compact (34.5GB), 16=Ternary (39GB), 2=Ultra (44.7GB)")
+    parser.add_argument("--layer-step", type=int, default=1)
+    parser.add_argument("--gu-bits", type=int, default=2, help="1=1-bit Compact (34.5GB), 16=Ternary (39GB), 2=Ultra (45.0GB)")
     parser.add_argument("--down-bits", type=int, default=2)
+    parser.add_argument("--svd-rank", type=int, default=64)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--skip-compose", action="store_true")
     parser.add_argument("--out-dir", default=str(OUT_CKPT_DIR))
@@ -431,14 +531,14 @@ def main() -> None:
     h128 = build_hadamard_128(device)
 
     print("=" * 116)
-    print(f"BATCHED GPU STREAMING CONVERSION: LAYERS {args.start_layer}..{args.end_layer} -> {out_dir}")
+    print(f"BATCHED GPU STREAMING CONVERSION (v6.8): LAYERS {args.start_layer}..{args.end_layer} (step={args.layer_step}) -> {out_dir}")
     print("=" * 116)
 
     converted_map: dict[int, str] = {}
     total_mb = 0.0
     t_all = time.perf_counter()
 
-    for l_idx in range(args.start_layer, args.end_layer + 1):
+    for l_idx in range(args.start_layer, args.end_layer + 1, args.layer_step):
         sname, mb, dt = convert_single_layer(
             l_idx=l_idx,
             idx_map=idx_map,
@@ -447,6 +547,7 @@ def main() -> None:
             h128=h128,
             gu_bits=args.gu_bits,
             down_bits=args.down_bits,
+            svd_rank=args.svd_rank,
             force=args.force,
         )
         converted_map[l_idx] = sname

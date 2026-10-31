@@ -65,14 +65,25 @@ Evaluated across Early (`Layer 0`), Middle (`Layer 23`), and Final (`Layer 47`) 
 | **Round 6 (`v6 Zero-Con 33.8GB`)**: 8:1 Bank + R32 SVD + **2-Bit Tail + EMA-32 Cache** | **`33.8 GB`** | **`-40.2 GB`** | **`90.26%`** | **`99.81%`** | **`99.89%`** | **`100.00%`** | **`99.48%`** | **`0.00035`** | **`0.472 ms` (`1.30x`)** |
 | **Round 6 (`v6 Max-Fidelity 44GB`)**: 4:1/2:1 Bank + R64/R256 + **2-Bit Tail + EMA-64 Cache** | **`44.0 GB`** | **`-30.0 GB`** | **`96.35%`** | **`99.97%`** | **`99.98%`** | **`100.00%`** | **`99.48%`** | **`0.00006`** | **`0.475 ms` (`1.29x`)** |
 
-### 2.5 Byte-Packed `.safetensors` Checkpoint Conversion & Chained 1,536-Expert Verification (`flash_next_chronos_v6`)
-Converted `PB27Qwen4ExpForConditionalGeneration` (`flash_next_nvfp4`, 512 routed experts/layer = 64 Holographic Groups/layer) into standalone byte-packed `.safetensors` shards (`chronos-layer-XXXXX-of-00048.safetensors`, `736.24 MB/layer` vs `1,350.00 MB/layer` stock; `34.51 GiB` for all 48 layers vs `63.28 GiB` stock) and verified chained multi-layer execution (`Layers 0 → 1 → 2`, `1,536` routed experts) directly from disk:
+### 2.5 Full 48-Layer (`24,576`-Expert) Byte-Packed `.safetensors` Checkpoint Conversion & 6-Domain Capability Suite (`flash_next_chronos_v6.8`)
+Converted all 48 layers of `PB27Qwen4ExpForConditionalGeneration` (`flash_next_nvfp4`, `48 × 512 = 24,576` routed experts = `3,072` Holographic Groups) into standalone byte-packed `.safetensors` shards (`chronos-layer-00000-of-00048.safetensors` through `chronos-layer-00047-of-00048.safetensors` in `/home/defnotean/pb27/hf/flash_next_chronos_v6`) and verified sequential 48-layer deep chaining (`Layer 0 → Layer 1 → ... → Layer 47 → 248,320-vocab lm_head`) across 6 capability domains (`CUDA_CPP_SYSTEMS`, `MATH_FORMAL_PROOF`, `MULTILINGUAL_RARE`, `QUANTUM_PHYSICS`, `CRISPR_GENOMICS`, and `ADVERSARIAL_8TOK_CHURN`):
 
-| Chained Multi-Layer Verification (`1,536` Routed Experts across `Layers 0..2`) | Shard Size / Layer | 48-Layer MoE Footprint | Chained Hidden Cos | 248K Logit Cos | **Top-1 Exact Match** | **Top-5 Overlap** | **KL Div (nats)** |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`BEFORE`: Stock `flash_next_nvfp4` (`1,536` Experts)** | `1,350.00 MB` | `63.28 GiB` | `100.00%` | `100.00%` | **`100.00%` (`115/115`)** | **`100.00%`** | `0.00000` |
-| **`AFTER`: Chronos `v6` Pure Cold (`0%` Cache, 100% Holographic + SVD + Tail)** | **`736.24 MB`** | **`34.51 GiB`** | **`99.68%`** | **`99.70%`** | **`100.00%` (`115/115`)** | **`89.22%`** | **`0.00118`** |
-| **`AFTER`: Chronos `v6` Hybrid EMA-48 Ring Cache** | **`736.24 MB`** | **`34.51 GiB`** | **`100.00%`** | **`100.00%`** | **`100.00%` (`115/115`)** | **`99.83%`** | **`0.00000`** |
+| 48-Layer Chained Regime (`24,576` Routed Experts, `Layers 0..47`) | Pure Routed MoE Cos (`0% x_init`, `0% shared`) | Chained Hidden Cos | 248K Logit Cos | **Top-1 Exact Match** | **Top-5 Overlap** | **KL Div (nats)** |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`BEFORE`: Stock `flash_next_nvfp4` (`63.28 GiB` MoE)** | `100.00%` | `100.00%` | `100.00%` | **`100.00%` (`160/160`)** | **`100.00%`** | `0.00000` |
+| **Chronos `v6.2` Pure Cold (`0%` Cache, Pre-Fix Baseline)** | `66.15%` | `96.15%` | `97.14%` | `66.25%` | `68.50%` | `0.01563` |
+| **Chronos `v6.8` Cumulative Pure Cold (`0%` Cache, All 48 Layers)** | **`94.11%` (`+27.96%`)** | **`99.42%`** | **`99.57%`** | **`83.75%`** | **`86.75%`** | **`0.00214`** |
+| **Chronos `v6.8` Autonomous Free-Running Pure Cold (`0%` Cache)** | **`92.78%` (`+30.78%`)** | **`99.15%`** | **`99.38%`** | **`78.12%`** | **`83.75%`** | **`0.00302`** |
+| **Chronos `v6.8` Autonomous Hybrid EMA-48 Ring Cache (`48/512` Slots)** | **`100.00%`** | **`100.00%`** | **`100.00%`** | **`100.00%` (`160/160`)** | **`99.88%`** | **`0.00000`** |
+
+| Capability Domain (`48` Layers Chained) | Tokens | Pure-Cold (`0%` Cache) Top-1 | **Hybrid EMA-48 Top-1** | **Hybrid EMA-48 Top-5** | **Hybrid EMA-48 KL Div** |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **`CUDA_CPP_SYSTEMS`** | `24` | `91.67%` | **`100.00%`** | **`100.00%`** | **`0.00000`** |
+| **`MATH_FORMAL_PROOF`** | `24` | `66.67%` | **`100.00%`** | **`100.00%`** | **`0.00000`** |
+| **`MULTILINGUAL_RARE`** | `24` | `87.50%` | **`100.00%`** | **`100.00%`** | **`0.00000`** |
+| **`QUANTUM_PHYSICS`** | `24` | `91.67%` | **`100.00%`** | **`100.00%`** | **`0.00000`** |
+| **`CRISPR_GENOMICS`** | `24` | `83.33%` | **`100.00%`** | **`100.00%`** | **`0.00000`** |
+| **`ADVERSARIAL_8TOK_CHURN`** | `40` | `82.50%` | **`100.00%`** | **`99.50%`** | **`0.00000`** |
 
 ---
 
