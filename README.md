@@ -85,6 +85,20 @@ Converted all 48 layers of `PB27Qwen4ExpForConditionalGeneration` (`flash_next_n
 | **`CRISPR_GENOMICS`** | `24` | `83.33%` | **`100.00%`** | **`100.00%`** | **`0.00000`** |
 | **`ADVERSARIAL_8TOK_CHURN`** | `40` | `82.50%` | **`100.00%`** | **`99.50%`** | **`0.00000`** |
 
+### Live End-to-End 48-Layer Text & Code Generation (`110` Real Completion Tokens vs Live `pb27-vllm`)
+
+Executed via [`benchmarks/live_e2e_text_generation_test.py`](benchmarks/live_e2e_text_generation_test.py) ([`assets/live_e2e_text_generation_report.json`](assets/live_e2e_text_generation_report.json)), querying the live `pb27-vllm` server (`http://127.0.0.1:8000/v1/completions`, `temperature=0.0`), embedding real completion tokens via `embed_tokens.weight`, streaming through all 48 converted layers (`24,576` routed experts), projecting through the `248,320`-vocab `lm_head.weight`, and decoding with the Qwen tokenizer (`tokenizer.json`):
+
+| Domain | Stock `pb27-vllm` (`63.3 GiB`) & Chronos `v6.8` (`50.2 GiB`) Decoded Text Output | Cum-Cold (`0%` Cache) | Auto-Cold (`0%` Cache) | **EMA-48 (`9.4%` Cache)** |
+| :--- | :--- | :---: | :---: | :---: |
+| **`CUDA_CPP_SYSTEMS`** | `__device__ __forceinline__ float warp_reduce_sum(float val) {\n    for (int offset = 16; offset > 0; offset >>= 1) ...` | **`100.0%`** (`94.43%` RoutedCos) | **`100.0%`** (`93.14%` RoutedCos) | **`100.0%`** (`100.00%` RoutedCos) |
+| **`MATH_FORMAL_PROOF`** | `"By Lagrange's theorem, the order of the element a in the multiplicative group of units modulo n divides the` | **`100.0%`** (`95.28%` RoutedCos) | **`100.0%`** (`94.48%` RoutedCos) | **`100.0%`** (`100.00%` RoutedCos) |
+| **`MULTILINGUAL_RARE`** | `### Translation\nThe classical Basque proverb **"Ogi gogorrari, hagin zorrotza"** translates to: > **"For hard bread, a sharp sickle."**` | **`100.0%`** (`94.05%` RoutedCos) | **`100.0%`** (`92.68%` RoutedCos) | **`100.0%`** (`100.00%` RoutedCos) |
+| **`QUANTUM_PHYSICS`** | `L[\rho] = -i[H, \rho] + \sum_k (L_k \rho L_k^\dagger - \frac{1}{2}\{L_k^\dagger L_k, \rho\})` | **`100.0%`** (`93.22%` RoutedCos) | **`100.0%`** (`91.22%` RoutedCos) | **`100.0%`** (`100.00%` RoutedCos) |
+| **`CRISPR_GENOMICS`** | `A. NGG; 3 bp upstream of the PAM\nB. NGG; 3 bp downstream of` | **`100.0%`** (`93.43%` RoutedCos) | **`100.0%`** (`91.34%` RoutedCos) | **`100.0%`** (`99.99%` RoutedCos) |
+| **`ADVERSARIAL_8TOK_CHURN`** | `Ensures trace preservation by satisfying the completeness relation, guaranteeing total probability remains conserved` | **`100.0%`** (`93.81%` RoutedCos) | **`100.0%`** (`92.35%` RoutedCos) | **`100.0%`** (`99.99%` RoutedCos) |
+| **OVERALL (`110` Tokens)** | **Word-for-Word Exact Decoded Token Match Across All 6 Domains** | **`110/110` (`100.00%`)** | **`110/110` (`100.00%`)** | **`110/110` (`100.00%`)** |
+
 ---
 
 ## 3. Complete 128 GB DGX Spark Unified Memory Map (1T MoE + 1M Context)
