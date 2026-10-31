@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chronos-1t"
+version = "7.5.0"
+description = "Chronos-1T x PseudoBrain: Holographic Spectral Synthesis & Zero-Con MoE Compression for NVIDIA DGX Spark (GB10)"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "defnotean", email = "iangaleonofficial@gmail.com" }
+]
+dependencies = [
+    "torch>=2.4.0",
+    "safetensors>=0.4.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["chronos_1t*"]
+
+[project.entry-points."vllm.general_plugins"]
+chronos_1t = "chronos_1t.vllm_plugin:register"

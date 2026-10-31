@@ -1807,13 +1807,21 @@
       128
     ]
   },
+  "auto_map": {
+    "AutoModelForCausalLM": "chronos_1t.models.glm5_chronos_moe.ChronosGlm5SparseMoeBlock",
+    "ChronosSparseMoeBlock": "chronos_1t.models.glm5_chronos_moe.ChronosGlm5SparseMoeBlock"
+  },
   "chronos_holographic_moe": {
-    "version": "v6.8-glm5",
+    "version": "v7.5-glm5",
     "num_groups": 36,
     "experts_per_group": 8,
     "svd_rank": 64,
     "gu_tail_bits": 2,
     "down_tail_bits": 2,
-    "offload_tail_to_cpu": true
+    "offload_tail_to_cpu": true,
+    "mmap_zero_ram": true,
+    "use_fused_moe": true,
+    "compact_disk_mode_supported": true,
+    "vllm_plugin_entrypoint": "chronos_1t.vllm_plugin:register"
   }
 }

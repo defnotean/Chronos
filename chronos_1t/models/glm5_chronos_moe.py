@@ -24,6 +24,26 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import load_file
 
+try:
+    from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts as vllm_fused_experts
+except Exception:
+    vllm_fused_experts = None
+
+_PINNED_DMA_BUFS: dict[tuple[int, ...], torch.Tensor] = {}
+
+
+def _copy_via_pinned_dma(cpu_tensor: torch.Tensor, device: torch.device, key_id: int) -> torch.Tensor:
+    shape_key = (key_id, *cpu_tensor.shape)
+    buf = _PINNED_DMA_BUFS.get(shape_key)
+    if buf is None or buf.dtype != cpu_tensor.dtype:
+        try:
+            buf = torch.empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, pin_memory=True)
+            _PINNED_DMA_BUFS[shape_key] = buf
+        except Exception:
+            return cpu_tensor.to(device, non_blocking=True)
+    buf.copy_(cpu_tensor, non_blocking=False)
+    return buf.to(device, non_blocking=True)
+
 from chronos_1t.models.chronos_moe_block import (
     build_hadamard_128,
     generate_expert_1d_keys,
@@ -106,10 +126,10 @@ class ChronosGlm5HolographicExpertGroup(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.mmap_zero_ram and self.mmap_handle is not None:
             p = self.mmap_prefix
-            gu_p_m = self.mmap_handle.get_slice(f"{p}tail.gu_packed")[local_m].to(self.device, non_blocking=True)
-            gu_s_m = self.mmap_handle.get_slice(f"{p}tail.gu_scale")[local_m].to(self.device, non_blocking=True)
-            dn_p_m = self.mmap_handle.get_slice(f"{p}tail.down_packed")[local_m].to(self.device, non_blocking=True)
-            dn_s_m = self.mmap_handle.get_slice(f"{p}tail.down_scale")[local_m].to(self.device, non_blocking=True)
+            gu_p_m = _copy_via_pinned_dma(self.mmap_handle.get_slice(f"{p}tail.gu_packed")[local_m], self.device, 1)
+            gu_s_m = _copy_via_pinned_dma(self.mmap_handle.get_slice(f"{p}tail.gu_scale")[local_m], self.device, 2)
+            dn_p_m = _copy_via_pinned_dma(self.mmap_handle.get_slice(f"{p}tail.down_packed")[local_m], self.device, 3)
+            dn_s_m = _copy_via_pinned_dma(self.mmap_handle.get_slice(f"{p}tail.down_scale")[local_m], self.device, 4)
             return gu_p_m, gu_s_m, dn_p_m, dn_s_m
         assert self.gu_tail_packed is not None and self.gu_tail_scale is not None
         assert self.down_tail_packed is not None and self.down_tail_scale is not None
@@ -215,6 +235,47 @@ class ChronosGlm5HolographicExpertGroup(nn.Module):
         down_hat = self.beta_down[local_m] * h_dn + healer_dn + tail_dn
         return gu_hat, down_hat
 
+    @torch.no_grad()
+    def reconstruct_expert_into_slot(
+        self,
+        local_m: int,
+        slot_gu: torch.Tensor,
+        slot_dn: torch.Tensor,
+        s_gu_cached: torch.Tensor | None = None,
+        s_dn_cached: torch.Tensor | None = None,
+    ) -> None:
+        """Zero-temp-allocation in-place slot reconstruction (`v7.5` `Con 1` Fix):
+        Writes directly into `slot_gu` `(4096, 4096)` and `slot_dn` `(4096, 2048)` using `addmm_`,
+        avoiding `134 MB` of intermediate GPU buffer allocations per cold miss.
+        """
+        if s_gu_cached is None or s_dn_cached is None:
+            s_gu, s_dn = self.get_group_banks()
+        else:
+            s_gu, s_dn = s_gu_cached, s_dn_cached
+
+        gu_p_m, gu_s_m, dn_p_m, dn_s_m = self._fetch_tail_slices(local_m)
+        r_s1, _, r_inv, r_s2, c_s1, _, c_inv, c_s2 = generate_expert_1d_keys(
+            4096, 4096, local_m, seed_base=101 + self.group_idx * 8, device=self.device
+        )
+        h_gu = unbind_2d_permuted_hadamard(s_gu, r_s1, r_inv, r_s2, c_s1, c_inv, c_s2, self.h128)
+        if self.gu_tail_bits == 2:
+            slot_gu.copy_(unpack_2bit_lloyd_max(gu_p_m, gu_s_m, dtype=torch.bfloat16))
+        else:
+            slot_gu.copy_(unpack_1bit_rademacher(gu_p_m, gu_s_m, dtype=torch.bfloat16))
+        slot_gu.add_(h_gu * self.beta_gu[local_m])
+        slot_gu.addmm_(self.u_gu[local_m].to(torch.bfloat16), self.v_gu[local_m].to(torch.bfloat16))
+
+        dr_s1, _, dr_inv, dr_s2, dc_s1, _, dc_inv, dc_s2 = generate_expert_1d_keys(
+            4096, 2048, local_m, seed_base=303 + self.group_idx * 8, device=self.device
+        )
+        h_dn = unbind_2d_permuted_hadamard(s_dn, dr_s1, dr_inv, dr_s2, dc_s1, dc_inv, dc_s2, self.h128)
+        if self.down_tail_bits == 2:
+            slot_dn.copy_(unpack_2bit_lloyd_max(dn_p_m, dn_s_m, dtype=torch.bfloat16))
+        else:
+            slot_dn.copy_(unpack_1bit_rademacher(dn_p_m, dn_s_m, dtype=torch.bfloat16))
+        slot_dn.add_(h_dn * self.beta_down[local_m])
+        slot_dn.addmm_(self.u_down[local_m].to(torch.bfloat16), self.v_down[local_m].to(torch.bfloat16))
+
 
 class ChronosGlm5SparseMoeBlock(nn.Module):
     """Drop-in replacement for GLM-5.3-Flash (`Glm5NextForConditionalGeneration`) Sparse MoE layer."""
@@ -229,6 +290,7 @@ class ChronosGlm5SparseMoeBlock(nn.Module):
         hot_cache_size: int = 16,
         offload_tail_to_cpu: bool = True,
         mmap_zero_ram: bool = False,
+        use_fused_moe: bool = True,
         vllm_config: Any = None,
         prefix: str = "",
     ) -> None:
@@ -246,7 +308,10 @@ class ChronosGlm5SparseMoeBlock(nn.Module):
         elif isinstance(device, str):
             device = torch.device(device)
         if shard_path is None:
-            shard_path = f"/home/defnotean/pb27/hf/glm53_flash_chronos_v6/chronos-glm5-layer-{layer_idx:05d}-of-00046.safetensors"
+            cand = f"/home/defnotean/pb27/hf/glm53_flash_chronos_v6/chronos-glm5-layer-{layer_idx:05d}-of-00046.safetensors"
+            if not os.path.exists(cand):
+                cand = f"/models/glm53_flash_chronos_v6/chronos-glm5-layer-{layer_idx:05d}-of-00046.safetensors"
+            shard_path = cand
 
         self.layer_idx = layer_idx
         self.device = device
@@ -255,6 +320,7 @@ class ChronosGlm5SparseMoeBlock(nn.Module):
         self.hot_cache_size = max(top_k, hot_cache_size)
         self.offload_tail_to_cpu = offload_tail_to_cpu
         self.mmap_zero_ram = mmap_zero_ram
+        self.use_fused_moe = use_fused_moe and (vllm_fused_experts is not None)
         self.shard_path_str = str(shard_path)
 
         tp = f"model.language_model.layers.{layer_idx}.mlp"
@@ -372,9 +438,9 @@ class ChronosGlm5SparseMoeBlock(nn.Module):
 
         g_idx = expert_id // 8
         local_m = expert_id % 8
-        gu_w, dw = self.groups[g_idx].reconstruct_expert(local_m, s_gu_cached=s_gu_cached, s_dn_cached=s_dn_cached)
-        self.slot_gu[slot].copy_(gu_w)
-        self.slot_d[slot].copy_(dw)
+        self.groups[g_idx].reconstruct_expert_into_slot(
+            local_m, self.slot_gu[slot], self.slot_d[slot], s_gu_cached=s_gu_cached, s_dn_cached=s_dn_cached
+        )
 
         self.expert_to_slot[expert_id] = slot
         self.slot_to_expert[slot] = expert_id
@@ -400,10 +466,9 @@ class ChronosGlm5SparseMoeBlock(nn.Module):
 
         if n_toks == 1:
             eids = top_ids[0].tolist()
-            gates = top_gates[0]
-            y_routed = torch.zeros_like(x)
             group_bank_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-            for k_idx, eid in enumerate(eids):
+            slot_ids: list[int] = []
+            for eid in eids:
                 eid_i = int(eid)
                 if self.expert_to_slot[eid_i] < 0:
                     g_idx = eid_i // 8
@@ -417,6 +482,16 @@ class ChronosGlm5SparseMoeBlock(nn.Module):
                     slot = self._ensure_expert_slot(eid_i, s_gu_cached=s_gu_c, s_dn_cached=s_dn_c)
                 else:
                     slot = self._ensure_expert_slot(eid_i)
+                slot_ids.append(slot)
+
+            if self.use_fused_moe and vllm_fused_experts is not None:
+                slot_ids_t = torch.tensor([slot_ids], dtype=torch.int32, device=self.device)
+                y_routed = vllm_fused_experts(x, self.cache_gu_buf, self.cache_d_buf, top_gates.float(), slot_ids_t)
+                return (y_routed + y_shared).view(orig_shape).to(orig_dtype)
+
+            gates = top_gates[0]
+            y_routed = torch.zeros_like(x)
+            for k_idx, slot in enumerate(slot_ids):
                 gu_out = F.linear(x, self.slot_gu[slot])
                 y_exp = F.linear(F.silu(gu_out[:, :2048]) * gu_out[:, 2048:], self.slot_d[slot])
                 y_routed.addcmul_(gates[k_idx : k_idx + 1], y_exp)
