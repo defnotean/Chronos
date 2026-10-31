@@ -185,12 +185,32 @@ def run_official_glm53_benchmarks(
       - Chronos v7.5 Standard (`2.71 GB/layer` Disk, `65.7 GB` VRAM, `0.00 GB` Tail RAM): Cum-Cold, Auto-Cold, Hybrid-16
       - Chronos v7.5 Compact-Disk (`1.52 GB/layer` Disk, `65.7 GB` VRAM, `0.00 GB` Tail RAM): Cum-Cold, Auto-Cold, Hybrid-16
     """
-    # Build deterministic 154,880-vocab projection head (matching GLM-5.3-Flash vocab_size = 154,880)
-    # chunked into 8 x 19,360 blocks or 19,360 active sub-vocabulary for fast exact argmax & Top-5 evaluation
-    torch.manual_seed(5300)
-    active_vocab = 19360  # 154,880 / 8 active benchmark token sub-vocabulary
-    lm_head_sub = torch.randn((active_vocab, 4096), device=device, dtype=torch.bfloat16) * (4096**-0.5)
-    rms_weight = torch.ones(4096, device=device, dtype=torch.bfloat16)
+    # Load real 154,880 x 4096 lm_head.weight and norm.weight from zai-org/GLM-5.3-Flash if available
+    lm_head_source = "synthetic_fallback"
+    try:
+        from huggingface_hub import hf_hub_download
+        from safetensors import safe_open
+
+        idx_file = hf_hub_download("zai-org/GLM-5.3-Flash", "model.safetensors.index.json")
+        wmap = json.loads(Path(idx_file).read_text())["weight_map"]
+        lm_shard_name = wmap.get("lm_head.weight", wmap.get("model.language_model.norm.weight"))
+        if lm_shard_name:
+            lm_shard_path = hf_hub_download("zai-org/GLM-5.3-Flash", lm_shard_name)
+            with safe_open(lm_shard_path, framework="pt", device="cpu") as f_lm:
+                lm_k = "lm_head.weight" if "lm_head.weight" in f_lm.keys() else "model.language_model.lm_head.weight"
+                nm_k = "model.language_model.norm.weight"
+                lm_w_full = f_lm.get_tensor(lm_k)
+                # Strided 19,360-token sub-vocabulary across all 154,880 real GLM-5.3-Flash vocabulary rows
+                lm_head_sub = lm_w_full[::8, :].to(device=device, dtype=torch.bfloat16).contiguous()
+                rms_weight = f_lm.get_tensor(nm_k).to(device=device, dtype=torch.bfloat16).contiguous()
+                del lm_w_full
+            reclaim_page_cache(lm_shard_path)
+            lm_head_source = f"zai-org/GLM-5.3-Flash/{lm_shard_name} (154,880 vocab strided)"
+    except Exception:
+        torch.manual_seed(5300)
+        active_vocab = 19360
+        lm_head_sub = torch.randn((active_vocab, 4096), device=device, dtype=torch.bfloat16) * (4096**-0.5)
+        rms_weight = torch.ones(4096, device=device, dtype=torch.bfloat16)
 
     def rms_norm_and_logits(h: torch.Tensor) -> torch.Tensor:
         h_f = h.float()
@@ -381,6 +401,7 @@ def run_official_glm53_benchmarks(
         }
 
     return {
+        "lm_head_source": lm_head_source,
         "total_benchmarks": len(official_suites),
         "total_tasks": total_tasks_all,
         "total_evaluated_tokens": total_tokens_all,
@@ -481,6 +502,56 @@ def main() -> None:
 
     # 6. Run Official GLM-5.3-Flash 8-Benchmark Evaluation Suite (`307` tasks, `9,824` tokens)
     official_benchmarks_report = run_official_glm53_benchmarks(moe, device)
+    del moe
+    torch.cuda.empty_cache()
+
+    # 7. Also verify ChronosQwen4ExpSparseMoeBlock (`Qwen Flash Next` v7.5) Single-Launch `vllm_fused_experts`
+    qwen_v75_report = {}
+    qwen_shard = "/home/defnotean/pb27/hf/flash_next_chronos_v6/chronos-layer-00000-of-00048.safetensors"
+    if Path(qwen_shard).exists():
+        from chronos_1t.models.vllm_chronos_moe import ChronosQwen4ExpSparseMoeBlock
+
+        q_moe = ChronosQwen4ExpSparseMoeBlock(
+            layer_idx=0,
+            shard_path=qwen_shard,
+            device=device,
+            hot_cache_size=24,
+            offload_tail_to_cpu=True,
+            mmap_zero_ram=True,
+            use_fused_moe=True,
+        )
+        xq_1 = torch.randn((1, 2560), device=device, dtype=torch.bfloat16) * 0.02
+        _ = q_moe(xq_1)
+        q_moe.use_fused_moe = False
+        for _ in range(10):
+            yq_loop = q_moe(xq_1)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(50):
+            yq_loop = q_moe(xq_1)
+        torch.cuda.synchronize()
+        q_loop_ms = (time.perf_counter() - t0) * 1000.0 / 50.0
+
+        q_moe.use_fused_moe = True
+        for _ in range(10):
+            yq_fused = q_moe(xq_1)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(50):
+            yq_fused = q_moe(xq_1)
+        torch.cuda.synchronize()
+        q_fused_ms = (time.perf_counter() - t0) * 1000.0 / 50.0
+        q_cos = float(F.cosine_similarity(yq_fused.float(), yq_loop.float(), dim=-1).mean().item())
+        qwen_v75_report = {
+            "warm_1tok_vllm_fused_moe_ms": round(q_fused_ms, 4),
+            "warm_1tok_python_loop_ms": round(q_loop_ms, 4),
+            "stock_nvfp4_1tok_ms": 1.120,
+            "fused_vs_loop_cosine_similarity": round(q_cos, 6),
+            "speedup_vs_stock_nvfp4": round(1.120 / q_fused_ms, 2),
+        }
+        del q_moe
+        torch.cuda.empty_cache()
+        reclaim_page_cache(qwen_shard)
 
     full_report = {
         "model": "zai-org/GLM-5.3-Flash",
@@ -511,6 +582,7 @@ def main() -> None:
                 "zero_touch_verified": bool(zero_touch_verified),
                 "layer_load_time_s": round(load_s, 3),
             },
+            "qwen_flash_next_v75_fused_moe": qwen_v75_report,
         },
         "official_glm53_flash_benchmarks": official_benchmarks_report,
     }
