@@ -65,6 +65,15 @@ Evaluated across Early (`Layer 0`), Middle (`Layer 23`), and Final (`Layer 47`) 
 | **Round 6 (`v6 Zero-Con 33.8GB`)**: 8:1 Bank + R32 SVD + **2-Bit Tail + EMA-32 Cache** | **`33.8 GB`** | **`-40.2 GB`** | **`90.26%`** | **`99.81%`** | **`99.89%`** | **`100.00%`** | **`99.48%`** | **`0.00035`** | **`0.472 ms` (`1.30x`)** |
 | **Round 6 (`v6 Max-Fidelity 44GB`)**: 4:1/2:1 Bank + R64/R256 + **2-Bit Tail + EMA-64 Cache** | **`44.0 GB`** | **`-30.0 GB`** | **`96.35%`** | **`99.97%`** | **`99.98%`** | **`100.00%`** | **`99.48%`** | **`0.00006`** | **`0.475 ms` (`1.29x`)** |
 
+### 2.5 Byte-Packed `.safetensors` Checkpoint Conversion & Chained 1,536-Expert Verification (`flash_next_chronos_v6`)
+Converted `PB27Qwen4ExpForConditionalGeneration` (`flash_next_nvfp4`, 512 routed experts/layer = 64 Holographic Groups/layer) into standalone byte-packed `.safetensors` shards (`chronos-layer-XXXXX-of-00048.safetensors`, `736.24 MB/layer` vs `1,350.00 MB/layer` stock; `34.51 GiB` for all 48 layers vs `63.28 GiB` stock) and verified chained multi-layer execution (`Layers 0 → 1 → 2`, `1,536` routed experts) directly from disk:
+
+| Chained Multi-Layer Verification (`1,536` Routed Experts across `Layers 0..2`) | Shard Size / Layer | 48-Layer MoE Footprint | Chained Hidden Cos | 248K Logit Cos | **Top-1 Exact Match** | **Top-5 Overlap** | **KL Div (nats)** |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`BEFORE`: Stock `flash_next_nvfp4` (`1,536` Experts)** | `1,350.00 MB` | `63.28 GiB` | `100.00%` | `100.00%` | **`100.00%` (`115/115`)** | **`100.00%`** | `0.00000` |
+| **`AFTER`: Chronos `v6` Pure Cold (`0%` Cache, 100% Holographic + SVD + Tail)** | **`736.24 MB`** | **`34.51 GiB`** | **`99.68%`** | **`99.70%`** | **`100.00%` (`115/115`)** | **`89.22%`** | **`0.00118`** |
+| **`AFTER`: Chronos `v6` Hybrid EMA-48 Ring Cache** | **`736.24 MB`** | **`34.51 GiB`** | **`100.00%`** | **`100.00%`** | **`100.00%` (`115/115`)** | **`99.83%`** | **`0.00000`** |
+
 ---
 
 ## 3. Complete 128 GB DGX Spark Unified Memory Map (1T MoE + 1M Context)
@@ -83,6 +92,11 @@ Evaluated across Early (`Layer 0`), Middle (`Layer 23`), and Final (`Layer 47`) 
 ## 4. Repository Structure
 
 - [`chronos_1t/kernels/gb10_hss_kernel.cu`](chronos_1t/kernels/gb10_hss_kernel.cu): Native CUDA 13.0 (`-arch=sm_121`) register-resident Holographic Spectral Synthesis kernel for the NVIDIA GB10 Grace Blackwell Superchip (fuses 8-expert HRR unbinding, 4-term Clenshaw Chebyshev recurrence via `FFMA`, and warp-level dot-product reduction in registers).
+- [`chronos_1t/models/chronos_moe_block.py`](chronos_1t/models/chronos_moe_block.py): Core `ChronosHolographicExpertGroup` module implementing byte-packed `W4A16_NVFP4` 8:1 Holographic Bank, `FP8` Coupled Subspace SVD Healer, and 1-bit / 2-bit / Base-3 Ternary Tail Lattice bit-packing and dequantization.
+- [`chronos_1t/models/vllm_chronos_moe.py`](chronos_1t/models/vllm_chronos_moe.py): Drop-in `ChronosQwen4ExpSparseMoeBlock` runtime layer with pre-allocated GPU ring-buffer cache (`slot_gu`, `slot_d`), Global Router Prior hub pre-seeding, and `vllm_fused_experts` integration.
+- [`chronos_1t/models/patch_pb27_vllm.py`](chronos_1t/models/patch_pb27_vllm.py): Runtime loader (`install_chronos_moe_into_pb27`) to swap `Qwen4ExpSparseMoeBlock` layers in `PB27Qwen4ExpForConditionalGeneration` with `ChronosQwen4ExpSparseMoeBlock`.
+- [`chronos_1t/converter/convert_all_48_layers.py`](chronos_1t/converter/convert_all_48_layers.py): Vectorized GPU streaming converter (`convert_expert_group_batched`, `batched_exact_gram_smw_healer`) converting all 48 layers (`24,576` routed experts) into `/home/defnotean/pb27/hf/flash_next_chronos_v6`.
+- [`chronos_1t/converter/verify_converted_checkpoint.py`](chronos_1t/converter/verify_converted_checkpoint.py): Multi-layer chained verification suite validating converted `.safetensors` shards directly from disk against stock `flash_next_nvfp4`.
 - [`benchmarks/dgx_spark_gb10_experiments.py`](benchmarks/dgx_spark_gb10_experiments.py): Live DGX Spark GB10 hardware calibration, native `sm_121` CUDA kernel benchmarks (`8.67x` register synthesis speedup, `182.1x` L2 spectral speedup), and 64-layer 1.0T virtual parameter forward pass (`59.02 tok/s` in `415.2 MB` VRAM).
 - [`benchmarks/pb27_holographic_moe_proof.py`](benchmarks/pb27_holographic_moe_proof.py): End-to-end DGX Spark GB10 benchmark on real `PB27Qwen4ExpForConditionalGeneration` (`flash_next_nvfp4`) Layer-0 routed MoE weights and 512-expert router (`91.49%`–`93.93%` MoE fidelity, `91.7 tok/s` Zero-NVMe Stride-64 decode).
 - [`benchmarks/shrink_flash_next_benchmark.py`](benchmarks/shrink_flash_next_benchmark.py): Round 1 Before-vs-After shrinking benchmark on real `flash_next_nvfp4` weights (`74.0 GB` $\to$ `28.8 GB` / `42.2 GB`).
