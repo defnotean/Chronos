@@ -1,0 +1,107 @@
+{
+  "model": "zai-org/GLM-5.3-Flash",
+  "architecture": "Glm5NextForConditionalGeneration",
+  "chronos_version": "v6.8-glm5",
+  "vocab_size": 154880,
+  "layers_converted_and_verified": [
+    3,
+    10,
+    23,
+    35,
+    44
+  ],
+  "hardware_cache_sweeps": {
+    "hot_cache_16": {
+      "hot_cache_size": 16,
+      "active_gpu_vram_mb_per_layer": 1564.51,
+      "active_gpu_vram_gb_43_layers": 65.7,
+      "stock_fp8_mb_per_layer": 6936.0,
+      "stock_fp8_gb_43_layers": 291.26,
+      "vram_reduction_factor": 4.43,
+      "warm_1tok_latency_ms": 1.654,
+      "warm_cache_hit_rate": 1.0,
+      "prefill_vs_decode_cos": 0.999989,
+      "vllm_load_weights_ok": true
+    },
+    "hot_cache_24": {
+      "hot_cache_size": 24,
+      "active_gpu_vram_mb_per_layer": 1940.38,
+      "active_gpu_vram_gb_43_layers": 81.48,
+      "stock_fp8_mb_per_layer": 6936.0,
+      "stock_fp8_gb_43_layers": 291.26,
+      "vram_reduction_factor": 3.57,
+      "warm_1tok_latency_ms": 1.566,
+      "warm_cache_hit_rate": 1.0,
+      "prefill_vs_decode_cos": 0.999989,
+      "vllm_load_weights_ok": true
+    }
+  },
+  "layer_execution_summary": [
+    {
+      "layer": 3,
+      "batch_1656_tok_s": 0.219,
+      "routed_cos": 0.9341045618057251,
+      "full_moe_cos": 0.9726980924606323
+    },
+    {
+      "layer": 10,
+      "batch_1656_tok_s": 1.692,
+      "routed_cos": 0.9213510751724243,
+      "full_moe_cos": 0.9793472290039062
+    },
+    {
+      "layer": 23,
+      "batch_1656_tok_s": 0.944,
+      "routed_cos": 0.9570906162261963,
+      "full_moe_cos": 0.9614013433456421
+    },
+    {
+      "layer": 35,
+      "batch_1656_tok_s": 1.659,
+      "routed_cos": 0.9305049180984497,
+      "full_moe_cos": 0.9983523488044739
+    },
+    {
+      "layer": 44,
+      "batch_1656_tok_s": 1.062,
+      "routed_cos": 0.9665861129760742,
+      "full_moe_cos": 0.997344970703125
+    }
+  ],
+  "benchmark_parity": {
+    "mmlu_300": {
+      "cum_cold": 1.0,
+      "auto_cold": 1.0
+    },
+    "mmlu_pro_150": {
+      "cum_cold": 1.0,
+      "auto_cold": 1.0
+    },
+    "gsm8k_150": {
+      "cum_cold": 1.0,
+      "auto_cold": 1.0
+    },
+    "python_coding_33_problems": {
+      "total_code_tokens": 1056,
+      "cum_cold_token_match": 1.0,
+      "auto_cold_token_match": 1.0,
+      "unit_test_parity": "33/33 (100.0%)"
+    }
+  },
+  "raw_perturbation_stress_test": {
+    "cumulative_cold": {
+      "top1": 0.7798941731452942,
+      "top5": 0.994179904460907,
+      "top10": 0.9989418387413025,
+      "kl_nats": 0.006460994016379118,
+      "logit_cos": 0.9953831434249878
+    },
+    "autonomous_cold": {
+      "top1": 0.750264585018158,
+      "top5": 0.9867724776268005,
+      "top10": 0.9978836178779602,
+      "kl_nats": 0.0088953897356987,
+      "logit_cos": 0.9936652183532715
+    }
+  }
+}

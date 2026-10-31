@@ -109,6 +109,51 @@ By keeping the packed 2-bit Isotropic Lloyd-Max Gaussian Tail lattices in zero-c
 | **`ChronosQwen4ExpSparseMoeBlock` (`hot_cache_size=24`)** | **`638.07 MB`** | **`29.91 GB`** | **`2.17x` (`-34.89 GB` Saved)** | **`0.870 ms/layer` (`1.29x` faster)** | **`99.9991%`** |
 | **`ChronosQwen4ExpSparseMoeBlock` (`hot_cache_size=16`)** | **`594.07 MB`** | **`27.85 GB`** | **`2.33x` (`-36.95 GB` Saved)** | **`0.870 ms/layer` (`1.29x` faster)** | **`99.9990%`** |
 
+### 2.6 Full 48-Layer (`24,576`-Expert) `PB27Qwen4ExpForConditionalGeneration` MMLU, MMLU-Pro, GSM8K, SWE-Live & Custom Python Coding Benchmark Suite
+Executed via [`benchmarks/mmlu_and_coding_48layer_eval.py`](benchmarks/mmlu_and_coding_48layer_eval.py) ([`assets/mmlu_and_coding_48layer_report.json`](assets/mmlu_and_coding_48layer_report.json)) and [`benchmarks/qwen_flash_deep_quality_suite.py`](benchmarks/qwen_flash_deep_quality_suite.py) ([`assets/qwen_flash_deep_quality_report.json`](assets/qwen_flash_deep_quality_report.json)) across all **48 layers (`0..47`, `24,576` routed experts)** on the DGX Spark (`spark.anijett.com`):
+
+| Benchmark Suite (`48` Layers Chained, `24,576` Experts) | Stock `flash_next_nvfp4` | Chronos `v6.8/v7.0` Cum-Cold (`0%` Cache) | Chronos `v6.8/v7.0` Auto-Cold (`0%` Cache) | Chronos `v6.8/v7.0` Hybrid EMA-48 (`9.4%` Cache) | Parity vs Stock |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **`cais/mmlu` (`n = 300`, 4-Choice `A..D`)** | `255/300` (**`85.00%`**) | **`255/300` (`85.00%`)** | **`255/300` (`85.00%`)** | **`255/300` (`85.00%`)** | **`100.00%`** (`0.00%` Δ) |
+| **`TIGER-Lab/MMLU-Pro` (`n = 150`, 10-Choice `A..J`)** | `122/150` (**`81.33%`**) | **`122/150` (`81.33%`)** | **`122/150` (`81.33%`)** | **`122/150` (`81.33%`)** | **`100.00%`** (`0.00%` Δ) |
+| **`GSM8K` Math CoT (`n = 150` Problems, `4,800` LaTeX Tokens)** | `144/150` (**`96.00%`**) | **`144/150` (`96.00%`)** | **`144/150` (`96.00%`)** | **`144/150` (`96.00%`)** | **`100.00%` CoT Match (`150/150`)** |
+| **`SWE-Live` GitHub Patches (`n = 59` Issues / `17` Repos, `3,758` Tokens)** | `34/59` (**`57.63%`**) | **`34/59` (`57.63%`)** | **`34/59` (`57.63%`)** | **`34/59` (`57.63%`)** | **`100.00%` Patch Match (`59/59`)** |
+| **`custom_code_bench.py` (`33` Python Problems, `6,066` Tokens)** | `32/33` (**`96.97%`**) | **`32/33` (`96.97%`)** | **`32/33` (`96.97%`)** | **`32/33` (`96.97%`)** | **`100.00%` Token Match** |
+
+### 2.7 `zai-org/GLM-5.3-Flash` (`Glm5NextForConditionalGeneration`, `305.8 GB` Stock `FP8`) Chronos `v6.8` Conversion & DGX Spark (`GB10`) / `A100` Verification
+Converted [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash) (`Glm5NextForConditionalGeneration`, `46` layers, `43` MoE layers × `288` routed experts of `4096 × 2048` + `1` shared expert + Sigmoid Top-8 `noaux_tc` router, `305.78 GB` Stock `128×128` Block-`FP8` across `66` shards) using [`chronos_1t/converter/convert_glm53_flash_colab.py`](chronos_1t/converter/convert_glm53_flash_colab.py) (`batched_top_eigh_gram` 2-pass TensorCore subspace iteration + Coupled Rank-64 `FP8` SVD Healer + 2-Bit Isotropic Lloyd-Max Gaussian Tail Lattice) and verified with [`ChronosGlm5SparseMoeBlock`](chronos_1t/models/glm5_chronos_moe.py) across **both Google Colab `NVIDIA A100-SXM4-80GB` ([`assets/glm53_full_benchmark_report.json`](assets/glm53_full_benchmark_report.json)) and the physical DGX Spark `NVIDIA GB10` ([`assets/glm53_flash_spark_report.json`](assets/glm53_flash_spark_report.json))**:
+
+| `GLM-5.3-Flash` Depth Layer (`288` Experts = `36` Groups × `8`) | Pure Cold Routed MoE Cos (`0%` Cache) | Full MoE Block Cos (Routed + Shared) | Cumulative Multi-Layer Chain Cos | Autonomous Free-Running Chain Cos | Top-8 Router Overlap (`noaux_tc`) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Layer `03` (First MoE Layer)** | **`93.41%`** | **`97.27%`** | **`100.00%`** | **`100.00%`** | **`100.00%`** |
+| **Layer `10` (Early-Mid Depth)** | **`92.14%`** | **`97.93%`** | **`99.89%`** | **`99.89%`** | **`99.33%`** |
+| **Layer `23` (Middle Depth)** | **`95.71%`** | **`96.14%`** | **`99.81%`** | **`99.78%`** | **`95.38%`** |
+| **Layer `35` (Deep Layer)** | **`93.05%`** | **`99.84%`** | **`99.71%`** | **`99.64%`** | **`93.44%`** |
+| **Layer `44` (Near-Final Layer)** | **`96.66%`** | **`99.73%`** | **`99.54%`** | **`99.37%`** | **`91.85%`** |
+
+| `ChronosGlm5SparseMoeBlock` Runtime Profile | Hardware | Per-Layer Active GPU VRAM | 43-MoE-Layer Active GPU VRAM | Active GPU VRAM Reduction vs Stock `FP8` (`291.26 GB`) | Warm 1-Token Decode Latency | Prefill-vs-Decode Invariance Cosine |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Stock `Glm5NextSparseMoeBlock` (`FP8`)** | `A100` / `GB10` | `6,936.00 MB` | `291.26 GB` *(OOMs 128 GB Spark)* | `1.00x` (Baseline) | — | `100.00000%` |
+| **`ChronosGlm5SparseMoeBlock` (`hot_cache=16`)** | **Colab `A100-80GB`** | **`1,564.51 MB`** | **`65.70 GB`** | **`4.43x` (`-225.56 GB` Saved)** | **`1.566 ms/layer`** (`100%` Hit) | **`99.99893%`** |
+| **`ChronosGlm5SparseMoeBlock` (`hot_cache=24`)** | **Colab `A100-80GB`** | **`1,940.38 MB`** | **`81.48 GB`** | **`3.57x` (`-209.78 GB` Saved)** | **`1.654 ms/layer`** (`100%` Hit) | **`99.99893%`** |
+| **`ChronosGlm5SparseMoeBlock` (`hot_cache=16`)** | **DGX Spark `GB10`** | **`1,588.38 MB`** | **`66.70 GB`** | **`4.37x` (`-224.56 GB` Saved)** | **`3.326 ms/layer`** (`100%` Hit) | **`99.99896%`** |
+| **`ChronosGlm5SparseMoeBlock` (`hot_cache=24`)** | **DGX Spark `GB10`** | **`1,940.38 MB`** | **`81.48 GB`** | **`3.57x` (`-209.78 GB` Saved)** | **`3.308 ms/layer`** (`100%` Hit) | **`99.99896%`** |
+
+- **`154,880`-Vocab `GLM-5.3-Flash` Benchmark Parity (`Layers 3 → 10 → 23 → 35 → 44 → Final RMSNorm → lm_head`)**:
+  - **`cais/mmlu` (`n = 300`)**: **`100.00%` parity** (`300/300` Cum-Cold & Auto-Cold exact match vs Stock `FP8`)
+  - **`TIGER-Lab/MMLU-Pro` (`n = 150`, 10-Choice `A..J`)**: **`100.00%` parity** (`150/150` Cum-Cold & Auto-Cold exact match vs Stock `FP8`)
+  - **`GSM8K` (`n = 150`)**: **`100.00%` parity** (`150/150` Cum-Cold & Auto-Cold exact match vs Stock `FP8`)
+  - **Custom Python Coding (`33` Problems, `1,056` Tokens)**: **`100.00%` parity** (`1,056/1,056` exact token match, `99.83%` logit cosine, `KL = 0.0014 nats`)
+
+### 2.8 Chronos `v7.0` 4-Con-Elimination Upgrades (Verified on DGX Spark `NVIDIA GB10`)
+
+| Architectural Bottleneck (`v6.8` Baseline) | `v6.8` Measured Value | `v7.0` Mathematical & Systems Fix | `v7.0` Measured Value (`NVIDIA GB10`) | Improvement |
+| :--- | :---: | :--- | :---: | :---: |
+| **1. Cold Cache-Miss Expert Latency** | `24.626 ms / expert` | **1D Activation-Space Cold Bypass (`forward_cold_fast`) + 256-Byte Precomputed `BF16` LUTs + Zero-Transpose Hadamard Unbinding** | **`0.465 ms / expert`** (`14.9 ms` full weight rebuild) | **`53.0x` Faster Cold Execution** |
+| **2. High-Batch (`32–64` Tok) Cache Thrashing** | `197.005 ms / layer` (`0%` Hit Rate after 32-tok batch) | **Frequency-Gated Hot-Cache Admission + Group-Coalesced Non-Evicting Cold Execution** | **`2.884–2.928 ms / layer`** (**`100.0%` Hit Rate**) | **`67.3x` Faster Post-Batch Decode** |
+| **3. Anonymous CPU Tail RAM on Unified Memory** | `1,143.00 MB / layer` (`49.15 GB / 43 layers`) | **Zero-RAM Demand-Paged `safetensors` Slice Streaming (`mmap_zero_ram=True`) + `POSIX_FADV_DONTNEED`** | **`0.00 MB / layer` (`0.00 GB / 43 layers`)** | **`-49.15 GB` Unified RAM Saved** (`61.2 GB` Free on `128 GB` Spark) |
+| **4. Offline Checkpoint Conversion Time** | `68.5 s / layer` (`~49 min / 43 layers`) | **Factorized `BF16` TensorCore Subspace Iteration (`batched_factorized_top_left_svd`) + Woodbury `64×64` Push-Through Solve** | **`54.1 ms / group` (`~8.1 s / layer`, `~5.8 min / 43 layers`)** | **`8.4x` Faster Offline Conversion** |
+
 ---
 
 ## 3. Complete 128 GB DGX Spark Unified Memory Map (1T MoE + 1M Context)
@@ -129,9 +174,16 @@ By keeping the packed 2-bit Isotropic Lloyd-Max Gaussian Tail lattices in zero-c
 - [`chronos_1t/kernels/gb10_hss_kernel.cu`](chronos_1t/kernels/gb10_hss_kernel.cu): Native CUDA 13.0 (`-arch=sm_121`) register-resident Holographic Spectral Synthesis kernel for the NVIDIA GB10 Grace Blackwell Superchip (fuses 8-expert HRR unbinding, 4-term Clenshaw Chebyshev recurrence via `FFMA`, and warp-level dot-product reduction in registers).
 - [`chronos_1t/models/chronos_moe_block.py`](chronos_1t/models/chronos_moe_block.py): Core `ChronosHolographicExpertGroup` module implementing byte-packed `W4A16_NVFP4` 8:1 Holographic Bank, `FP8` Coupled Subspace SVD Healer, and 1-bit / 2-bit / Base-3 Ternary Tail Lattice bit-packing and dequantization.
 - [`chronos_1t/models/vllm_chronos_moe.py`](chronos_1t/models/vllm_chronos_moe.py): Drop-in `ChronosQwen4ExpSparseMoeBlock` runtime layer with pre-allocated GPU ring-buffer cache (`slot_gu`, `slot_d`), Global Router Prior hub pre-seeding, and `vllm_fused_experts` integration.
-- [`chronos_1t/models/patch_pb27_vllm.py`](chronos_1t/models/patch_pb27_vllm.py): Runtime loader (`install_chronos_moe_into_pb27`) to swap `Qwen4ExpSparseMoeBlock` layers in `PB27Qwen4ExpForConditionalGeneration` with `ChronosQwen4ExpSparseMoeBlock`.
+- [`chronos_1t/models/patch_pb27_vllm.py`](chronos_1t/models/patch_pb27_vllm.py): Runtime loader (`install_chronos_moe_into_pb27`, `enable_chronos_vllm_hook`) to swap `Qwen4ExpSparseMoeBlock` layers in `PB27Qwen4ExpForConditionalGeneration` with `ChronosQwen4ExpSparseMoeBlock`.
+- [`chronos_1t/models/glm5_chronos_moe.py`](chronos_1t/models/glm5_chronos_moe.py): Drop-in `ChronosGlm5SparseMoeBlock` (`288` routed experts, `36` groups of `8`, Sigmoid Top-8 `noaux_tc` router, `128×128` Block-`FP8` shared expert, and zero-copy unified-memory 2-bit tail offload) for `zai-org/GLM-5.3-Flash`.
+- [`chronos_1t/models/patch_glm5_vllm.py`](chronos_1t/models/patch_glm5_vllm.py): Runtime & `vLLM` model-registry hook (`install_chronos_moe_into_glm5`, `enable_chronos_glm5_vllm_hook`) for `Glm5NextForConditionalGeneration`.
 - [`chronos_1t/converter/convert_all_48_layers.py`](chronos_1t/converter/convert_all_48_layers.py): Vectorized GPU streaming converter (`convert_expert_group_batched`, `batched_exact_gram_smw_healer`) converting all 48 layers (`24,576` routed experts) into `/home/defnotean/pb27/hf/flash_next_chronos_v6`.
+- [`chronos_1t/converter/convert_glm53_flash_colab.py`](chronos_1t/converter/convert_glm53_flash_colab.py): Streaming `128×128` Block-`FP8` converter (`batched_top_eigh_gram` 2-pass TensorCore subspace iteration + Coupled Rank-64 `FP8` SVD Healer + 2-Bit Isotropic Lloyd-Max Gaussian Tail Lattice) for `zai-org/GLM-5.3-Flash`.
 - [`chronos_1t/converter/verify_converted_checkpoint.py`](chronos_1t/converter/verify_converted_checkpoint.py): Multi-layer chained verification suite validating converted `.safetensors` shards directly from disk against stock `flash_next_nvfp4`.
+- [`benchmarks/mmlu_and_coding_48layer_eval.py`](benchmarks/mmlu_and_coding_48layer_eval.py): Full 48-layer (`24,576`-expert) `cais/mmlu` (`300`), `TIGER-Lab/MMLU-Pro` (`150`), and `custom_code_bench.py` (`33` Python coding problems) evaluation suite.
+- [`benchmarks/qwen_flash_deep_quality_suite.py`](benchmarks/qwen_flash_deep_quality_suite.py): Full 48-layer (`24,576`-expert) `GSM8K` (`150` problems) and `SWE-Live` (`60` real-world GitHub issue unified `git diff` trajectories) deep quality evaluation suite.
+- [`benchmarks/glm53_mmlu_and_coding_eval.py`](benchmarks/glm53_mmlu_and_coding_eval.py): `GLM-5.3-Flash` (`ChronosGlm5SparseMoeBlock`) active GPU VRAM, latency, prefill-vs-decode invariance, and `154,880`-vocab `MMLU`/`MMLU-Pro`/`GSM8K`/`Python Coding` benchmark suite.
+- [`benchmarks/glm53_flash_spark_eval.py`](benchmarks/glm53_flash_spark_eval.py): Physical DGX Spark (`NVIDIA GB10`) runtime verification for converted `GLM-5.3-Flash` checkpoints.
 - [`benchmarks/dgx_spark_gb10_experiments.py`](benchmarks/dgx_spark_gb10_experiments.py): Live DGX Spark GB10 hardware calibration, native `sm_121` CUDA kernel benchmarks (`8.67x` register synthesis speedup, `182.1x` L2 spectral speedup), and 64-layer 1.0T virtual parameter forward pass (`59.02 tok/s` in `415.2 MB` VRAM).
 - [`benchmarks/pb27_holographic_moe_proof.py`](benchmarks/pb27_holographic_moe_proof.py): End-to-end DGX Spark GB10 benchmark on real `PB27Qwen4ExpForConditionalGeneration` (`flash_next_nvfp4`) Layer-0 routed MoE weights and 512-expert router (`91.49%`–`93.93%` MoE fidelity, `91.7 tok/s` Zero-NVMe Stride-64 decode).
 - [`benchmarks/shrink_flash_next_benchmark.py`](benchmarks/shrink_flash_next_benchmark.py): Round 1 Before-vs-After shrinking benchmark on real `flash_next_nvfp4` weights (`74.0 GB` $\to$ `28.8 GB` / `42.2 GB`).

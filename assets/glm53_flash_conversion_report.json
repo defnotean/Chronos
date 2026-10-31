@@ -1,0 +1,134 @@
+{
+  "repo_id": "zai-org/GLM-5.3-Flash",
+  "layers": [
+    {
+      "layer": 3,
+      "stock_fp8_mb": 6936.0,
+      "chronos_shard_mb": 2708.35,
+      "active_vram_offload_mb": 1542.0,
+      "routed_cos": 0.9341045618057251,
+      "full_moe_cos": 0.9726980924606323,
+      "cum_hidden_cos": 0.999974250793457,
+      "auto_hidden_cos": 0.999974250793457,
+      "route_overlap": 1.0,
+      "elapsed_s": 38.73
+    },
+    {
+      "layer": 10,
+      "stock_fp8_mb": 6936.0,
+      "chronos_shard_mb": 2708.35,
+      "active_vram_offload_mb": 1542.0,
+      "routed_cos": 0.9213510751724243,
+      "full_moe_cos": 0.9793472290039062,
+      "cum_hidden_cos": 0.9989007711410522,
+      "auto_hidden_cos": 0.9988530874252319,
+      "route_overlap": 0.9933201058201058,
+      "elapsed_s": 85.16
+    },
+    {
+      "layer": 23,
+      "stock_fp8_mb": 6936.0,
+      "chronos_shard_mb": 2708.35,
+      "active_vram_offload_mb": 1542.0,
+      "routed_cos": 0.9570906162261963,
+      "full_moe_cos": 0.9614013433456421,
+      "cum_hidden_cos": 0.998082160949707,
+      "auto_hidden_cos": 0.9977860450744629,
+      "route_overlap": 0.9537698412698413,
+      "elapsed_s": 76.19
+    },
+    {
+      "layer": 35,
+      "stock_fp8_mb": 6936.0,
+      "chronos_shard_mb": 2708.35,
+      "active_vram_offload_mb": 1542.0,
+      "routed_cos": 0.9305049180984497,
+      "full_moe_cos": 0.9983523488044739,
+      "cum_hidden_cos": 0.9971053004264832,
+      "auto_hidden_cos": 0.9964050054550171,
+      "route_overlap": 0.9343915343915344,
+      "elapsed_s": 78.69
+    },
+    {
+      "layer": 44,
+      "stock_fp8_mb": 6936.0,
+      "chronos_shard_mb": 2708.35,
+      "active_vram_offload_mb": 1542.0,
+      "routed_cos": 0.9665861129760742,
+      "full_moe_cos": 0.997344970703125,
+      "cum_hidden_cos": 0.9954349994659424,
+      "auto_hidden_cos": 0.9937416315078735,
+      "route_overlap": 0.9184523809523809,
+      "elapsed_s": 79.69
+    }
+  ],
+  "lm_head_vocab_size": 154880,
+  "chained_lm_head_parity": {
+    "cumulative_cold": {
+      "top1": 0.7798941731452942,
+      "top5": 0.994179904460907,
+      "top10": 0.9989418387413025,
+      "kl_nats": 0.006460994016379118,
+      "logit_cos": 0.9953831434249878
+    },
+    "autonomous_cold": {
+      "top1": 0.750264585018158,
+      "top5": 0.9867724776268005,
+      "top10": 0.9978836178779602,
+      "kl_nats": 0.0088953897356987,
+      "logit_cos": 0.9936652183532715
+    }
+  },
+  "mmlu_300": {
+    "cum_cold_agreement": 0.9133,
+    "auto_cold_agreement": 0.9167
+  },
+  "mmlu_pro_150": {
+    "cum_cold_agreement": 0.92,
+    "auto_cold_agreement": 0.8933
+  },
+  "python_coding_33_problems": {
+    "total_code_tokens": 1056,
+    "cum_cold_top1": 0.768,
+    "auto_cold_top1": 0.7443,
+    "auto_cold_top5": 0.9858
+  },
+  "domains_6": {
+    "Reasoning & Logic": {
+      "cum_top1": 0.8281,
+      "auto_top1": 0.7656,
+      "auto_top5": 0.9688,
+      "logit_cos": 0.993317
+    },
+    "Python Coding": {
+      "cum_top1": 0.7969,
+      "auto_top1": 0.75,
+      "auto_top5": 1.0,
+      "logit_cos": 0.993965
+    },
+    "Mathematics": {
+      "cum_top1": 0.8125,
+      "auto_top1": 0.7812,
+      "auto_top5": 1.0,
+      "logit_cos": 0.993719
+    },
+    "General Knowledge": {
+      "cum_top1": 0.7812,
+      "auto_top1": 0.7344,
+      "auto_top5": 1.0,
+      "logit_cos": 0.993825
+    },
+    "Creative Writing": {
+      "cum_top1": 0.8281,
+      "auto_top1": 0.8438,
+      "auto_top5": 1.0,
+      "logit_cos": 0.994041
+    },
+    "Agentic Tool Use": {
+      "cum_top1": 0.7031,
+      "auto_top1": 0.7188,
+      "auto_top5": 0.9844,
+      "logit_cos": 0.994287
+    }
+  }
+}

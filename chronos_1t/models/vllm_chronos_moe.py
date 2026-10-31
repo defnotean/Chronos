@@ -12,6 +12,7 @@ Drop-in replacement for `Qwen4ExpSparseMoeBlock` in `PB27Qwen4ExpForConditionalG
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 
@@ -20,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch
 from torch import nn
 import torch.nn.functional as F
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 try:
@@ -57,6 +59,7 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
         top_k: int = 10,
         hot_cache_size: int = 24,
         offload_tail_to_cpu: bool = True,
+        mmap_zero_ram: bool = False,
         vllm_config: Any = None,
         prefix: str = "",
     ) -> None:
@@ -73,6 +76,7 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
             if isinstance(chronos_cfg, dict):
                 hot_cache_size = int(chronos_cfg.get("hot_cache_size", hot_cache_size))
                 offload_tail_to_cpu = bool(chronos_cfg.get("offload_tail_to_cpu", offload_tail_to_cpu))
+                mmap_zero_ram = bool(chronos_cfg.get("mmap_zero_ram", mmap_zero_ram))
 
         if layer_idx is None:
             layer_idx = 0
@@ -88,54 +92,82 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
         self.top_k = top_k
         self.hot_cache_size = max(top_k, hot_cache_size)
         self.offload_tail_to_cpu = offload_tail_to_cpu
+        self.mmap_zero_ram = mmap_zero_ram
+        self.shard_path_str = str(shard_path)
 
         tensor_prefix = f"model.language_model.layers.{layer_idx}.mlp"
-        raw = load_file(str(shard_path), device="cpu")
+        self._mmap_handle = safe_open(self.shard_path_str, framework="pt", device="cpu")
+        all_keys = set(self._mmap_handle.keys())
 
-        self.router_w = raw[f"{tensor_prefix}.gate.weight"].to(device=device, dtype=torch.bfloat16).contiguous()
-        self.shared_gate_w = raw[f"{tensor_prefix}.shared_expert_gate.weight"].to(device=device, dtype=torch.bfloat16).contiguous()
+        self.router_w = self._mmap_handle.get_tensor(f"{tensor_prefix}.gate.weight").to(device=device, dtype=torch.bfloat16).contiguous()
+        self.shared_gate_w = self._mmap_handle.get_tensor(f"{tensor_prefix}.shared_expert_gate.weight").to(device=device, dtype=torch.bfloat16).contiguous()
 
         sh_g = dequantize_mxfp8(
-            raw[f"{tensor_prefix}.shared_expert.gate_proj.weight"],
-            raw[f"{tensor_prefix}.shared_expert.gate_proj.weight_scale"],
+            self._mmap_handle.get_tensor(f"{tensor_prefix}.shared_expert.gate_proj.weight"),
+            self._mmap_handle.get_tensor(f"{tensor_prefix}.shared_expert.gate_proj.weight_scale"),
             device,
         )
         sh_u = dequantize_mxfp8(
-            raw[f"{tensor_prefix}.shared_expert.up_proj.weight"],
-            raw[f"{tensor_prefix}.shared_expert.up_proj.weight_scale"],
+            self._mmap_handle.get_tensor(f"{tensor_prefix}.shared_expert.up_proj.weight"),
+            self._mmap_handle.get_tensor(f"{tensor_prefix}.shared_expert.up_proj.weight_scale"),
             device,
         )
         self.sh_gu = torch.cat([sh_g, sh_u], dim=0).contiguous()  # (1280, 2560)
         self.sh_down = dequantize_mxfp8(
-            raw[f"{tensor_prefix}.shared_expert.down_proj.weight"],
-            raw[f"{tensor_prefix}.shared_expert.down_proj.weight_scale"],
+            self._mmap_handle.get_tensor(f"{tensor_prefix}.shared_expert.down_proj.weight"),
+            self._mmap_handle.get_tensor(f"{tensor_prefix}.shared_expert.down_proj.weight_scale"),
             device,
         ).contiguous()  # (2560, 640)
 
-        # Optional embedded lossless NVFP4 hub experts in the shard
         self.hub_experts_cpu: dict[int, dict[str, torch.Tensor]] = {}
         hub_prefix = f"{tensor_prefix}.hub_experts."
-        for k, v in raw.items():
+        for k in all_keys:
             if k.startswith(hub_prefix):
                 rest = k[len(hub_prefix):]
                 eid_str, tensor_name = rest.split(".", 1)
                 eid = int(eid_str)
-                self.hub_experts_cpu.setdefault(eid, {})[tensor_name] = v
+                self.hub_experts_cpu.setdefault(eid, {})[tensor_name] = self._mmap_handle.get_tensor(k)
 
         shared_h128 = build_hadamard_128(device)
         self.groups = nn.ModuleList()
         for g_idx in range(64):
             gp = f"{tensor_prefix}.chronos_groups.{g_idx}."
-            sub_t = {k[len(gp):]: v for k, v in raw.items() if k.startswith(gp)}
+            sub_t: dict[str, torch.Tensor] = {}
+            for k_suffix in (
+                "s_gu.weight", "s_gu.weight_scale", "s_gu.weight_scale_2", "s_gu.beta",
+                "s_down.weight", "s_down.weight_scale", "s_down.weight_scale_2", "s_down.beta",
+                "healer.u_gu", "healer.v_gu", "healer.u_down", "healer.v_down",
+                "tail.gu_bits", "tail.down_bits",
+            ):
+                full_k = f"{gp}{k_suffix}"
+                if full_k in all_keys:
+                    sub_t[k_suffix] = self._mmap_handle.get_tensor(full_k)
+            if not mmap_zero_ram:
+                for k_suffix in ("tail.gu_packed", "tail.gu_scale", "tail.gu_mask", "tail.down_packed", "tail.down_scale", "tail.down_mask"):
+                    full_k = f"{gp}{k_suffix}"
+                    if full_k in all_keys:
+                        sub_t[k_suffix] = self._mmap_handle.get_tensor(full_k)
             self.groups.append(
                 ChronosHolographicExpertGroup(
                     group_idx=g_idx,
                     tensors=sub_t,
                     device=device,
                     offload_tail_to_cpu=offload_tail_to_cpu,
+                    mmap_zero_ram=mmap_zero_ram,
+                    mmap_handle=self._mmap_handle if mmap_zero_ram else None,
+                    mmap_prefix=gp,
                     h128=shared_h128,
                 )
             )
+        if not mmap_zero_ram:
+            self._mmap_handle = None
+        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+            try:
+                fd = os.open(self.shard_path_str, os.O_RDONLY)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(fd)
+            except OSError:
+                pass
 
         # Pre-allocated in-place GPU Ring-Buffer views (zero weight gather copy at runtime)
         self.cache_gu_buf = torch.empty((self.hot_cache_size, 1280, 2560), dtype=torch.bfloat16, device=device)
@@ -238,26 +270,78 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
             gates = top_gates[0]
             y_routed = torch.zeros_like(x)
             for k_idx, eid in enumerate(eids):
-                slot = self._ensure_expert_slot(eid)
+                slot = self._ensure_expert_slot(int(eid))
                 gu_out = F.linear(x, self.slot_gu[slot])
                 y_exp = F.linear(F.silu(gu_out[:, :640]) * gu_out[:, 640:], self.slot_d[slot])
                 y_routed.addcmul_(gates[k_idx : k_idx + 1], y_exp)
             return (y_routed + y_shared).view(orig_shape).to(orig_dtype)
 
-        # Multi-token prefill / batch execution (grouped per-active-expert GEMM)
+        # Multi-token prefill / batch execution with Frequency-Gated Non-Thrashing Hot Cache
         y_routed = torch.zeros_like(x)
+        flat_ids = top_ids.view(-1)
+        flat_gates = top_gates.view(-1).float()
+        expert_mass = torch.zeros(512, dtype=torch.float32, device=self.device)
+        expert_mass.scatter_add_(0, flat_ids, flat_gates)
+        expert_mass.scatter_add_(0, top_ids[0], torch.full((self.top_k,), 100.0, dtype=torch.float32, device=self.device))
+
         unique_eids = torch.unique(top_ids).tolist()
-        for eid in unique_eids:
-            slot = self._ensure_expert_slot(int(eid))
+        warm_eids = [int(eid) for eid in unique_eids if self.expert_to_slot[int(eid)] >= 0]
+        cold_eids = [int(eid) for eid in unique_eids if self.expert_to_slot[int(eid)] < 0]
+
+        for eid in warm_eids:
+            slot = self._ensure_expert_slot(eid)
             mask = top_ids == eid
             tok_indices, slot_indices = torch.where(mask)
             x_sel = x[tok_indices]
             g_sel = top_gates[tok_indices, slot_indices].unsqueeze(-1)
-
             gu_out = F.linear(x_sel, self.slot_gu[slot])
             act = F.silu(gu_out[:, :640]) * gu_out[:, 640:]
             y_exp = F.linear(act, self.slot_d[slot])
             y_routed.index_add_(0, tok_indices, g_sel * y_exp)
+
+        if cold_eids:
+            cold_masses = [float(expert_mass[eid].item()) for eid in cold_eids]
+            sorted_cold = [eid for _, eid in sorted(zip(cold_masses, cold_eids), reverse=True)]
+            n_admit = min(len(sorted_cold), max(self.top_k, self.hot_cache_size - len(warm_eids)))
+            admit_set = set(sorted_cold[:n_admit])
+
+            by_group: dict[int, list[int]] = {}
+            for eid in cold_eids:
+                by_group.setdefault(eid // 8, []).append(eid)
+
+            admitted_ordered: list[tuple[float, int, torch.Tensor, torch.Tensor]] = []
+            for g_idx, g_eids in by_group.items():
+                grp = self.groups[g_idx]
+                s_gu_c = unpack_nvfp4(grp.s_gu_packed, grp.s_gu_scale, grp.s_gu_scale2)
+                s_dn_c = unpack_nvfp4(grp.s_down_packed, grp.s_down_scale, grp.s_down_scale2)
+                for eid in g_eids:
+                    gw, uw, dw = grp.reconstruct_expert(eid % 8, s_gu_cached=s_gu_c, s_down_cached=s_dn_c)
+                    gu_w = torch.cat([gw, uw], dim=0).to(torch.bfloat16)
+                    dw_bf16 = dw.to(torch.bfloat16)
+                    mask = top_ids == eid
+                    tok_indices, slot_indices = torch.where(mask)
+                    x_sel = x[tok_indices]
+                    g_sel = top_gates[tok_indices, slot_indices].unsqueeze(-1)
+                    gu_out = F.linear(x_sel, gu_w)
+                    act = F.silu(gu_out[:, :640]) * gu_out[:, 640:]
+                    y_exp = F.linear(act, dw_bf16)
+                    y_routed.index_add_(0, tok_indices, g_sel * y_exp)
+                    if eid in admit_set:
+                        admitted_ordered.append((float(expert_mass[eid].item()), eid, gu_w, dw_bf16))
+
+            for _, eid, gu_w, dw_bf16 in sorted(admitted_ordered, key=lambda item: item[0]):
+                self.cache_misses += 1
+                slot = self.ring_cursor
+                self.ring_cursor = (self.ring_cursor + 1) % self.hot_cache_size
+                old_eid = self.slot_to_expert[slot]
+                if old_eid >= 0:
+                    self.expert_to_slot[old_eid] = -1
+                    self.expert_to_slot_gpu[old_eid] = -1
+                self.slot_gu[slot].copy_(gu_w)
+                self.slot_d[slot].copy_(dw_bf16)
+                self.expert_to_slot[eid] = slot
+                self.expert_to_slot_gpu[eid] = slot
+                self.slot_to_expert[slot] = eid
 
         return (y_routed + y_shared).view(orig_shape).to(orig_dtype)
 

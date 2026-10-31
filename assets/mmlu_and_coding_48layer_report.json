@@ -1,0 +1,591 @@
+{
+  "checkpoint": "/home/defnotean/pb27/hf/flash_next_chronos_v6",
+  "version": "v6.8",
+  "num_layers": 48,
+  "total_routed_experts": 24576,
+  "total_tokens_evaluated": 6516,
+  "elapsed_seconds": 1009.37,
+  "mean_routed_cos": {
+    "cum_cold": 0.8934588606158892,
+    "auto_cold": 0.8886406061549982,
+    "ema48": 1.0000000322858493
+  },
+  "mmlu": {
+    "n": 300,
+    "stock_correct": 255,
+    "stock_acc": 0.85,
+    "cum_cold_correct": 255,
+    "cum_cold_acc": 0.85,
+    "auto_cold_correct": 255,
+    "auto_cold_acc": 0.85,
+    "ema48_correct": 255,
+    "ema48_acc": 0.85,
+    "agreement_with_stock": {
+      "cum_cold": 1.0,
+      "auto_cold": 1.0,
+      "ema48": 1.0
+    },
+    "cs_math_stem_subset": {
+      "n": 53,
+      "stock_correct": 41,
+      "cum_cold_correct": 41,
+      "auto_cold_correct": 41,
+      "ema48_correct": 41
+    }
+  },
+  "mmlu_pro": {
+    "n": 150,
+    "stock_correct": 122,
+    "stock_acc": 0.8133333333333334,
+    "cum_cold_correct": 122,
+    "cum_cold_acc": 0.8133333333333334,
+    "auto_cold_correct": 122,
+    "auto_cold_acc": 0.8133333333333334,
+    "ema48_correct": 122,
+    "ema48_acc": 0.8133333333333334
+  },
+  "custom_code_bench": {
+    "n_problems": 33,
+    "n_code_tokens": 6066,
+    "stock_passed": 32,
+    "stock_pass_rate": 0.9696969696969697,
+    "cum_cold_passed": 32,
+    "cum_cold_pass_rate": 0.9696969696969697,
+    "auto_cold_passed": 32,
+    "auto_cold_pass_rate": 0.9696969696969697,
+    "ema48_passed": 32,
+    "ema48_pass_rate": 0.9696969696969697,
+    "token_match_rate": {
+      "cum_cold": 1.0,
+      "auto_cold": 1.0,
+      "ema48": 1.0
+    },
+    "by_tier": {
+      "easy": {
+        "n": 8,
+        "stk": 8,
+        "cum": 8,
+        "auto": 8,
+        "hyb": 8
+      },
+      "medium": {
+        "n": 12,
+        "stk": 12,
+        "cum": 12,
+        "auto": 12,
+        "hyb": 12
+      },
+      "hard": {
+        "n": 10,
+        "stk": 9,
+        "cum": 9,
+        "auto": 9,
+        "hyb": 9
+      },
+      "fix": {
+        "n": 3,
+        "stk": 3,
+        "cum": 3,
+        "auto": 3,
+        "hyb": 3
+      }
+    },
+    "problems": [
+      {
+        "id": "rle_encode",
+        "tier": "easy",
+        "num_tokens": 107,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "rle_decode",
+        "tier": "easy",
+        "num_tokens": 95,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "balanced",
+        "tier": "easy",
+        "num_tokens": 112,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "roman_to_int",
+        "tier": "easy",
+        "num_tokens": 131,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "int_to_roman",
+        "tier": "easy",
+        "num_tokens": 153,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "merge_intervals",
+        "tier": "easy",
+        "num_tokens": 104,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "top_k_words",
+        "tier": "easy",
+        "num_tokens": 58,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "flatten",
+        "tier": "easy",
+        "num_tokens": 50,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "lru_cache",
+        "tier": "medium",
+        "num_tokens": 221,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "dijkstra",
+        "tier": "medium",
+        "num_tokens": 186,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "topo_sort",
+        "tier": "medium",
+        "num_tokens": 185,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "csv_line",
+        "tier": "medium",
+        "num_tokens": 222,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "eval_expr",
+        "tier": "medium",
+        "num_tokens": 659,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "lcs",
+        "tier": "medium",
+        "num_tokens": 255,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "edit_distance",
+        "tier": "medium",
+        "num_tokens": 147,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "word_wrap",
+        "tier": "medium",
+        "num_tokens": 145,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "next_perm",
+        "tier": "medium",
+        "num_tokens": 192,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "spiral",
+        "tier": "medium",
+        "num_tokens": 259,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "islands",
+        "tier": "medium",
+        "num_tokens": 249,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "base_convert",
+        "tier": "medium",
+        "num_tokens": 243,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "median_stream",
+        "tier": "hard",
+        "num_tokens": 238,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "regex_match",
+        "tier": "hard",
+        "num_tokens": 262,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "min_window",
+        "tier": "hard",
+        "num_tokens": 247,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "weighted_jobs",
+        "tier": "hard",
+        "num_tokens": 123,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "json_path",
+        "tier": "hard",
+        "num_tokens": 169,
+        "stock_passed": false,
+        "cum_cold_passed": false,
+        "auto_cold_passed": false,
+        "ema48_passed": false,
+        "errors": {
+          "stk": "AssertionError: ",
+          "cum": "AssertionError: ",
+          "auto": "AssertionError: ",
+          "hyb": "AssertionError: "
+        }
+      },
+      {
+        "id": "knapsack",
+        "tier": "hard",
+        "num_tokens": 94,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "sudoku",
+        "tier": "hard",
+        "num_tokens": 543,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "time_map",
+        "tier": "hard",
+        "num_tokens": 193,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "simplify_path",
+        "tier": "hard",
+        "num_tokens": 80,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "ledger",
+        "tier": "hard",
+        "num_tokens": 127,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "fix_bisect",
+        "tier": "fix",
+        "num_tokens": 70,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "fix_moving_avg",
+        "tier": "fix",
+        "num_tokens": 84,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      },
+      {
+        "id": "fix_dedupe",
+        "tier": "fix",
+        "num_tokens": 63,
+        "stock_passed": true,
+        "cum_cold_passed": true,
+        "auto_cold_passed": true,
+        "ema48_passed": true,
+        "errors": {
+          "stk": "",
+          "cum": "",
+          "auto": "",
+          "hyb": ""
+        }
+      }
+    ]
+  }
+}

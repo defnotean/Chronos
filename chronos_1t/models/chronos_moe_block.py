@@ -23,6 +23,47 @@ NVFP4_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.
 POS_T = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 LLOYD_MAX_2BIT_LUT = (-1.510417, -0.452780, 0.452780, 1.510417)
 
+_NVFP4_BYTE_LUT_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+_LLOYD2_BYTE_LUT_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+_1BIT_BYTE_LUT_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+_EXPERT_KEY_CACHE: dict[tuple[int, int, int, int, torch.device], tuple[torch.Tensor, ...]] = {}
+
+
+def _get_nvfp4_byte_lut(device: torch.device, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    key = (device, dtype)
+    lut = _NVFP4_BYTE_LUT_CACHE.get(key)
+    if lut is None:
+        base = torch.tensor(NVFP4_LUT, dtype=torch.float32, device=device)
+        b = torch.arange(256, dtype=torch.int64, device=device)
+        lut = torch.stack([base[b & 0x0F], base[(b >> 4) & 0x0F]], dim=-1).to(dtype).contiguous()
+        _NVFP4_BYTE_LUT_CACHE[key] = lut
+    return lut
+
+
+def _get_lloyd2_byte_lut(device: torch.device, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    key = (device, dtype)
+    lut = _LLOYD2_BYTE_LUT_CACHE.get(key)
+    if lut is None:
+        base = torch.tensor(LLOYD_MAX_2BIT_LUT, dtype=torch.float32, device=device)
+        b = torch.arange(256, dtype=torch.int64, device=device)
+        lut = torch.stack(
+            [base[b & 0x03], base[(b >> 2) & 0x03], base[(b >> 4) & 0x03], base[(b >> 6) & 0x03]],
+            dim=-1,
+        ).to(dtype).contiguous()
+        _LLOYD2_BYTE_LUT_CACHE[key] = lut
+    return lut
+
+
+def _get_1bit_byte_lut(device: torch.device, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    key = (device, dtype)
+    lut = _1BIT_BYTE_LUT_CACHE.get(key)
+    if lut is None:
+        b = torch.arange(256, dtype=torch.int64, device=device)
+        bits = torch.stack([((b >> i) & 0x01) for i in range(8)], dim=-1)
+        lut = (bits.to(torch.float32) * 2.0 - 1.0).to(dtype).contiguous()
+        _1BIT_BYTE_LUT_CACHE[key] = lut
+    return lut
+
 
 def build_hadamard_128(device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     h = torch.tensor([[1.0]], device=device, dtype=torch.float32)
@@ -72,13 +113,10 @@ def unpack_nvfp4(
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     device = packed.device
-    lut = torch.tensor(NVFP4_LUT, dtype=torch.float32, device=device)
-    low = packed & 0x0F
-    high = (packed >> 4) & 0x0F
-    unpacked = torch.stack([low, high], dim=-1).view(packed.shape[0], -1)
-    vals = lut[unpacked.long()].view(packed.shape[0], -1, 16)
-    scales = scale_fp8.to(torch.float32).unsqueeze(-1) * scale_2.to(device=device, dtype=torch.float32)
-    return (vals * scales).view(packed.shape[0], -1).to(dtype)
+    lut256 = _get_nvfp4_byte_lut(device, dtype)
+    vals = lut256[packed.to(torch.int32)].view(packed.shape[0], -1, 16)
+    scales = (scale_fp8.to(torch.float32).unsqueeze(-1) * scale_2.to(device=device, dtype=torch.float32)).to(dtype)
+    return (vals * scales).view(packed.shape[0], -1)
 
 
 def pack_2bit_lloyd_max(res_tail: torch.Tensor, block_size: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
@@ -113,16 +151,10 @@ def unpack_2bit_lloyd_max(
     device = packed_u8.device
     rows = packed_u8.shape[0]
     cols = packed_u8.shape[1] * 4
-    lut = torch.tensor(LLOYD_MAX_2BIT_LUT, dtype=torch.float32, device=device)
-
-    c0 = packed_u8 & 0x03
-    c1 = (packed_u8 >> 2) & 0x03
-    c2 = (packed_u8 >> 4) & 0x03
-    c3 = (packed_u8 >> 6) & 0x03
-    codes = torch.stack([c0, c1, c2, c3], dim=-1).view(rows, cols)
-    vals = lut[codes.long()].view(rows, cols // block_size, block_size)
-    scales = sigma_fp8.float().unsqueeze(-1)
-    return (vals * scales).view(rows, cols).to(dtype)
+    lut256 = _get_lloyd2_byte_lut(device, dtype)
+    vals = lut256[packed_u8.to(torch.int32)].view(rows, cols // block_size, block_size)
+    scales = sigma_fp8.to(dtype).unsqueeze(-1)
+    return (vals * scales).view(rows, cols)
 
 
 def pack_ternary_base3(res_tail: torch.Tensor, block_size: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
@@ -188,13 +220,13 @@ def unpack_1bit_rademacher(
     block_size: int = 64,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
+    device = packed_u8.device
     rows = packed_u8.shape[0]
     cols = packed_u8.shape[1] * 8
-    bits_list = [((packed_u8 >> b) & 0x01) for b in range(8)]
-    bits = torch.stack(bits_list, dim=-1).view(rows, cols)
-    signs = bits.float() * 2.0 - 1.0
-    scales = sigma_fp8.float().unsqueeze(-1)
-    return (signs.view(rows, cols // block_size, block_size) * scales).view(rows, cols).to(dtype)
+    lut256 = _get_1bit_byte_lut(device, dtype)
+    signs = lut256[packed_u8.to(torch.int32)].view(rows, cols // block_size, block_size)
+    scales = sigma_fp8.to(dtype).unsqueeze(-1)
+    return (signs * scales).view(rows, cols)
 
 
 def pack_sparse_2bit_lloyd_max(
@@ -280,6 +312,10 @@ def generate_expert_1d_keys(
     seed_base: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cache_key = (rows, cols, expert_id, seed_base, device)
+    cached = _EXPERT_KEY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     gen = torch.Generator(device=device)
     gen.manual_seed(seed_base + (expert_id + 1) * 104729)
     r_s1 = torch.randint(0, 2, (rows,), generator=gen, device=device, dtype=torch.int8).float() * 2.0 - 1.0
@@ -290,7 +326,10 @@ def generate_expert_1d_keys(
     c_perm = torch.randperm(cols, generator=gen, device=device)
     c_inv = torch.argsort(c_perm)
     c_s2 = torch.randint(0, 2, (cols,), generator=gen, device=device, dtype=torch.int8).float() * 2.0 - 1.0
-    return r_s1, r_perm, r_inv, r_s2, c_s1, c_perm, c_inv, c_s2
+    res = (r_s1, r_perm, r_inv, r_s2, c_s1, c_perm, c_inv, c_s2)
+    if len(_EXPERT_KEY_CACHE) < 1024:
+        _EXPERT_KEY_CACHE[cache_key] = res
+    return res
 
 
 def apply_1d_permuted_hadamard_rows(
@@ -343,8 +382,14 @@ def unbind_2d_permuted_hadamard(
     c_s2: torch.Tensor,
     h128: torch.Tensor,
 ) -> torch.Tensor:
-    tmp = unbind_1d_permuted_hadamard_rows(s.T.contiguous(), r_s1, r_inv, r_s2, h128).T.contiguous()
-    return unbind_1d_permuted_hadamard_rows(tmp, c_s1, c_inv, c_s2, h128)
+    rows, cols = s.shape
+    dt = s.dtype
+    h = h128.to(dt)
+    x = s * r_s2.to(dt).unsqueeze(1)
+    x = torch.matmul(h, x.view(rows // 128, 128, cols)).view(rows, cols)
+    x = x[r_inv] * (r_s1.to(dt).unsqueeze(1) * c_s2.to(dt).unsqueeze(0))
+    x = torch.matmul(x.view(rows, cols // 128, 128), h).view(rows, cols)
+    return x[:, c_inv] * c_s1.to(dt).unsqueeze(0)
 
 
 class ChronosHolographicExpertGroup(nn.Module):
@@ -358,12 +403,18 @@ class ChronosHolographicExpertGroup(nn.Module):
         tensors: dict[str, torch.Tensor],
         device: torch.device,
         offload_tail_to_cpu: bool = True,
+        mmap_zero_ram: bool = False,
+        mmap_handle: object = None,
+        mmap_prefix: str = "",
         h128: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.group_idx = group_idx
         self.device = device
         self.h128 = h128 if h128 is not None else build_hadamard_128(device)
+        self.mmap_zero_ram = mmap_zero_ram and (mmap_handle is not None)
+        self.mmap_handle = mmap_handle
+        self.mmap_prefix = mmap_prefix
 
         # Packed 8:1 NVFP4 Holographic Banks (Always GPU-Resident: 1.80 MB/group)
         self.s_gu_packed = tensors["s_gu.weight"].to(device)
@@ -382,23 +433,36 @@ class ChronosHolographicExpertGroup(nn.Module):
         self.u_down = tensors["healer.u_down"].to(device)    # (K, 2560, r) float8_e4m3fn
         self.v_down = tensors["healer.v_down"].to(device)    # (K, r, 640)  float8_e4m3fn
 
-        # Bit-packed Isotropic Gaussian Tail Lattices (Zero-Copy Unified Memory / CPU mmap by default)
-        tail_dev = torch.device("cpu") if offload_tail_to_cpu else device
         self.gu_tail_bits = int(tensors.get("tail.gu_bits", torch.tensor(1)).item())
-        self.gu_tail_packed = tensors["tail.gu_packed"].to(tail_dev)
-        self.gu_tail_scale = tensors["tail.gu_scale"].to(tail_dev)
-        self.gu_tail_mask = tensors["tail.gu_mask"].to(tail_dev) if "tail.gu_mask" in tensors else None
-
         self.down_tail_bits = int(tensors.get("tail.down_bits", torch.tensor(2)).item())
-        self.down_tail_packed = tensors["tail.down_packed"].to(tail_dev)
-        self.down_tail_scale = tensors["tail.down_scale"].to(tail_dev)
-        self.down_tail_mask = tensors["tail.down_mask"].to(tail_dev) if "tail.down_mask" in tensors else None
+
+        if self.mmap_zero_ram:
+            self.gu_tail_packed = None
+            self.gu_tail_scale = None
+            self.gu_tail_mask = None
+            self.down_tail_packed = None
+            self.down_tail_scale = None
+            self.down_tail_mask = None
+        else:
+            tail_dev = torch.device("cpu") if offload_tail_to_cpu else device
+            self.gu_tail_packed = tensors["tail.gu_packed"].to(tail_dev)
+            self.gu_tail_scale = tensors["tail.gu_scale"].to(tail_dev)
+            self.gu_tail_mask = tensors["tail.gu_mask"].to(tail_dev) if "tail.gu_mask" in tensors else None
+
+            self.down_tail_packed = tensors["tail.down_packed"].to(tail_dev)
+            self.down_tail_scale = tensors["tail.down_scale"].to(tail_dev)
+            self.down_tail_mask = tensors["tail.down_mask"].to(tail_dev) if "tail.down_mask" in tensors else None
 
     @torch.no_grad()
-    def reconstruct_expert(self, local_m: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def reconstruct_expert(
+        self,
+        local_m: int,
+        s_gu_cached: torch.Tensor | None = None,
+        s_down_cached: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reconstructs (gate_w, up_w, down_w) for expert `local_m` in 0..K-1 from the packed tensors."""
-        s_gu = unpack_nvfp4(self.s_gu_packed, self.s_gu_scale, self.s_gu_scale2)
-        s_down = unpack_nvfp4(self.s_down_packed, self.s_down_scale, self.s_down_scale2)
+        s_gu = s_gu_cached if s_gu_cached is not None else unpack_nvfp4(self.s_gu_packed, self.s_gu_scale, self.s_gu_scale2)
+        s_down = s_down_cached if s_down_cached is not None else unpack_nvfp4(self.s_down_packed, self.s_down_scale, self.s_down_scale2)
 
         r_s1, _, r_inv, r_s2, c_s1, _, c_inv, c_s2 = generate_expert_1d_keys(
             1280, 2560, local_m, seed_base=101 + self.group_idx * 8, device=self.device
@@ -406,8 +470,20 @@ class ChronosHolographicExpertGroup(nn.Module):
         h_gu = unbind_2d_permuted_hadamard(s_gu, r_s1, r_inv, r_s2, c_s1, c_inv, c_s2, self.h128)
         healer_gu = self.u_gu[local_m].float() @ self.v_gu[local_m].float()
 
-        gu_p_m = self.gu_tail_packed[local_m].to(self.device, non_blocking=True)
-        gu_s_m = self.gu_tail_scale[local_m].to(self.device, non_blocking=True)
+        if self.mmap_zero_ram and self.mmap_handle is not None:
+            p = self.mmap_prefix
+            gu_p_m = self.mmap_handle.get_slice(f"{p}tail.gu_packed")[local_m].to(self.device, non_blocking=True)
+            gu_s_m = self.mmap_handle.get_slice(f"{p}tail.gu_scale")[local_m].to(self.device, non_blocking=True)
+            dn_p_m = self.mmap_handle.get_slice(f"{p}tail.down_packed")[local_m].to(self.device, non_blocking=True)
+            dn_s_m = self.mmap_handle.get_slice(f"{p}tail.down_scale")[local_m].to(self.device, non_blocking=True)
+        else:
+            assert self.gu_tail_packed is not None and self.gu_tail_scale is not None
+            assert self.down_tail_packed is not None and self.down_tail_scale is not None
+            gu_p_m = self.gu_tail_packed[local_m].to(self.device, non_blocking=True)
+            gu_s_m = self.gu_tail_scale[local_m].to(self.device, non_blocking=True)
+            dn_p_m = self.down_tail_packed[local_m].to(self.device, non_blocking=True)
+            dn_s_m = self.down_tail_scale[local_m].to(self.device, non_blocking=True)
+
         if self.gu_tail_bits == 20 and self.gu_tail_mask is not None:
             gu_m_m = self.gu_tail_mask[local_m].to(self.device, non_blocking=True)
             tail_gu = unpack_sparse_2bit_lloyd_max(gu_m_m, gu_p_m, gu_s_m, 1280, 2560)
@@ -420,7 +496,7 @@ class ChronosHolographicExpertGroup(nn.Module):
         else:
             tail_gu = torch.zeros_like(h_gu)
 
-        gu_hat = float(self.beta_gu[local_m].item()) * h_gu + healer_gu + tail_gu
+        gu_hat = self.beta_gu[local_m].float() * h_gu + healer_gu + tail_gu
         gate_hat = gu_hat[:640, :]
         up_hat = gu_hat[640:, :]
 
@@ -430,8 +506,6 @@ class ChronosHolographicExpertGroup(nn.Module):
         h_down = unbind_2d_permuted_hadamard(s_down, dr_s1, dr_inv, dr_s2, dc_s1, dc_inv, dc_s2, self.h128)
         healer_down = self.u_down[local_m].float() @ self.v_down[local_m].float()
 
-        dn_p_m = self.down_tail_packed[local_m].to(self.device, non_blocking=True)
-        dn_s_m = self.down_tail_scale[local_m].to(self.device, non_blocking=True)
         if self.down_tail_bits == 20 and self.down_tail_mask is not None:
             dn_m_m = self.down_tail_mask[local_m].to(self.device, non_blocking=True)
             tail_down = unpack_sparse_2bit_lloyd_max(dn_m_m, dn_p_m, dn_s_m, 2560, 640)
@@ -444,5 +518,5 @@ class ChronosHolographicExpertGroup(nn.Module):
         else:
             tail_down = torch.zeros_like(h_down)
 
-        down_hat = float(self.beta_down[local_m].item()) * h_down + healer_down + tail_down
+        down_hat = self.beta_down[local_m].float() * h_down + healer_down + tail_down
         return gate_hat, up_hat, down_hat

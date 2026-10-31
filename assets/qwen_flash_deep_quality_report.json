@@ -1,0 +1,37 @@
+{
+  "model": "PB27Qwen4ExpForConditionalGeneration",
+  "chronos_version": "v6.8",
+  "layers_evaluated": 48,
+  "total_experts": 24576,
+  "total_tokens": 8558,
+  "elapsed_s": 1087.8,
+  "mean_routed_cos": {
+    "cum_cold": 0.893429,
+    "auto_cold": 0.888642,
+    "ema_48": 1.0
+  },
+  "gsm8k_150": {
+    "total_problems": 150,
+    "total_tokens": 4800,
+    "stock_solved": 144,
+    "stock_acc": 0.96,
+    "chronos_cum_solved": 144,
+    "chronos_auto_solved": 144,
+    "chronos_ema48_solved": 144,
+    "chronos_acc": 0.96,
+    "token_identity_cum": 1.0,
+    "token_identity_auto": 1.0,
+    "token_identity_ema48": 1.0,
+    "exact_cot_matches": 150
+  },
+  "swe_live_60": {
+    "total_instances": 59,
+    "total_patch_tokens": 3758,
+    "stock_resolved": 34,
+    "chronos_auto_resolved": 34,
+    "exact_patch_matches": 59,
+    "patch_token_identity_cum": 1.0,
+    "patch_token_identity_auto": 1.0,
+    "patch_token_identity_ema48": 1.0
+  }
+}
