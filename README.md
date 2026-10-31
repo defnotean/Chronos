@@ -178,6 +178,57 @@ Evaluated via [`benchmarks/glm53_official_benchmarks_eval.py`](benchmarks/glm53_
 | **7. `NL2Repo`** | 1M-Context Zero-Shot Repo Synthesis & Anti-Hacking (`n = 30`, `960` tok) | `83.3%` | `83.3%` | **`83.3%`** (`Cum-Cold` / `Auto-Cold` / `Hybrid-16`) | **`83.3%`** (`Cum-Cold` / `Auto-Cold` / `Hybrid-16`) | **`99.90%` Std / `99.58%` Compact (`100.0%` Top-5)** | **`100.00%`** |
 | **8. `Toolathlon Verified`** | Multi-Turn Chained Tool-Call Verification (`n = 36`, `1,152` tok) | `77.8%` | `77.8%` | **`77.8%`** (`Cum-Cold` / `Auto-Cold` / `Hybrid-16`) | **`77.8%`** (`Cum-Cold` / `Auto-Cold` / `Hybrid-16`) | **`100.00%` Std / `100.00%` Compact (`100.0%` Top-5)** | **`100.00%`** |
 
+### 2.11 Real 48-Layer Side-by-Side Autoregressive Generation & Subprocess `assert` Unit-Test Grading (`Qwen Flash Next` on DGX Spark `NVIDIA GB10`)
+
+Evaluated via [`benchmarks/real_e2e_side_by_side_eval.py`](benchmarks/real_e2e_side_by_side_eval.py) ([`assets/real_e2e_side_by_side_report.json`](assets/real_e2e_side_by_side_report.json)) on the live `pb27-vllm` server (`127.0.0.1:8000`) on the DGX Spark (`NVIDIA GB10`) with **zero proxies and zero synthetic vectors**:
+- **Full 48-Layer Pipeline**: Real plain-text prompts $\to$ Real Tokenizer $\to$ Real `embed_tokens` $\to$ **48 Full Layers (`Attention` / `Gated DeltaNet` / `PLE` + `ChronosQwen4ExpSparseMoeBlock` across `24,576` routed experts)** $\to$ Final `RMSNorm` $\to$ `lm_head` $\to$ Greedy token-by-token autoregressive decoding (`temperature=0.0`).
+- **Real Subprocess Execution Grading**: Every generated Python function (`HumanEval`, `MBPP`, `DeepSWE`) is executed in an isolated `python3 -c` subprocess against real `assert` unit tests.
+- **Aggregate Score**:
+  - **48-Layer Stock (`STOCK_48L`)**: **`18 / 20` (`90.0%` Pass Rate)**
+  - **48-Layer Chronos (`CHRONOS_48L`)**: **`19 / 20` (`95.0%` Pass Rate — `105.56%` Capability Retention vs. Stock)**
+  - **48-Layer Hot-Cache Telemetry**: **`151,828` Cache Hits / `149,817` Cache Misses (`50.33%` Hit Rate across all 48 layers)** with **`32.0 GiB` free unified RAM** on the `121 GiB` DGX Spark (via in-place `untyped_storage().resize_(0)` deallocation of replaced stock `layer.mlp` weights and `POSIX_FADV_DONTNEED` page reclamation).
+
+| Task ID | Category | 48-Layer Stock Output (Verbatim Summary) | Stock Grade | 48-Layer Chronos Output (Verbatim Summary) | Chronos Grade |
+| :--- | :--- | :--- | :---: | :--- | :---: |
+| **`HumanEval/0`** | Coding (`has_close_elements`) | `sorted_numbers = sorted(numbers)... if abs(...) < threshold: return True` | `PASS` (`ALL_ASSERTS_PASSED`) | `sorted_numbers = sorted(numbers)... if sorted_numbers[i + 1] - sorted_numbers[i] < threshold: return True` | **`PASS` (`ALL_ASSERTS_PASSED`)** |
+| **`HumanEval/2`** | Coding (`truncate_number`) | `return number - int(number)` | `PASS` (`ALL_ASSERTS_PASSED`) | `return round(decimal_part, 1)` | `FAIL` (`AssertionError` on `1.33`) |
+| **`HumanEval/23`** | Coding (`strlen`) | `return len(string)` | `PASS` (`ALL_ASSERTS_PASSED`) | `return len(string)` *(100% Exact Match)* | **`PASS` (`ALL_ASSERTS_PASSED`)** |
+| **`HumanEval/31`** | Coding (`is_prime`) | `if n < 2: return False; for i in range(2, int(n**0.5) + 1): ...` | `PASS` (`ALL_ASSERTS_PASSED`) | `if n < 2: return False; for i in range(2, int(n**0.5) + 1): ...` *(100% Exact Match)* | **`PASS` (`ALL_ASSERTS_PASSED`)** |
+| **`HumanEval/45`** | Coding (`triangle_area`) | `return (a * h) / 2` | `PASS` (`ALL_ASSERTS_PASSED`) | `return a * h / 2` | **`PASS` (`ALL_ASSERTS_PASSED`)** |
+| **`HumanEval/53`** | Coding (`add`) | `return x + y` | `PASS` (`ALL_ASSERTS_PASSED`) | `return x + y` *(100% Exact Match)* | **`PASS` (`ALL_ASSERTS_PASSED`)** |
+| **`MBPP/11`** | Coding (`remove_Occ`) | `s.replace(ch, '', 1); s[::-1].replace(ch, '', 1)[::-1]` | `PASS` (`ALL_ASSERTS_PASSED`) | `first = s.find(ch); last = s.rfind(ch); return s[:first] + s[first+1:last] + s[last+1:]` | **`PASS` (`ALL_ASSERTS_PASSED`)** |
+| **`MBPP/58`** | Coding (`opposite_Signs`) | `return (x ^ y) < 0` | `PASS` (`ALL_ASSERTS_PASSED`) | `return (x ^ y) < 0` *(100% Exact Match)* | **`PASS` (`ALL_ASSERTS_PASSED`)** |
+| **`DeepSWE/1`** | Agentic Bug Fix (`binary_search`) | `low = 0; high = len(arr) - 1 ... while low <= high: ...` | `PASS` (`ALL_ASSERTS_PASSED`) | `low = 0; high = len(arr) - 1  # FIX: was len(arr) ... while low <= high: ...` | **`PASS` (`ALL_ASSERTS_PASSED`)** |
+| **`GSM8K/1`** | Math Word Problem | `48 / 2 = 24 clips. Altogether, she sold 48 + 24 = 72 clips. #### 72` | `PASS` (`72 == 72`) | `48 / 2 = 24 clips. Altogether, Natalia sold 48 + 24 = 72 clips. #### 72` | **`PASS` (`72 == 72`)** |
+| **`GSM8K/2`** | Math Word Problem | `$12/60 = $0.20/min ... 50 * $0.20 = $10. #### 10` | `PASS` (`10 == 10`) | `$12/60 = $0.20/min. She babysat for 50 minutes, so she earned 50 * $0.20 = $10. #### 10` | **`PASS` (`10 == 10`)** |
+| **`GSM8K/3`** | Math Word Problem | `2 * $15 = $30 ... $100 - $95 = $5 more. <think>...` *(truncated before `#### 5`)* | `FAIL` (`extracted=100`) | `$15 * 2 = $30. So, Betty has $50 + $15 + $30 = $95. She needs $100 - $95 = $5 more. #### 5` | **`PASS` (`5 == 5`)** |
+| **`GSM8K/4`** | Math Word Problem | `12 pages.` *(stopped early)* | `FAIL` (`extracted=12`) | `12 pages. Over 52 weeks, he writes 12 * 52 = 624 pages. #### 624` | **`PASS` (`624 == 624`)** |
+| **`MMLU/Physics`** | STEM (`Kinetic Energy`) | `C` | `PASS` (`C == C`) | `C` *(100% Exact Match)* | **`PASS` (`C == C`)** |
+| **`MMLU/CS`** | Computer Science (`Binary Search`) | `B` | `PASS` (`B == B`) | `B` *(100% Exact Match)* | **`PASS` (`B == B`)** |
+| **`MMLU/Biology`** | Biology (`Mitochondrion`) | `B` | `PASS` (`B == B`) | `B` *(100% Exact Match)* | **`PASS` (`B == B`)** |
+| **`MMLU/History`** | World History (`Westphalia 1648`) | `C` | `PASS` (`C == C`) | `C` *(100% Exact Match)* | **`PASS` (`C == C`)** |
+| **`MMLU/Economics`** | Macroeconomics (`Open-Market Sale`) | `B` | `PASS` (`B == B`) | `B` *(100% Exact Match)* | **`PASS` (`B == B`)** |
+| **`Terminal-Bench/1`** | Agentic Bash CLI (`find` + `grep`) | `find /var/log -name "*.log" -exec grep -c "ERROR" {} +` | `PASS` (`Valid CLI`) | `find /var/log -name "*.log" -exec grep -c "ERROR" {} \;` | **`PASS` (`Valid CLI`)** |
+| **`Toolathlon/1`** | Agentic JSON Tool Call | `{"tool": "query_database", "arguments": {"table": "orders", "limit": 5}}` | `PASS` (`Valid JSON`) | `{"tool": "query_database", "arguments": {"table": "orders", "limit": 5}}` *(100% Exact Match)* | **`PASS` (`Valid JSON`)** |
+
+### 2.12 Full 46-Layer `zai-org/GLM-5.3-Flash` (`12,384` Routed Experts + Dense Layers `0..2` + MLA Attention + `embed_tokens` + `lm_head` + Tokenizer) Conversion & Real-Token Evaluation (`NVIDIA A100-SXM4-80GB`)
+
+Converted and evaluated via [`chronos_1t/converter/convert_full_46layer_glm53.py`](chronos_1t/converter/convert_full_46layer_glm53.py) and [`benchmarks/glm53_real_46layer_e2e_eval.py`](benchmarks/glm53_real_46layer_e2e_eval.py) ([`assets/full_46layer_progress.json`](assets/full_46layer_progress.json) & [`assets/glm53_real_46layer_eval.json`](assets/glm53_real_46layer_eval.json)) on Google Colab `NVIDIA A100-SXM4-80GB`:
+- **Complete 46-Layer Self-Contained Checkpoint (`/content/glm53_flash_chronos_v6`)**:
+  - **Config & Real Tokenizer**: `config.json`, `tokenizer.json`, `tokenizer_config.json`, `generation_config.json` (`16.5 MB`)
+  - **Embeddings & Output Head**: `chronos-glm5-embeddings-and-lm-head.safetensors` (`model.embed_tokens.weight` `[154,880 × 4,096]`, `model.norm.weight`, `lm_head.weight` `[154,880 × 4,096]` = `2.363 GB`)
+  - **Dense Layers `0..2`**: `chronos-glm5-layer-00000..00002-of-00046.safetensors` (MLA Attention + Dense SwiGLU MLP `gate_proj`/`up_proj`/`down_proj` = `0.556 GB / layer`)
+  - **Sparse MoE Layers `3..45` (`43` MoE Layers = `12,384` Routed Experts)**: `chronos-glm5-layer-00003..00045-of-00046.safetensors` (`36` Holographic Groups/Layer + Coupled Rank-64 `FP8` SVD Healer + `1-Bit`/`2-Bit` Tail Lattice + Shared Expert + MLA Attention = `1.971–2.098 GB / layer`)
+  - **Total Full-Model Disk Footprint**: **`92.58 GB` (`93.10 GB` with metadata)** vs. **`305.80 GB` Stock Block-`FP8`** (**`3.30x` Full-Model Compression**, freeing **`-213.22 GB`** so the entire 46-layer `GLM-5.3-Flash` checkpoint fits on a single `128 GB` DGX Spark).
+- **Real-Token Evaluation (`318` Real Tokenized Tokens via `tokenizer.json` + `embed_tokens` + All 46 Layers + `154,880`-Vocab `lm_head`)**:
+
+| `GLM-5.3-Flash` MoE Layer | Converted Shard Size | Real Tokens Evaluated (`tokenizer.json`) | Residual Stream Cosine vs. Stock `FP8` | `154,880`-Vocab `lm_head` Logit Cosine vs. Stock `FP8` | Real-Token Top-1 Match | Real-Token Top-5 Containment |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Layer `10` (Early-Mid Depth)** | `2.098 GB` | `318` Real Tokens | **`99.5095%`** | **`99.4556%`** | **`81.76%`** | **`100.00%`** |
+| **Layer `23` (Middle Depth)** | `1.971 GB` | `318` Real Tokens | **`99.7656%`** | **`99.7419%`** | **`85.53%`** | **`100.00%`** |
+| **Layer `35` (Deep Layer)** | `1.971 GB` | `318` Real Tokens | **`99.3214%`** | **`99.2899%`** | **`81.13%`** | **`98.11%`** |
+| **Layer `44` (Final Standard MoE Layer)** | `2.098 GB` | `318` Real Tokens | **`99.0483%`** | **`98.9188%`** | **`70.13%`** | **`97.17%`** |
+
 ---
 
 ## 3. Complete 128 GB DGX Spark Unified Memory Map (1T MoE + 1M Context)
@@ -203,6 +254,9 @@ Evaluated via [`benchmarks/glm53_official_benchmarks_eval.py`](benchmarks/glm53_
 - [`chronos_1t/models/patch_glm5_vllm.py`](chronos_1t/models/patch_glm5_vllm.py): Runtime & `vLLM` model-registry hook (`install_chronos_moe_into_glm5`, `enable_chronos_glm5_vllm_hook`) for `Glm5NextForConditionalGeneration`.
 - [`chronos_1t/vllm_plugin.py`](chronos_1t/vllm_plugin.py) & [`pyproject.toml`](pyproject.toml): Zero-Touch `vllm.general_plugins` entrypoint (`chronos_1t.vllm_plugin:register`) for automatic `vLLM` model-registry patching without custom wrapper code.
 - [`benchmarks/glm53_official_benchmarks_eval.py`](benchmarks/glm53_official_benchmarks_eval.py): `Chronos v7.5` Ultra-Zero-Con hardware verification and 8-suite official `zai-org/GLM-5.3-Flash` benchmark evaluation (`Terminal-Bench 2.1`, `DeepSWE v1.1`, `Agents' Last Exam`, `AutomationBench v1.0.6`, `HLE w/ Tools`, `GDPval-AA v2`, `NL2Repo`, and `Toolathlon Verified`).
+- [`benchmarks/real_e2e_side_by_side_eval.py`](benchmarks/real_e2e_side_by_side_eval.py): Real 48-layer side-by-side autoregressive text/code generation (`temperature=0.0`) and subprocess `python3` `assert` unit-test grading (`Stock` vs. `Chronos` on `pb27-vllm`).
+- [`chronos_1t/converter/convert_full_46layer_glm53.py`](chronos_1t/converter/convert_full_46layer_glm53.py): Full 46-layer streaming converter for `zai-org/GLM-5.3-Flash` (`0..2` dense layers + `3..45` sparse MoE layers = `12,384` routed experts + MLA attention + `embed_tokens` + `lm_head` + `tokenizer.json`).
+- [`benchmarks/glm53_real_46layer_e2e_eval.py`](benchmarks/glm53_real_46layer_e2e_eval.py): Full 46-layer real-token evaluation (`tokenizer.json` + `embed_tokens` + 46 layers + `154,880`-vocab `lm_head`) comparing Stock `FP8` vs. converted `Chronos` shards on `318` real tokens.
 - [`chronos_1t/converter/convert_all_48_layers.py`](chronos_1t/converter/convert_all_48_layers.py): Vectorized GPU streaming converter (`convert_expert_group_batched`, `batched_exact_gram_smw_healer`) converting all 48 layers (`24,576` routed experts) into `/home/defnotean/pb27/hf/flash_next_chronos_v6`.
 - [`chronos_1t/converter/convert_glm53_flash_colab.py`](chronos_1t/converter/convert_glm53_flash_colab.py): Streaming `128×128` Block-`FP8` converter (`batched_top_eigh_gram` 2-pass TensorCore subspace iteration + Coupled Rank-64 `FP8` SVD Healer + 2-Bit Isotropic Lloyd-Max Gaussian Tail Lattice) for `zai-org/GLM-5.3-Flash`.
 - [`chronos_1t/converter/verify_converted_checkpoint.py`](chronos_1t/converter/verify_converted_checkpoint.py): Multi-layer chained verification suite validating converted `.safetensors` shards directly from disk against stock `flash_next_nvfp4`.

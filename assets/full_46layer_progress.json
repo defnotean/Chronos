@@ -1,0 +1,264 @@
+{
+  "completed_count": 43,
+  "total_target_layers": 43,
+  "layers": [
+    {
+      "layer": 3,
+      "status": "converted",
+      "elapsed_s": 58.18,
+      "size_gb": 1.971
+    },
+    {
+      "layer": 4,
+      "status": "converted",
+      "elapsed_s": 54.75,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 5,
+      "status": "converted",
+      "elapsed_s": 68.43,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 6,
+      "status": "converted",
+      "elapsed_s": 38.62,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 7,
+      "status": "converted",
+      "elapsed_s": 52.99,
+      "size_gb": 1.971
+    },
+    {
+      "layer": 8,
+      "status": "converted",
+      "elapsed_s": 37.82,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 9,
+      "status": "converted",
+      "elapsed_s": 41.09,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 10,
+      "status": "converted",
+      "elapsed_s": 41.21,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 11,
+      "status": "converted",
+      "elapsed_s": 37.47,
+      "size_gb": 1.971
+    },
+    {
+      "layer": 12,
+      "status": "converted",
+      "elapsed_s": 54.01,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 13,
+      "status": "converted",
+      "elapsed_s": 38.54,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 14,
+      "status": "converted",
+      "elapsed_s": 52.13,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 15,
+      "status": "converted",
+      "elapsed_s": 38.39,
+      "size_gb": 1.971
+    },
+    {
+      "layer": 16,
+      "status": "converted",
+      "elapsed_s": 39.05,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 17,
+      "status": "converted",
+      "elapsed_s": 52.88,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 18,
+      "status": "converted",
+      "elapsed_s": 38.84,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 19,
+      "status": "converted",
+      "elapsed_s": 38.96,
+      "size_gb": 1.971
+    },
+    {
+      "layer": 20,
+      "status": "converted",
+      "elapsed_s": 49.05,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 21,
+      "status": "converted",
+      "elapsed_s": 38.07,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 22,
+      "status": "converted",
+      "elapsed_s": 52.95,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 23,
+      "status": "converted",
+      "elapsed_s": 38.13,
+      "size_gb": 1.971
+    },
+    {
+      "layer": 24,
+      "status": "converted",
+      "elapsed_s": 52.95,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 25,
+      "status": "converted",
+      "elapsed_s": 38.53,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 26,
+      "status": "converted",
+      "elapsed_s": 41.27,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 27,
+      "status": "converted",
+      "elapsed_s": 53.32,
+      "size_gb": 1.971
+    },
+    {
+      "layer": 28,
+      "status": "converted",
+      "elapsed_s": 37.27,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 29,
+      "status": "converted",
+      "elapsed_s": 42.92,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 30,
+      "status": "converted",
+      "elapsed_s": 43.74,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 31,
+      "status": "converted",
+      "elapsed_s": 59.15,
+      "size_gb": 1.971
+    },
+    {
+      "layer": 32,
+      "status": "converted",
+      "elapsed_s": 40.0,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 33,
+      "status": "converted",
+      "elapsed_s": 52.77,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 34,
+      "status": "converted",
+      "elapsed_s": 37.32,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 35,
+      "status": "converted",
+      "elapsed_s": 39.14,
+      "size_gb": 1.971
+    },
+    {
+      "layer": 36,
+      "status": "converted",
+      "elapsed_s": 59.19,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 37,
+      "status": "converted",
+      "elapsed_s": 37.42,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 38,
+      "status": "converted",
+      "elapsed_s": 52.69,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 39,
+      "status": "converted",
+      "elapsed_s": 39.58,
+      "size_gb": 1.971
+    },
+    {
+      "layer": 40,
+      "status": "converted",
+      "elapsed_s": 57.54,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 41,
+      "status": "converted",
+      "elapsed_s": 37.86,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 42,
+      "status": "converted",
+      "elapsed_s": 53.17,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 43,
+      "status": "converted",
+      "elapsed_s": 37.0,
+      "size_gb": 1.971
+    },
+    {
+      "layer": 44,
+      "status": "converted",
+      "elapsed_s": 40.72,
+      "size_gb": 2.098
+    },
+    {
+      "layer": 45,
+      "status": "converted",
+      "elapsed_s": 46.94,
+      "size_gb": 2.037
+    }
+  ]
+}

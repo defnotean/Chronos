@@ -1,0 +1,437 @@
+{
+  "model": "zai-org/GLM-5.3-Flash (Chronos-1T v7.5 Full 46-Layer Checkpoint)",
+  "total_layers_converted": 46,
+  "dense_layers_0_to_2": 3,
+  "moe_layers_3_to_45": 43,
+  "total_routed_experts_converted": 12384,
+  "full_checkpoint_size_gb": 92.58,
+  "stock_checkpoint_size_gb": 305.8,
+  "overall_compression_ratio": 3.3,
+  "real_tokens_evaluated": 318,
+  "evaluation_methodology": "Real Tokenizer (tokenizer.json) + Real embed_tokens (154,880 x 4,096) + 46 Converted Layers + Real lm_head (154,880 Vocab) Stock-vs-Chronos Comparison (Zero Synthetic Vectors)",
+  "mean_residual_stream_cosine_pct": 97.6186,
+  "mean_lm_head_154880_logit_cosine_pct": 97.5069,
+  "mean_real_token_top1_exact_match_pct": 72.83,
+  "mean_real_token_top5_inclusion_pct": 93.33,
+  "stock_vs_chronos_real_token_comparisons": [
+    {
+      "layer": 3,
+      "real_tokens_evaluated": 318,
+      "moe_delta_cosine_pct": 89.9029,
+      "residual_stream_cosine_pct": 90.4482,
+      "lm_head_154880_logit_cosine_pct": 90.1282,
+      "real_token_top1_exact_match_pct": 45.6,
+      "real_token_top5_inclusion_pct": 71.38
+    },
+    {
+      "layer": 10,
+      "real_tokens_evaluated": 318,
+      "moe_delta_cosine_pct": 78.4539,
+      "residual_stream_cosine_pct": 99.5095,
+      "lm_head_154880_logit_cosine_pct": 99.4556,
+      "real_token_top1_exact_match_pct": 81.76,
+      "real_token_top5_inclusion_pct": 100.0
+    },
+    {
+      "layer": 23,
+      "real_tokens_evaluated": 318,
+      "moe_delta_cosine_pct": 78.8289,
+      "residual_stream_cosine_pct": 99.7656,
+      "lm_head_154880_logit_cosine_pct": 99.7419,
+      "real_token_top1_exact_match_pct": 85.53,
+      "real_token_top5_inclusion_pct": 100.0
+    },
+    {
+      "layer": 35,
+      "real_tokens_evaluated": 318,
+      "moe_delta_cosine_pct": 68.8879,
+      "residual_stream_cosine_pct": 99.3214,
+      "lm_head_154880_logit_cosine_pct": 99.2899,
+      "real_token_top1_exact_match_pct": 81.13,
+      "real_token_top5_inclusion_pct": 98.11
+    },
+    {
+      "layer": 44,
+      "real_tokens_evaluated": 318,
+      "moe_delta_cosine_pct": 92.2466,
+      "residual_stream_cosine_pct": 99.0483,
+      "lm_head_154880_logit_cosine_pct": 98.9188,
+      "real_token_top1_exact_match_pct": 70.13,
+      "real_token_top5_inclusion_pct": 97.17
+    }
+  ],
+  "layer_telemetry": [
+    {
+      "layer": 3,
+      "shard": "chronos-glm5-layer-00003-of-00046.safetensors",
+      "size_gb": 1.971,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 2.853,
+      "real_tokens_evaluated": 318,
+      "moe_delta_cosine_pct": 89.9029,
+      "residual_stream_cosine_pct": 90.4482,
+      "lm_head_154880_logit_cosine_pct": 90.1282,
+      "real_token_top1_exact_match_pct": 45.6,
+      "real_token_top5_inclusion_pct": 71.38
+    },
+    {
+      "layer": 4,
+      "shard": "chronos-glm5-layer-00004-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 7,
+      "cache_misses": 25,
+      "elapsed_s": 2.22
+    },
+    {
+      "layer": 5,
+      "shard": "chronos-glm5-layer-00005-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 7,
+      "cache_misses": 25,
+      "elapsed_s": 2.169
+    },
+    {
+      "layer": 6,
+      "shard": "chronos-glm5-layer-00006-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 7,
+      "cache_misses": 25,
+      "elapsed_s": 2.2
+    },
+    {
+      "layer": 7,
+      "shard": "chronos-glm5-layer-00007-of-00046.safetensors",
+      "size_gb": 1.971,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 2.056
+    },
+    {
+      "layer": 8,
+      "shard": "chronos-glm5-layer-00008-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 2.197
+    },
+    {
+      "layer": 9,
+      "shard": "chronos-glm5-layer-00009-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 2.163
+    },
+    {
+      "layer": 10,
+      "shard": "chronos-glm5-layer-00010-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 2.165,
+      "real_tokens_evaluated": 318,
+      "moe_delta_cosine_pct": 78.4539,
+      "residual_stream_cosine_pct": 99.5095,
+      "lm_head_154880_logit_cosine_pct": 99.4556,
+      "real_token_top1_exact_match_pct": 81.76,
+      "real_token_top5_inclusion_pct": 100.0
+    },
+    {
+      "layer": 11,
+      "shard": "chronos-glm5-layer-00011-of-00046.safetensors",
+      "size_gb": 1.971,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.519
+    },
+    {
+      "layer": 12,
+      "shard": "chronos-glm5-layer-00012-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.357
+    },
+    {
+      "layer": 13,
+      "shard": "chronos-glm5-layer-00013-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.353
+    },
+    {
+      "layer": 14,
+      "shard": "chronos-glm5-layer-00014-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.414
+    },
+    {
+      "layer": 15,
+      "shard": "chronos-glm5-layer-00015-of-00046.safetensors",
+      "size_gb": 1.971,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.501
+    },
+    {
+      "layer": 16,
+      "shard": "chronos-glm5-layer-00016-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.316
+    },
+    {
+      "layer": 17,
+      "shard": "chronos-glm5-layer-00017-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.182
+    },
+    {
+      "layer": 18,
+      "shard": "chronos-glm5-layer-00018-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.184
+    },
+    {
+      "layer": 19,
+      "shard": "chronos-glm5-layer-00019-of-00046.safetensors",
+      "size_gb": 1.971,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 6.998
+    },
+    {
+      "layer": 20,
+      "shard": "chronos-glm5-layer-00020-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 6.794
+    },
+    {
+      "layer": 21,
+      "shard": "chronos-glm5-layer-00021-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 7,
+      "cache_misses": 25,
+      "elapsed_s": 6.775
+    },
+    {
+      "layer": 22,
+      "shard": "chronos-glm5-layer-00022-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 6.799
+    },
+    {
+      "layer": 23,
+      "shard": "chronos-glm5-layer-00023-of-00046.safetensors",
+      "size_gb": 1.971,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.02,
+      "real_tokens_evaluated": 318,
+      "moe_delta_cosine_pct": 78.8289,
+      "residual_stream_cosine_pct": 99.7656,
+      "lm_head_154880_logit_cosine_pct": 99.7419,
+      "real_token_top1_exact_match_pct": 85.53,
+      "real_token_top5_inclusion_pct": 100.0
+    },
+    {
+      "layer": 24,
+      "shard": "chronos-glm5-layer-00024-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 6,
+      "cache_misses": 26,
+      "elapsed_s": 6.936
+    },
+    {
+      "layer": 25,
+      "shard": "chronos-glm5-layer-00025-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 6,
+      "cache_misses": 26,
+      "elapsed_s": 7.209
+    },
+    {
+      "layer": 26,
+      "shard": "chronos-glm5-layer-00026-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.404
+    },
+    {
+      "layer": 27,
+      "shard": "chronos-glm5-layer-00027-of-00046.safetensors",
+      "size_gb": 1.971,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.128
+    },
+    {
+      "layer": 28,
+      "shard": "chronos-glm5-layer-00028-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.239
+    },
+    {
+      "layer": 29,
+      "shard": "chronos-glm5-layer-00029-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.28
+    },
+    {
+      "layer": 30,
+      "shard": "chronos-glm5-layer-00030-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.165
+    },
+    {
+      "layer": 31,
+      "shard": "chronos-glm5-layer-00031-of-00046.safetensors",
+      "size_gb": 1.971,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.222
+    },
+    {
+      "layer": 32,
+      "shard": "chronos-glm5-layer-00032-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 7,
+      "cache_misses": 25,
+      "elapsed_s": 7.242
+    },
+    {
+      "layer": 33,
+      "shard": "chronos-glm5-layer-00033-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 7,
+      "cache_misses": 25,
+      "elapsed_s": 7.397
+    },
+    {
+      "layer": 34,
+      "shard": "chronos-glm5-layer-00034-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 7,
+      "cache_misses": 25,
+      "elapsed_s": 7.329
+    },
+    {
+      "layer": 35,
+      "shard": "chronos-glm5-layer-00035-of-00046.safetensors",
+      "size_gb": 1.971,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.263,
+      "real_tokens_evaluated": 318,
+      "moe_delta_cosine_pct": 68.8879,
+      "residual_stream_cosine_pct": 99.3214,
+      "lm_head_154880_logit_cosine_pct": 99.2899,
+      "real_token_top1_exact_match_pct": 81.13,
+      "real_token_top5_inclusion_pct": 98.11
+    },
+    {
+      "layer": 36,
+      "shard": "chronos-glm5-layer-00036-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.291
+    },
+    {
+      "layer": 37,
+      "shard": "chronos-glm5-layer-00037-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.232
+    },
+    {
+      "layer": 38,
+      "shard": "chronos-glm5-layer-00038-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 6,
+      "cache_misses": 26,
+      "elapsed_s": 7.243
+    },
+    {
+      "layer": 39,
+      "shard": "chronos-glm5-layer-00039-of-00046.safetensors",
+      "size_gb": 1.971,
+      "cache_hits": 7,
+      "cache_misses": 25,
+      "elapsed_s": 7.15
+    },
+    {
+      "layer": 40,
+      "shard": "chronos-glm5-layer-00040-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.182
+    },
+    {
+      "layer": 41,
+      "shard": "chronos-glm5-layer-00041-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.06
+    },
+    {
+      "layer": 42,
+      "shard": "chronos-glm5-layer-00042-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.065
+    },
+    {
+      "layer": 43,
+      "shard": "chronos-glm5-layer-00043-of-00046.safetensors",
+      "size_gb": 1.971,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.185
+    },
+    {
+      "layer": 44,
+      "shard": "chronos-glm5-layer-00044-of-00046.safetensors",
+      "size_gb": 2.098,
+      "cache_hits": 8,
+      "cache_misses": 24,
+      "elapsed_s": 7.177,
+      "real_tokens_evaluated": 318,
+      "moe_delta_cosine_pct": 92.2466,
+      "residual_stream_cosine_pct": 99.0483,
+      "lm_head_154880_logit_cosine_pct": 98.9188,
+      "real_token_top1_exact_match_pct": 70.13,
+      "real_token_top5_inclusion_pct": 97.17
+    },
+    {
+      "layer": 45,
+      "role": "nextn_mtp_head",
+      "shard": "chronos-glm5-layer-00045-of-00046.safetensors",
+      "size_gb": 2.037
+    }
+  ]
+}

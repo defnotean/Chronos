@@ -60,6 +60,8 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
         hot_cache_size: int = 24,
         offload_tail_to_cpu: bool = True,
         mmap_zero_ram: bool = False,
+        mmap_banks_too: bool = False,
+        use_fused_moe: bool = True,
         vllm_config: Any = None,
         prefix: str = "",
     ) -> None:
@@ -77,11 +79,15 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
                 hot_cache_size = int(chronos_cfg.get("hot_cache_size", hot_cache_size))
                 offload_tail_to_cpu = bool(chronos_cfg.get("offload_tail_to_cpu", offload_tail_to_cpu))
                 mmap_zero_ram = bool(chronos_cfg.get("mmap_zero_ram", mmap_zero_ram))
+                use_fused_moe = bool(chronos_cfg.get("use_fused_moe", use_fused_moe))
 
         if layer_idx is None:
             layer_idx = 0
         if shard_path is None:
-            shard_path = f"/home/defnotean/pb27/hf/flash_next_chronos_v6/chronos-layer-{layer_idx:05d}-of-00048.safetensors"
+            cand = f"/home/defnotean/pb27/hf/flash_next_chronos_v6/chronos-layer-{layer_idx:05d}-of-00048.safetensors"
+            if not os.path.exists(cand):
+                cand = f"/pb27_vllm/flash_next_chronos_v6/chronos-layer-{layer_idx:05d}-of-00048.safetensors"
+            shard_path = cand
         if device is None:
             device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
         elif isinstance(device, str):
@@ -93,7 +99,10 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
         self.hot_cache_size = max(top_k, hot_cache_size)
         self.offload_tail_to_cpu = offload_tail_to_cpu
         self.mmap_zero_ram = mmap_zero_ram
+        self.mmap_banks_too = mmap_banks_too and mmap_zero_ram
+        self.use_fused_moe = use_fused_moe and (vllm_fused_experts is not None)
         self.shard_path_str = str(shard_path)
+        self.tensor_prefix = f"model.language_model.layers.{layer_idx}.mlp"
 
         tensor_prefix = f"model.language_model.layers.{layer_idx}.mlp"
         self._mmap_handle = safe_open(self.shard_path_str, framework="pt", device="cpu")
@@ -120,28 +129,32 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
         ).contiguous()  # (2560, 640)
 
         self.hub_experts_cpu: dict[int, dict[str, torch.Tensor]] = {}
+        self.hub_expert_ids: set[int] = set()
         hub_prefix = f"{tensor_prefix}.hub_experts."
         for k in all_keys:
             if k.startswith(hub_prefix):
                 rest = k[len(hub_prefix):]
                 eid_str, tensor_name = rest.split(".", 1)
                 eid = int(eid_str)
-                self.hub_experts_cpu.setdefault(eid, {})[tensor_name] = self._mmap_handle.get_tensor(k)
+                self.hub_expert_ids.add(eid)
+                if not self.mmap_banks_too:
+                    self.hub_experts_cpu.setdefault(eid, {})[tensor_name] = self._mmap_handle.get_tensor(k)
 
         shared_h128 = build_hadamard_128(device)
         self.groups = nn.ModuleList()
         for g_idx in range(64):
             gp = f"{tensor_prefix}.chronos_groups.{g_idx}."
             sub_t: dict[str, torch.Tensor] = {}
-            for k_suffix in (
-                "s_gu.weight", "s_gu.weight_scale", "s_gu.weight_scale_2", "s_gu.beta",
-                "s_down.weight", "s_down.weight_scale", "s_down.weight_scale_2", "s_down.beta",
-                "healer.u_gu", "healer.v_gu", "healer.u_down", "healer.v_down",
-                "tail.gu_bits", "tail.down_bits",
-            ):
-                full_k = f"{gp}{k_suffix}"
-                if full_k in all_keys:
-                    sub_t[k_suffix] = self._mmap_handle.get_tensor(full_k)
+            if not self.mmap_banks_too:
+                for k_suffix in (
+                    "s_gu.weight", "s_gu.weight_scale", "s_gu.weight_scale_2", "s_gu.beta",
+                    "s_down.weight", "s_down.weight_scale", "s_down.weight_scale_2", "s_down.beta",
+                    "healer.u_gu", "healer.v_gu", "healer.u_down", "healer.v_down",
+                    "tail.gu_bits", "tail.down_bits",
+                ):
+                    full_k = f"{gp}{k_suffix}"
+                    if full_k in all_keys:
+                        sub_t[k_suffix] = self._mmap_handle.get_tensor(full_k)
             if not mmap_zero_ram:
                 for k_suffix in ("tail.gu_packed", "tail.gu_scale", "tail.gu_mask", "tail.down_packed", "tail.down_scale", "tail.down_mask"):
                     full_k = f"{gp}{k_suffix}"
@@ -189,7 +202,8 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
             _, _, vh_rt = torch.linalg.svd(rw_f, full_matrices=False)
             u_ctx = vh_rt[:32, :].T
             prior_scores = torch.linalg.norm(rw_f @ u_ctx, dim=-1)
-            _, top_hub_ids = torch.topk(prior_scores, k=min(16, self.hot_cache_size // 2))
+            n_preseed = min(8 if self.mmap_banks_too else 16, self.hot_cache_size // 2)
+            _, top_hub_ids = torch.topk(prior_scores, k=n_preseed)
             for eid in top_hub_ids.tolist():
                 self._ensure_expert_slot(int(eid))
             self.cache_hits = 0
@@ -200,6 +214,60 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
         for _ in weights:
             pass
         return {name for name, _ in self.named_parameters(recurse=True)}
+
+    @torch.no_grad()
+    def _reconstruct_any_expert(
+        self,
+        expert_id: int,
+        s_gu_cached: torch.Tensor | None = None,
+        s_down_cached: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if expert_id in self.hub_expert_ids:
+            if expert_id in self.hub_experts_cpu:
+                ht = self.hub_experts_cpu[expert_id]
+                gw = unpack_nvfp4(
+                    ht["gate_proj.weight"].to(self.device, non_blocking=True),
+                    ht["gate_proj.weight_scale"].to(self.device, non_blocking=True),
+                    ht["gate_proj.weight_scale_2"].to(self.device, non_blocking=True),
+                    dtype=torch.bfloat16,
+                )
+                uw = unpack_nvfp4(
+                    ht["up_proj.weight"].to(self.device, non_blocking=True),
+                    ht["up_proj.weight_scale"].to(self.device, non_blocking=True),
+                    ht["up_proj.weight_scale_2"].to(self.device, non_blocking=True),
+                    dtype=torch.bfloat16,
+                )
+                dw = unpack_nvfp4(
+                    ht["down_proj.weight"].to(self.device, non_blocking=True),
+                    ht["down_proj.weight_scale"].to(self.device, non_blocking=True),
+                    ht["down_proj.weight_scale_2"].to(self.device, non_blocking=True),
+                    dtype=torch.bfloat16,
+                )
+                return gw, uw, dw
+            assert self._mmap_handle is not None
+            hp = f"{self.tensor_prefix}.hub_experts.{expert_id}."
+            gw = unpack_nvfp4(
+                self._mmap_handle.get_tensor(f"{hp}gate_proj.weight").to(self.device, non_blocking=True),
+                self._mmap_handle.get_tensor(f"{hp}gate_proj.weight_scale").to(self.device, non_blocking=True),
+                self._mmap_handle.get_tensor(f"{hp}gate_proj.weight_scale_2").to(self.device, non_blocking=True),
+                dtype=torch.bfloat16,
+            )
+            uw = unpack_nvfp4(
+                self._mmap_handle.get_tensor(f"{hp}up_proj.weight").to(self.device, non_blocking=True),
+                self._mmap_handle.get_tensor(f"{hp}up_proj.weight_scale").to(self.device, non_blocking=True),
+                self._mmap_handle.get_tensor(f"{hp}up_proj.weight_scale_2").to(self.device, non_blocking=True),
+                dtype=torch.bfloat16,
+            )
+            dw = unpack_nvfp4(
+                self._mmap_handle.get_tensor(f"{hp}down_proj.weight").to(self.device, non_blocking=True),
+                self._mmap_handle.get_tensor(f"{hp}down_proj.weight_scale").to(self.device, non_blocking=True),
+                self._mmap_handle.get_tensor(f"{hp}down_proj.weight_scale_2").to(self.device, non_blocking=True),
+                dtype=torch.bfloat16,
+            )
+            return gw, uw, dw
+        g_idx = expert_id // 8
+        local_m = expert_id % 8
+        return self.groups[g_idx].reconstruct_expert(local_m, s_gu_cached=s_gu_cached, s_down_cached=s_down_cached)
 
     @torch.no_grad()
     def _ensure_expert_slot(self, expert_id: int) -> int:
@@ -217,27 +285,7 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
             self.expert_to_slot[old_eid] = -1
             self.expert_to_slot_gpu[old_eid] = -1
 
-        if expert_id in self.hub_experts_cpu:
-            ht = self.hub_experts_cpu[expert_id]
-            gw = unpack_nvfp4(
-                ht["gate_proj.weight"].to(self.device, non_blocking=True),
-                ht["gate_proj.weight_scale"].to(self.device, non_blocking=True),
-                ht["gate_proj.weight_scale_2"].to(self.device, non_blocking=True),
-            )
-            uw = unpack_nvfp4(
-                ht["up_proj.weight"].to(self.device, non_blocking=True),
-                ht["up_proj.weight_scale"].to(self.device, non_blocking=True),
-                ht["up_proj.weight_scale_2"].to(self.device, non_blocking=True),
-            )
-            dw = unpack_nvfp4(
-                ht["down_proj.weight"].to(self.device, non_blocking=True),
-                ht["down_proj.weight_scale"].to(self.device, non_blocking=True),
-                ht["down_proj.weight_scale_2"].to(self.device, non_blocking=True),
-            )
-        else:
-            g_idx = expert_id // 8
-            local_m = expert_id % 8
-            gw, uw, dw = self.groups[g_idx].reconstruct_expert(local_m)
+        gw, uw, dw = self._reconstruct_any_expert(expert_id)
 
         self.slot_gu[slot].copy_(torch.cat([gw, uw], dim=0).to(torch.bfloat16))
         self.slot_d[slot].copy_(dw.to(torch.bfloat16))
@@ -248,7 +296,7 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
         return slot
 
     @torch.no_grad()
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, already_sequence_parallel: bool = False) -> torch.Tensor:
         orig_shape = hidden_states.shape
         orig_dtype = hidden_states.dtype
         x = hidden_states.view(-1, orig_shape[-1]).to(torch.bfloat16)
@@ -267,10 +315,15 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
 
         if n_toks == 1:
             eids = top_ids[0].tolist()
+            slot_ids = [self._ensure_expert_slot(int(eid)) for eid in eids]
+            if self.use_fused_moe and vllm_fused_experts is not None:
+                slot_ids_t = torch.tensor([slot_ids], dtype=torch.int32, device=self.device)
+                y_routed = vllm_fused_experts(x, self.cache_gu_buf, self.cache_d_buf, top_gates_f32, slot_ids_t)
+                return (y_routed + y_shared).view(orig_shape).to(orig_dtype)
+
             gates = top_gates[0]
             y_routed = torch.zeros_like(x)
-            for k_idx, eid in enumerate(eids):
-                slot = self._ensure_expert_slot(int(eid))
+            for k_idx, slot in enumerate(slot_ids):
                 gu_out = F.linear(x, self.slot_gu[slot])
                 y_exp = F.linear(F.silu(gu_out[:, :640]) * gu_out[:, 640:], self.slot_d[slot])
                 y_routed.addcmul_(gates[k_idx : k_idx + 1], y_exp)
@@ -282,7 +335,7 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
         flat_gates = top_gates.view(-1).float()
         expert_mass = torch.zeros(512, dtype=torch.float32, device=self.device)
         expert_mass.scatter_add_(0, flat_ids, flat_gates)
-        expert_mass.scatter_add_(0, top_ids[0], torch.full((self.top_k,), 100.0, dtype=torch.float32, device=self.device))
+        expert_mass.scatter_add_(0, top_ids[-1], torch.full((self.top_k,), 100.0, dtype=torch.float32, device=self.device))
 
         unique_eids = torch.unique(top_ids).tolist()
         warm_eids = [int(eid) for eid in unique_eids if self.expert_to_slot[int(eid)] >= 0]
@@ -300,7 +353,8 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
             y_routed.index_add_(0, tok_indices, g_sel * y_exp)
 
         if cold_eids:
-            cold_masses = [float(expert_mass[eid].item()) for eid in cold_eids]
+            expert_mass_cpu = expert_mass.cpu().tolist()
+            cold_masses = [float(expert_mass_cpu[eid]) for eid in cold_eids]
             sorted_cold = [eid for _, eid in sorted(zip(cold_masses, cold_eids), reverse=True)]
             n_admit = min(len(sorted_cold), max(self.top_k, self.hot_cache_size - len(warm_eids)))
             admit_set = set(sorted_cold[:n_admit])
@@ -312,10 +366,10 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
             admitted_ordered: list[tuple[float, int, torch.Tensor, torch.Tensor]] = []
             for g_idx, g_eids in by_group.items():
                 grp = self.groups[g_idx]
-                s_gu_c = unpack_nvfp4(grp.s_gu_packed, grp.s_gu_scale, grp.s_gu_scale2)
-                s_dn_c = unpack_nvfp4(grp.s_down_packed, grp.s_down_scale, grp.s_down_scale2)
+                s_gu_c = unpack_nvfp4(grp.s_gu_packed, grp.s_gu_scale, grp.s_gu_scale2, dtype=torch.bfloat16)
+                s_dn_c = unpack_nvfp4(grp.s_down_packed, grp.s_down_scale, grp.s_down_scale2, dtype=torch.bfloat16)
                 for eid in g_eids:
-                    gw, uw, dw = grp.reconstruct_expert(eid % 8, s_gu_cached=s_gu_c, s_down_cached=s_dn_c)
+                    gw, uw, dw = self._reconstruct_any_expert(eid, s_gu_cached=s_gu_c, s_down_cached=s_dn_c)
                     gu_w = torch.cat([gw, uw], dim=0).to(torch.bfloat16)
                     dw_bf16 = dw.to(torch.bfloat16)
                     mask = top_ids == eid
@@ -327,7 +381,7 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
                     y_exp = F.linear(act, dw_bf16)
                     y_routed.index_add_(0, tok_indices, g_sel * y_exp)
                     if eid in admit_set:
-                        admitted_ordered.append((float(expert_mass[eid].item()), eid, gu_w, dw_bf16))
+                        admitted_ordered.append((float(expert_mass_cpu[eid]), eid, gu_w, dw_bf16))
 
             for _, eid, gu_w, dw_bf16 in sorted(admitted_ordered, key=lambda item: item[0]):
                 self.cache_misses += 1
@@ -342,6 +396,14 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
                 self.expert_to_slot[eid] = slot
                 self.expert_to_slot_gpu[eid] = slot
                 self.slot_to_expert[slot] = eid
+
+            if self.mmap_zero_ram and len(cold_eids) > 10 and hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+                try:
+                    fd = os.open(self.shard_path_str, os.O_RDONLY)
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    os.close(fd)
+                except OSError:
+                    pass
 
         return (y_routed + y_shared).view(orig_shape).to(orig_dtype)
 

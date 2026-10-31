@@ -415,26 +415,41 @@ class ChronosHolographicExpertGroup(nn.Module):
         self.mmap_zero_ram = mmap_zero_ram and (mmap_handle is not None)
         self.mmap_handle = mmap_handle
         self.mmap_prefix = mmap_prefix
+        self.mmap_banks_too = ("healer.u_gu" not in tensors) and self.mmap_zero_ram
 
-        # Packed 8:1 NVFP4 Holographic Banks (Always GPU-Resident: 1.80 MB/group)
-        self.s_gu_packed = tensors["s_gu.weight"].to(device)
-        self.s_gu_scale = tensors["s_gu.weight_scale"].to(device)
-        self.s_gu_scale2 = tensors["s_gu.weight_scale_2"].to(device)
-        self.beta_gu = tensors["s_gu.beta"].to(device)
+        # Packed 8:1 NVFP4 Holographic Banks (Always GPU-Resident: 1.80 MB/group = 115 MB/layer)
+        if "s_gu.weight" in tensors:
+            self.s_gu_packed = tensors["s_gu.weight"].to(device, non_blocking=True)
+            self.s_gu_scale = tensors["s_gu.weight_scale"].to(device, non_blocking=True)
+            self.s_gu_scale2 = tensors["s_gu.weight_scale_2"].to(device, non_blocking=True)
+            self.beta_gu_list = [float(x) for x in tensors["s_gu.beta"].cpu().tolist()]
+            self.s_down_packed = tensors["s_down.weight"].to(device, non_blocking=True)
+            self.s_down_scale = tensors["s_down.weight_scale"].to(device, non_blocking=True)
+            self.s_down_scale2 = tensors["s_down.weight_scale_2"].to(device, non_blocking=True)
+            self.beta_down_list = [float(x) for x in tensors["s_down.beta"].cpu().tolist()]
+        else:
+            p = self.mmap_prefix
+            self.s_gu_packed = self.mmap_handle.get_tensor(f"{p}s_gu.weight").to(device, non_blocking=True)
+            self.s_gu_scale = self.mmap_handle.get_tensor(f"{p}s_gu.weight_scale").to(device, non_blocking=True)
+            self.s_gu_scale2 = self.mmap_handle.get_tensor(f"{p}s_gu.weight_scale_2").to(device, non_blocking=True)
+            self.beta_gu_list = [float(x) for x in self.mmap_handle.get_tensor(f"{p}s_gu.beta").tolist()]
+            self.s_down_packed = self.mmap_handle.get_tensor(f"{p}s_down.weight").to(device, non_blocking=True)
+            self.s_down_scale = self.mmap_handle.get_tensor(f"{p}s_down.weight_scale").to(device, non_blocking=True)
+            self.s_down_scale2 = self.mmap_handle.get_tensor(f"{p}s_down.weight_scale_2").to(device, non_blocking=True)
+            self.beta_down_list = [float(x) for x in self.mmap_handle.get_tensor(f"{p}s_down.beta").tolist()]
 
-        self.s_down_packed = tensors["s_down.weight"].to(device)
-        self.s_down_scale = tensors["s_down.weight_scale"].to(device)
-        self.s_down_scale2 = tensors["s_down.weight_scale_2"].to(device)
-        self.beta_down = tensors["s_down.beta"].to(device)
-
-        # Coupled FP8 Rank-64 SVD Healers (Always GPU-Resident: 3.93 MB/group)
-        self.u_gu = tensors["healer.u_gu"].to(device)        # (K, 1280, r) float8_e4m3fn
-        self.v_gu = tensors["healer.v_gu"].to(device)        # (K, r, 2560) float8_e4m3fn
-        self.u_down = tensors["healer.u_down"].to(device)    # (K, 2560, r) float8_e4m3fn
-        self.v_down = tensors["healer.v_down"].to(device)    # (K, r, 640)  float8_e4m3fn
-
-        self.gu_tail_bits = int(tensors.get("tail.gu_bits", torch.tensor(1)).item())
-        self.down_tail_bits = int(tensors.get("tail.down_bits", torch.tensor(2)).item())
+        if not self.mmap_banks_too:
+            # Coupled FP8 SVD Healers on GPU
+            self.u_gu = tensors["healer.u_gu"].to(device, non_blocking=True)
+            self.v_gu = tensors["healer.v_gu"].to(device, non_blocking=True)
+            self.u_down = tensors["healer.u_down"].to(device, non_blocking=True)
+            self.v_down = tensors["healer.v_down"].to(device, non_blocking=True)
+            self.gu_tail_bits = int(tensors.get("tail.gu_bits", torch.tensor(1)).item())
+            self.down_tail_bits = int(tensors.get("tail.down_bits", torch.tensor(2)).item())
+        else:
+            p = self.mmap_prefix
+            self.gu_tail_bits = int(self.mmap_handle.get_tensor(f"{p}tail.gu_bits").item())
+            self.down_tail_bits = int(self.mmap_handle.get_tensor(f"{p}tail.down_bits").item())
 
         if self.mmap_zero_ram:
             self.gu_tail_packed = None
@@ -461,14 +476,29 @@ class ChronosHolographicExpertGroup(nn.Module):
         s_down_cached: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reconstructs (gate_w, up_w, down_w) for expert `local_m` in 0..K-1 from the packed tensors."""
-        s_gu = s_gu_cached if s_gu_cached is not None else unpack_nvfp4(self.s_gu_packed, self.s_gu_scale, self.s_gu_scale2)
-        s_down = s_down_cached if s_down_cached is not None else unpack_nvfp4(self.s_down_packed, self.s_down_scale, self.s_down_scale2)
+        s_gu = s_gu_cached if s_gu_cached is not None else unpack_nvfp4(self.s_gu_packed, self.s_gu_scale, self.s_gu_scale2, dtype=torch.bfloat16)
+        s_down = s_down_cached if s_down_cached is not None else unpack_nvfp4(self.s_down_packed, self.s_down_scale, self.s_down_scale2, dtype=torch.bfloat16)
+        if self.mmap_banks_too and self.mmap_handle is not None:
+            p = self.mmap_prefix
+            u_gu_m = self.mmap_handle.get_slice(f"{p}healer.u_gu")[local_m].to(self.device, non_blocking=True).to(torch.bfloat16)
+            v_gu_m = self.mmap_handle.get_slice(f"{p}healer.v_gu")[local_m].to(self.device, non_blocking=True).to(torch.bfloat16)
+            u_dn_m = self.mmap_handle.get_slice(f"{p}healer.u_down")[local_m].to(self.device, non_blocking=True).to(torch.bfloat16)
+            v_dn_m = self.mmap_handle.get_slice(f"{p}healer.v_down")[local_m].to(self.device, non_blocking=True).to(torch.bfloat16)
+        else:
+            u_gu_m = self.u_gu[local_m].to(torch.bfloat16)
+            v_gu_m = self.v_gu[local_m].to(torch.bfloat16)
+            u_dn_m = self.u_down[local_m].to(torch.bfloat16)
+            v_dn_m = self.v_down[local_m].to(torch.bfloat16)
+        beta_gu_m = self.beta_gu_list[local_m]
+        beta_dn_m = self.beta_down_list[local_m]
+        gu_bits = self.gu_tail_bits
+        dn_bits = self.down_tail_bits
 
         r_s1, _, r_inv, r_s2, c_s1, _, c_inv, c_s2 = generate_expert_1d_keys(
             1280, 2560, local_m, seed_base=101 + self.group_idx * 8, device=self.device
         )
         h_gu = unbind_2d_permuted_hadamard(s_gu, r_s1, r_inv, r_s2, c_s1, c_inv, c_s2, self.h128)
-        healer_gu = self.u_gu[local_m].float() @ self.v_gu[local_m].float()
+        healer_gu = u_gu_m @ v_gu_m
 
         if self.mmap_zero_ram and self.mmap_handle is not None:
             p = self.mmap_prefix
@@ -484,19 +514,19 @@ class ChronosHolographicExpertGroup(nn.Module):
             dn_p_m = self.down_tail_packed[local_m].to(self.device, non_blocking=True)
             dn_s_m = self.down_tail_scale[local_m].to(self.device, non_blocking=True)
 
-        if self.gu_tail_bits == 20 and self.gu_tail_mask is not None:
+        if gu_bits == 20 and self.gu_tail_mask is not None:
             gu_m_m = self.gu_tail_mask[local_m].to(self.device, non_blocking=True)
-            tail_gu = unpack_sparse_2bit_lloyd_max(gu_m_m, gu_p_m, gu_s_m, 1280, 2560)
-        elif self.gu_tail_bits == 16:
-            tail_gu = unpack_ternary_base3(gu_p_m, gu_s_m)
-        elif self.gu_tail_bits == 2:
-            tail_gu = unpack_2bit_lloyd_max(gu_p_m, gu_s_m)
-        elif self.gu_tail_bits == 1:
-            tail_gu = unpack_1bit_rademacher(gu_p_m, gu_s_m)
+            tail_gu = unpack_sparse_2bit_lloyd_max(gu_m_m, gu_p_m, gu_s_m, 1280, 2560, dtype=torch.bfloat16)
+        elif gu_bits == 16:
+            tail_gu = unpack_ternary_base3(gu_p_m, gu_s_m, dtype=torch.bfloat16)
+        elif gu_bits == 2:
+            tail_gu = unpack_2bit_lloyd_max(gu_p_m, gu_s_m, dtype=torch.bfloat16)
+        elif gu_bits == 1:
+            tail_gu = unpack_1bit_rademacher(gu_p_m, gu_s_m, dtype=torch.bfloat16)
         else:
             tail_gu = torch.zeros_like(h_gu)
 
-        gu_hat = self.beta_gu[local_m].float() * h_gu + healer_gu + tail_gu
+        gu_hat = h_gu.mul_(beta_gu_m).add_(healer_gu).add_(tail_gu)
         gate_hat = gu_hat[:640, :]
         up_hat = gu_hat[640:, :]
 
@@ -504,19 +534,19 @@ class ChronosHolographicExpertGroup(nn.Module):
             2560, 640, local_m, seed_base=303 + self.group_idx * 8, device=self.device
         )
         h_down = unbind_2d_permuted_hadamard(s_down, dr_s1, dr_inv, dr_s2, dc_s1, dc_inv, dc_s2, self.h128)
-        healer_down = self.u_down[local_m].float() @ self.v_down[local_m].float()
+        healer_down = u_dn_m @ v_dn_m
 
-        if self.down_tail_bits == 20 and self.down_tail_mask is not None:
+        if dn_bits == 20 and self.down_tail_mask is not None:
             dn_m_m = self.down_tail_mask[local_m].to(self.device, non_blocking=True)
-            tail_down = unpack_sparse_2bit_lloyd_max(dn_m_m, dn_p_m, dn_s_m, 2560, 640)
-        elif self.down_tail_bits == 16:
-            tail_down = unpack_ternary_base3(dn_p_m, dn_s_m)
-        elif self.down_tail_bits == 2:
-            tail_down = unpack_2bit_lloyd_max(dn_p_m, dn_s_m)
-        elif self.down_tail_bits == 1:
-            tail_down = unpack_1bit_rademacher(dn_p_m, dn_s_m)
+            tail_down = unpack_sparse_2bit_lloyd_max(dn_m_m, dn_p_m, dn_s_m, 2560, 640, dtype=torch.bfloat16)
+        elif dn_bits == 16:
+            tail_down = unpack_ternary_base3(dn_p_m, dn_s_m, dtype=torch.bfloat16)
+        elif dn_bits == 2:
+            tail_down = unpack_2bit_lloyd_max(dn_p_m, dn_s_m, dtype=torch.bfloat16)
+        elif dn_bits == 1:
+            tail_down = unpack_1bit_rademacher(dn_p_m, dn_s_m, dtype=torch.bfloat16)
         else:
             tail_down = torch.zeros_like(h_down)
 
-        down_hat = self.beta_down[local_m].float() * h_down + healer_down + tail_down
+        down_hat = h_down.mul_(beta_dn_m).add_(healer_down).add_(tail_down)
         return gate_hat, up_hat, down_hat
