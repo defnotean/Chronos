@@ -1,0 +1,51 @@
+{
+  "part1_real_nvfp4_spectral_smw": [
+    {
+      "svd_rank": 32,
+      "naive_8to1_swiglu_cosine_pct": 5.233322270214558,
+      "linear_proj_cosine_pct": 93.62563118338585,
+      "healed_cold_swiglu_cosine_pct": 75.10331720113754,
+      "combined_10expert_moe_fidelity_pct": 88.81541201700801
+    },
+    {
+      "svd_rank": 64,
+      "naive_8to1_swiglu_cosine_pct": 5.233322270214558,
+      "linear_proj_cosine_pct": 95.71220949292183,
+      "healed_cold_swiglu_cosine_pct": 81.05830773711205,
+      "combined_10expert_moe_fidelity_pct": 91.49063249218452
+    },
+    {
+      "svd_rank": 96,
+      "naive_8to1_swiglu_cosine_pct": 5.233322270214558,
+      "linear_proj_cosine_pct": 96.31407856941223,
+      "healed_cold_swiglu_cosine_pct": 84.21506211161613,
+      "combined_10expert_moe_fidelity_pct": 92.90877310664216
+    },
+    {
+      "svd_rank": 128,
+      "naive_8to1_swiglu_cosine_pct": 5.233322270214558,
+      "linear_proj_cosine_pct": 96.80715575814247,
+      "healed_cold_swiglu_cosine_pct": 86.49841621518135,
+      "combined_10expert_moe_fidelity_pct": 93.93454730611977
+    }
+  ],
+  "part2_stride64_decode_cache": {
+    "hit_rate_count_pct": 52.50000357627869,
+    "hit_rate_prob_mass_pct": 55.07599115371704,
+    "cold_expert_sram_fidelity_pct": 81.05830773711205,
+    "combined_10expert_moe_fidelity_pct": 91.49063249218452,
+    "gb10_per_layer_per_tok_ms": 0.7101997498466517,
+    "naive_nvme_tok_per_sec": 1.12,
+    "pinned_hss_tok_per_sec": 91.6702190907898,
+    "decode_speedup_x": 81.84840990249089
+  },
+  "part3_128gb_memory_map": {
+    "shared_attn_routers_gdn_gb": 18.0,
+    "routed_1t_moe_8to1_hrr_nvfp4_gb": 62.0,
+    "rank64_svd_healers_plus_4gb_pinned_experts_gb": 16.0,
+    "pseudobrain_1m_kv_cache_4sinks_prompt_top_16k_win_gdn_gb": 3.5,
+    "total_active_gpu_footprint_gb": 99.5,
+    "dgx_spark_total_unified_ram_gb": 128.0,
+    "remaining_os_and_speculative_headroom_gb": 28.5
+  }
+}

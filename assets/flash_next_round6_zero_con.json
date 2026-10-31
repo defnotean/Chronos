@@ -1,0 +1,86 @@
+[
+  {
+    "id": "BEFORE_Stock_74GB",
+    "name": "BEFORE: Stock `flash_next_nvfp4` (Un-shrunk 512 Experts)",
+    "total_gpu_gb": 74.0,
+    "zero_cache_cold_moe_cosine_pct": 100.0,
+    "routed_moe_cosine_pct": 99.99999602635701,
+    "logit_248k_cosine_pct": 100.00002384185791,
+    "top1_token_agreement_pct": 99.99999403953552,
+    "top5_token_overlap_pct": 100.0,
+    "kl_divergence_nats": 0.0,
+    "gb10_layer_latency_ms": 0.612
+  },
+  {
+    "id": "R1_v1_Symmetric_8to1",
+    "name": "Round 1 (v1): Symmetric 8:1 + Uncoupled R64 + Static-32 Cache",
+    "total_gpu_gb": 28.8,
+    "zero_cache_cold_moe_cosine_pct": 48.03517460823059,
+    "routed_moe_cosine_pct": 48.62988591194153,
+    "logit_248k_cosine_pct": 82.89412260055542,
+    "top1_token_agreement_pct": 0.0,
+    "top5_token_overlap_pct": 13.56521739130435,
+    "kl_divergence_nats": 0.06355712562799454,
+    "gb10_layer_latency_ms": 0.677
+  },
+  {
+    "id": "R5_v5_Asymmetric_PureCold_ZeroCache",
+    "name": "Round 5 (v5 Pure Cold - 0% Cache!): Fused GU 8:1 + Down 4:1 R192",
+    "total_gpu_gb": 32.4,
+    "zero_cache_cold_moe_cosine_pct": 76.20398203531902,
+    "routed_moe_cosine_pct": 76.20398203531902,
+    "logit_248k_cosine_pct": 90.71743488311768,
+    "top1_token_agreement_pct": 38.260868191719055,
+    "top5_token_overlap_pct": 52.17391304347826,
+    "kl_divergence_nats": 0.03408495709300041,
+    "gb10_layer_latency_ms": 0.498
+  },
+  {
+    "id": "R6_v6_PureCold_1Bit_PhaseLattice_26GB",
+    "name": "Round 6 (v6 Pure Cold - 0% Cache!): 8:1 Bank + R32 SVD + 1-Bit Tail",
+    "total_gpu_gb": 26.8,
+    "zero_cache_cold_moe_cosine_pct": 70.15292445818584,
+    "routed_moe_cosine_pct": 70.15292445818584,
+    "logit_248k_cosine_pct": 88.61632943153381,
+    "top1_token_agreement_pct": 29.56521511077881,
+    "top5_token_overlap_pct": 32.869565217391305,
+    "kl_divergence_nats": 0.04427381232380867,
+    "gb10_layer_latency_ms": 0.482
+  },
+  {
+    "id": "R6_v6_PureCold_2Bit_LloydMax_32GB",
+    "name": "Round 6 (v6 Pure Cold - 0% Cache!): 8:1 Bank + R32 SVD + 2-Bit Tail",
+    "total_gpu_gb": 32.6,
+    "zero_cache_cold_moe_cosine_pct": 90.29575188954671,
+    "routed_moe_cosine_pct": 90.29575188954671,
+    "logit_248k_cosine_pct": 95.39847373962402,
+    "top1_token_agreement_pct": 61.739128828048706,
+    "top5_token_overlap_pct": 55.130434782608695,
+    "kl_divergence_nats": 0.016444118693470955,
+    "gb10_layer_latency_ms": 0.485
+  },
+  {
+    "id": "R6_v6_ZeroCon_34GB",
+    "name": "Round 6 (v6 Zero-Con 33.8GB): 8:1 Bank + R32 SVD + 2-Bit Tail + EMA",
+    "total_gpu_gb": 33.8,
+    "zero_cache_cold_moe_cosine_pct": 90.26209910710652,
+    "routed_moe_cosine_pct": 99.80561931927998,
+    "logit_248k_cosine_pct": 99.8871922492981,
+    "top1_token_agreement_pct": 99.99999403953552,
+    "top5_token_overlap_pct": 99.47826086956522,
+    "kl_divergence_nats": 0.0003511846298351884,
+    "gb10_layer_latency_ms": 0.472
+  },
+  {
+    "id": "R5_v5_Asymmetric_ZeroCon_44GB",
+    "name": "Round 5 (v5 Zero-Con 44GB): Asymmetric GU-4:1/Down-2:1 + EMA-64 RAM",
+    "total_gpu_gb": 44.0,
+    "zero_cache_cold_moe_cosine_pct": 96.35334213574727,
+    "routed_moe_cosine_pct": 99.96766249338786,
+    "logit_248k_cosine_pct": 99.98476505279541,
+    "top1_token_agreement_pct": 99.99999403953552,
+    "top5_token_overlap_pct": 99.47826086956522,
+    "kl_divergence_nats": 6.107577792135999e-05,
+    "gb10_layer_latency_ms": 0.475
+  }
+]

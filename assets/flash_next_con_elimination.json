@@ -1,0 +1,72 @@
+{
+  "fix3_r1_calib_sec": 0.7250125560094602,
+  "fix3_r3_calib_sec": 0.20218614232726395,
+  "fix3_speedup_x": 3.585866705127275,
+  "fix2_gb10_latency_ms": {
+    "before_ms": 0.6122262100689113,
+    "round1_ms": 0.6769587699091062,
+    "round3_ms": 0.507486030110158
+  },
+  "evolutions": [
+    {
+      "id": "BEFORE_Stock_74GB",
+      "name": "BEFORE: Stock `flash_next_nvfp4` (Un-shrunk 512 Experts)",
+      "total_gpu_gb": 74.0,
+      "hot_gate_hit_pct": 100.0,
+      "routed_moe_cosine_pct": 100.00000397364299,
+      "logit_248k_cosine_pct": 100.0,
+      "top1_token_agreement_pct": 99.99999403953552,
+      "top5_token_overlap_pct": 100.0,
+      "kl_divergence_nats": 0.0,
+      "gb10_layer_latency_ms": 0.6122262100689113
+    },
+    {
+      "id": "ROUND1_8to1_StaticCache",
+      "name": "ROUND 1 (v1): 8:1 Shrink + Uncoupled R64 + Static Prefill Cache",
+      "total_gpu_gb": 28.8,
+      "hot_gate_hit_pct": 0.21293198419431544,
+      "routed_moe_cosine_pct": 46.86835507551829,
+      "logit_248k_cosine_pct": 81.69504404067993,
+      "top1_token_agreement_pct": 0.0,
+      "top5_token_overlap_pct": 18.26086956521739,
+      "kl_divergence_nats": 0.07120402157306671,
+      "gb10_layer_latency_ms": 0.6769587699091062
+    },
+    {
+      "id": "ROUND2_8to1_Coupled_EMA",
+      "name": "ROUND 2 (v2): 8:1 Shrink + Coupled SwiGLU R64 + Sliding EMA Cache",
+      "total_gpu_gb": 29.4,
+      "hot_gate_hit_pct": 98.33795229593913,
+      "routed_moe_cosine_pct": 99.71137841542561,
+      "logit_248k_cosine_pct": 99.79180097579956,
+      "top1_token_agreement_pct": 98.26086759567261,
+      "top5_token_overlap_pct": 98.60869565217392,
+      "kl_divergence_nats": 0.0005763559020124376,
+      "gb10_layer_latency_ms": 0.507486030110158
+    },
+    {
+      "id": "ROUND3_8to1_ZeroCon_Lookahead",
+      "name": "ROUND 3 (v3 Zero-Con 8:1): Coupled R64 + 1-Layer Lookahead Top-2 Pin",
+      "total_gpu_gb": 30.2,
+      "hot_gate_hit_pct": 99.40262635548909,
+      "routed_moe_cosine_pct": 99.95659987131755,
+      "logit_248k_cosine_pct": 99.98697638511658,
+      "top1_token_agreement_pct": 99.13042783737183,
+      "top5_token_overlap_pct": 99.30434782608695,
+      "kl_divergence_nats": 4.333444303483702e-05,
+      "gb10_layer_latency_ms": 0.507486030110158
+    },
+    {
+      "id": "ROUND3_4to1_ZeroCon_Lookahead",
+      "name": "ROUND 3 (v3 Zero-Con 4:1): Coupled R96 + 1-Layer Lookahead Top-3 Pin",
+      "total_gpu_gb": 43.0,
+      "hot_gate_hit_pct": 99.6320645014445,
+      "routed_moe_cosine_pct": 99.98385310173035,
+      "logit_248k_cosine_pct": 99.99577403068542,
+      "top1_token_agreement_pct": 99.99999403953552,
+      "top5_token_overlap_pct": 99.47826086956522,
+      "kl_divergence_nats": 1.3164588381187059e-05,
+      "gb10_layer_latency_ms": 0.48718658890575167
+    }
+  ]
+}

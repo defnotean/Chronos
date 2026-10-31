@@ -1,0 +1,69 @@
+{
+  "platform": "NVIDIA DGX Spark (GB10 Grace Blackwell Superchip, sm_121)",
+  "cuda_version": "13.0",
+  "pytorch_version": "2.14.1+cu130",
+  "exp2a_calibration": {
+    "measured_lpddr5x_bw_gbps": 227.18117490200154,
+    "measured_fp16_gemm_tflops": 92.56395152199762
+  },
+  "exp2b_kernel_benchmarks": [
+    {
+      "d_out": 8192,
+      "d_in": 8192,
+      "dense_fp16_mb": 134.217728,
+      "hss_10x_seed_mb": 13.43488,
+      "dense_latency_ms": 0.5731199979782104,
+      "hss_10x_cuda_latency_ms": 0.07872000336647034,
+      "hss_l2_spectral_latency_ms": 0.022336000576615334,
+      "speedup_10x_cuda": 7.280487467843818,
+      "speedup_l2_spectral": 25.6590250350476
+    },
+    {
+      "d_out": 16384,
+      "d_in": 16384,
+      "dense_fp16_mb": 536.870912,
+      "hss_10x_seed_mb": 53.73952,
+      "dense_latency_ms": 2.2824959754943848,
+      "hss_10x_cuda_latency_ms": 0.2826240062713623,
+      "hss_l2_spectral_latency_ms": 0.027648000046610832,
+      "speedup_10x_cuda": 8.07608669060773,
+      "speedup_l2_spectral": 82.55555453003478
+    },
+    {
+      "d_out": 32768,
+      "d_in": 16384,
+      "dense_fp16_mb": 1073.741824,
+      "hss_10x_seed_mb": 107.47904,
+      "dense_latency_ms": 6.012703895568848,
+      "hss_10x_cuda_latency_ms": 0.7234560251235962,
+      "hss_l2_spectral_latency_ms": 0.04438399896025658,
+      "speedup_10x_cuda": 8.31108413886197,
+      "speedup_l2_spectral": 135.47008012849162
+    },
+    {
+      "d_out": 49152,
+      "d_in": 16384,
+      "dense_fp16_mb": 1610.612736,
+      "hss_10x_seed_mb": 161.21856,
+      "dense_latency_ms": 9.295071601867676,
+      "hss_10x_cuda_latency_ms": 1.0723199844360352,
+      "hss_l2_spectral_latency_ms": 0.05104000121355057,
+      "speedup_10x_cuda": 8.668188354949134,
+      "speedup_l2_spectral": 182.1134674934125
+    }
+  ],
+  "exp2c_live_1t_forward": {
+    "n_layers": 64,
+    "d_model": 16384,
+    "d_ffn": 49152,
+    "superposed_experts": 6,
+    "total_virtual_parameters": 998579896320,
+    "allocated_vram_mb": 415.2353515625,
+    "init_seconds": 0.06642562005436048,
+    "latency_64layer_l2_hss_ms": 16.942047119140625,
+    "tokens_per_sec_l2_hss": 59.02474435159784,
+    "latency_1layer_cuda_10x_ms": 3.8761279582977295,
+    "latency_64layer_cuda_10x_ms": 248.0721893310547,
+    "tokens_per_sec_cuda_10x": 4.0310846721535984
+  }
+}

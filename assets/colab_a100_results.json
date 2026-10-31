@@ -1,0 +1,133 @@
+{
+  "hardware": "NVIDIA A100-SXM4-40GB",
+  "exp1a_16k_superposition": [
+    {
+      "d": 16384,
+      "M": 2,
+      "virtual_params_billions": 0.536870912,
+      "theo_var": 6.103515625e-05,
+      "emp_var": 6.231040907446708e-05,
+      "theo_snr_db": 42.14419939295737,
+      "emp_snr_db": 42.05439397546385,
+      "cosine_similarity": 0.9999999392670142
+    },
+    {
+      "d": 16384,
+      "M": 4,
+      "virtual_params_billions": 1.073741824,
+      "theo_var": 0.00018310546875,
+      "emp_var": 0.00018582233586858222,
+      "theo_snr_db": 37.37298684576074,
+      "emp_snr_db": 37.309020849523925,
+      "cosine_similarity": 0.9999998343667332
+    },
+    {
+      "d": 16384,
+      "M": 8,
+      "virtual_params_billions": 2.147483648,
+      "theo_var": 0.00042724609375,
+      "emp_var": 0.0004277087790806037,
+      "theo_snr_db": 33.6932189928148,
+      "emp_snr_db": 33.68851835394037,
+      "cosine_similarity": 0.9999995530455592
+    },
+    {
+      "d": 16384,
+      "M": 10,
+      "virtual_params_billions": 2.68435456,
+      "theo_var": 0.00054931640625,
+      "emp_var": 0.0005428622994355988,
+      "theo_snr_db": 32.601774298564116,
+      "emp_snr_db": 32.65310318070992,
+      "cosine_similarity": 0.9999994441454872
+    },
+    {
+      "d": 16384,
+      "M": 16,
+      "virtual_params_billions": 4.294967296,
+      "theo_var": 0.00091552734375,
+      "emp_var": 0.0009025319898936276,
+      "theo_snr_db": 30.383286802400555,
+      "emp_snr_db": 30.44537395751324,
+      "cosine_similarity": 0.9999992025710772
+    }
+  ],
+  "exp1b_rank_explosion": [
+    {
+      "d": 1024,
+      "m": 64,
+      "seed_params": 8448,
+      "dense_params": 1048576,
+      "compression_ratio": 124.12121212121212,
+      "linear_rank": 64,
+      "hss_full_rank": 1014
+    },
+    {
+      "d": 2048,
+      "m": 64,
+      "seed_params": 8448,
+      "dense_params": 4194304,
+      "compression_ratio": 496.4848484848485,
+      "linear_rank": 63,
+      "hss_full_rank": 1977
+    },
+    {
+      "d": 2048,
+      "m": 128,
+      "seed_params": 33280,
+      "dense_params": 4194304,
+      "compression_ratio": 126.03076923076924,
+      "linear_rank": 128,
+      "hss_full_rank": 2024
+    },
+    {
+      "d": 4096,
+      "m": 128,
+      "seed_params": 33280,
+      "dense_params": 16777216,
+      "compression_ratio": 504.12307692307695,
+      "linear_rank": 128,
+      "hss_full_rank": 3885
+    }
+  ],
+  "exp1c_training": {
+    "elapsed_sec": 6.440414694000026,
+    "history": [
+      {
+        "step": 1,
+        "loss": 512.8748779296875,
+        "accuracy_pct": 0.1953125
+      },
+      {
+        "step": 20,
+        "loss": 441.0061950683594,
+        "accuracy_pct": 0.1953125
+      },
+      {
+        "step": 40,
+        "loss": 275.73321533203125,
+        "accuracy_pct": 1.5625
+      },
+      {
+        "step": 60,
+        "loss": 69.34101104736328,
+        "accuracy_pct": 21.09375
+      },
+      {
+        "step": 80,
+        "loss": 5.080171585083008,
+        "accuracy_pct": 70.703125
+      },
+      {
+        "step": 100,
+        "loss": 2.7373604774475098,
+        "accuracy_pct": 78.90625
+      },
+      {
+        "step": 120,
+        "loss": 2.3930187225341797,
+        "accuracy_pct": 78.3203125
+      }
+    ]
+  }
+}

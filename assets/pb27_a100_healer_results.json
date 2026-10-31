@@ -1,0 +1,34 @@
+[
+  {
+    "svd_rank": 32,
+    "naive_8to1_swiglu_cosine_pct": 5.558681767433882,
+    "linear_proj_cosine_pct": 93.50589290261269,
+    "healed_cold_swiglu_cosine_pct": 74.5832048356533,
+    "hot_gate_mass_pct": 55.51110506057739,
+    "combined_10expert_moe_fidelity_pct": 88.69234870236555
+  },
+  {
+    "svd_rank": 64,
+    "naive_8to1_swiglu_cosine_pct": 5.558681767433882,
+    "linear_proj_cosine_pct": 95.61648294329643,
+    "healed_cold_swiglu_cosine_pct": 80.69768026471138,
+    "hot_gate_mass_pct": 55.51110506057739,
+    "combined_10expert_moe_fidelity_pct": 91.41261125209601
+  },
+  {
+    "svd_rank": 96,
+    "naive_8to1_swiglu_cosine_pct": 5.558681767433882,
+    "linear_proj_cosine_pct": 96.22868299484253,
+    "healed_cold_swiglu_cosine_pct": 83.91524478793144,
+    "hot_gate_mass_pct": 55.51110506057739,
+    "combined_10expert_moe_fidelity_pct": 92.84407015243951
+  },
+  {
+    "svd_rank": 128,
+    "naive_8to1_swiglu_cosine_pct": 5.558681767433882,
+    "linear_proj_cosine_pct": 96.73468843102455,
+    "healed_cold_swiglu_cosine_pct": 86.25218942761421,
+    "hot_gate_mass_pct": 55.51110506057739,
+    "combined_10expert_moe_fidelity_pct": 93.88375099798046
+  }
+]

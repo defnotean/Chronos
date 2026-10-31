@@ -1,0 +1,19 @@
+# Large temporary weight dumps (>5 MB)
+assets/real_pb27_layer0_experts.pt
+assets/pb27_part1.pt
+assets/pb27_part2.pt
+assets/pb27_a100_healed_bank.pt
+
+# Python & CUDA build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dll
+*.exp
+*.lib
+*.obj
+*.o
+.venv/
+venv/
+.env
