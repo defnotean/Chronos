@@ -27,7 +27,13 @@ try:
 except Exception:
     vllm_fused_experts = None
 
-from chronos_1t.models.chronos_moe_block import ChronosHolographicExpertGroup
+import re
+from typing import Any, Iterable
+from chronos_1t.models.chronos_moe_block import (
+    ChronosHolographicExpertGroup,
+    build_hadamard_128,
+    unpack_nvfp4,
+)
 
 
 def dequantize_mxfp8(weight_fp8: torch.Tensor, scale_e8m0: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -39,50 +45,97 @@ def dequantize_mxfp8(weight_fp8: torch.Tensor, scale_e8m0: torch.Tensor, device:
 
 
 class ChronosQwen4ExpSparseMoeBlock(nn.Module):
-    """Drop-in replacement for `Qwen4ExpSparseMoeBlock` backed by a `chronos-layer-XXXXX-of-00048.safetensors` shard."""
+    """Drop-in replacement for `Qwen4ExpSparseMoeBlock` backed by a `chronos-layer-XXXXX-of-00048.safetensors` shard.
+    Supports both direct standalone instantiation and native vLLM `Qwen4ExpSparseMoeBlock(vllm_config, prefix)` instantiation.
+    """
 
     def __init__(
         self,
-        layer_idx: int,
-        shard_path: str | Path,
-        device: torch.device,
+        layer_idx: int | None = None,
+        shard_path: str | Path | None = None,
+        device: torch.device | str | None = None,
         top_k: int = 10,
-        hot_cache_size: int = 64,
+        hot_cache_size: int = 24,
+        offload_tail_to_cpu: bool = True,
+        vllm_config: Any = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
+        if vllm_config is not None:
+            if layer_idx is None:
+                m = re.search(r"layers\.(\d+)", prefix)
+                layer_idx = int(m.group(1)) if m else 0
+            if shard_path is None:
+                model_dir = Path(vllm_config.model_config.model)
+                shard_path = model_dir / f"chronos-layer-{layer_idx:05d}-of-00048.safetensors"
+            hf_cfg = getattr(vllm_config.model_config, "hf_config", None)
+            chronos_cfg = getattr(hf_cfg, "chronos_holographic_moe", None) or {}
+            if isinstance(chronos_cfg, dict):
+                hot_cache_size = int(chronos_cfg.get("hot_cache_size", hot_cache_size))
+                offload_tail_to_cpu = bool(chronos_cfg.get("offload_tail_to_cpu", offload_tail_to_cpu))
+
+        if layer_idx is None:
+            layer_idx = 0
+        if shard_path is None:
+            shard_path = f"/home/defnotean/pb27/hf/flash_next_chronos_v6/chronos-layer-{layer_idx:05d}-of-00048.safetensors"
+        if device is None:
+            device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+        elif isinstance(device, str):
+            device = torch.device(device)
+
         self.layer_idx = layer_idx
         self.device = device
         self.top_k = top_k
         self.hot_cache_size = max(top_k, hot_cache_size)
+        self.offload_tail_to_cpu = offload_tail_to_cpu
 
-        prefix = f"model.language_model.layers.{layer_idx}.mlp"
+        tensor_prefix = f"model.language_model.layers.{layer_idx}.mlp"
         raw = load_file(str(shard_path), device="cpu")
 
-        self.router_w = raw[f"{prefix}.gate.weight"].to(device=device, dtype=torch.bfloat16).contiguous()
-        self.shared_gate_w = raw[f"{prefix}.shared_expert_gate.weight"].to(device=device, dtype=torch.bfloat16).contiguous()
+        self.router_w = raw[f"{tensor_prefix}.gate.weight"].to(device=device, dtype=torch.bfloat16).contiguous()
+        self.shared_gate_w = raw[f"{tensor_prefix}.shared_expert_gate.weight"].to(device=device, dtype=torch.bfloat16).contiguous()
 
         sh_g = dequantize_mxfp8(
-            raw[f"{prefix}.shared_expert.gate_proj.weight"],
-            raw[f"{prefix}.shared_expert.gate_proj.weight_scale"],
+            raw[f"{tensor_prefix}.shared_expert.gate_proj.weight"],
+            raw[f"{tensor_prefix}.shared_expert.gate_proj.weight_scale"],
             device,
         )
         sh_u = dequantize_mxfp8(
-            raw[f"{prefix}.shared_expert.up_proj.weight"],
-            raw[f"{prefix}.shared_expert.up_proj.weight_scale"],
+            raw[f"{tensor_prefix}.shared_expert.up_proj.weight"],
+            raw[f"{tensor_prefix}.shared_expert.up_proj.weight_scale"],
             device,
         )
         self.sh_gu = torch.cat([sh_g, sh_u], dim=0).contiguous()  # (1280, 2560)
         self.sh_down = dequantize_mxfp8(
-            raw[f"{prefix}.shared_expert.down_proj.weight"],
-            raw[f"{prefix}.shared_expert.down_proj.weight_scale"],
+            raw[f"{tensor_prefix}.shared_expert.down_proj.weight"],
+            raw[f"{tensor_prefix}.shared_expert.down_proj.weight_scale"],
             device,
         ).contiguous()  # (2560, 640)
 
+        # Optional embedded lossless NVFP4 hub experts in the shard
+        self.hub_experts_cpu: dict[int, dict[str, torch.Tensor]] = {}
+        hub_prefix = f"{tensor_prefix}.hub_experts."
+        for k, v in raw.items():
+            if k.startswith(hub_prefix):
+                rest = k[len(hub_prefix):]
+                eid_str, tensor_name = rest.split(".", 1)
+                eid = int(eid_str)
+                self.hub_experts_cpu.setdefault(eid, {})[tensor_name] = v
+
+        shared_h128 = build_hadamard_128(device)
         self.groups = nn.ModuleList()
         for g_idx in range(64):
-            gp = f"{prefix}.chronos_groups.{g_idx}."
+            gp = f"{tensor_prefix}.chronos_groups.{g_idx}."
             sub_t = {k[len(gp):]: v for k, v in raw.items() if k.startswith(gp)}
-            self.groups.append(ChronosHolographicExpertGroup(group_idx=g_idx, tensors=sub_t, device=device))
+            self.groups.append(
+                ChronosHolographicExpertGroup(
+                    group_idx=g_idx,
+                    tensors=sub_t,
+                    device=device,
+                    offload_tail_to_cpu=offload_tail_to_cpu,
+                    h128=shared_h128,
+                )
+            )
 
         # Pre-allocated in-place GPU Ring-Buffer views (zero weight gather copy at runtime)
         self.cache_gu_buf = torch.empty((self.hot_cache_size, 1280, 2560), dtype=torch.bfloat16, device=device)
@@ -104,11 +157,17 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
             _, _, vh_rt = torch.linalg.svd(rw_f, full_matrices=False)
             u_ctx = vh_rt[:32, :].T
             prior_scores = torch.linalg.norm(rw_f @ u_ctx, dim=-1)
-            _, top_hub_ids = torch.topk(prior_scores, k=min(24, self.hot_cache_size // 2))
+            _, top_hub_ids = torch.topk(prior_scores, k=min(16, self.hot_cache_size // 2))
             for eid in top_hub_ids.tolist():
                 self._ensure_expert_slot(int(eid))
             self.cache_hits = 0
             self.cache_misses = 0
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Consumes vLLM AutoWeightsLoader weight stream for this `.mlp` submodule."""
+        for _ in weights:
+            pass
+        return {name for name, _ in self.named_parameters(recurse=True)}
 
     @torch.no_grad()
     def _ensure_expert_slot(self, expert_id: int) -> int:
@@ -126,9 +185,28 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
             self.expert_to_slot[old_eid] = -1
             self.expert_to_slot_gpu[old_eid] = -1
 
-        g_idx = expert_id // 8
-        local_m = expert_id % 8
-        gw, uw, dw = self.groups[g_idx].reconstruct_expert(local_m)
+        if expert_id in self.hub_experts_cpu:
+            ht = self.hub_experts_cpu[expert_id]
+            gw = unpack_nvfp4(
+                ht["gate_proj.weight"].to(self.device, non_blocking=True),
+                ht["gate_proj.weight_scale"].to(self.device, non_blocking=True),
+                ht["gate_proj.weight_scale_2"].to(self.device, non_blocking=True),
+            )
+            uw = unpack_nvfp4(
+                ht["up_proj.weight"].to(self.device, non_blocking=True),
+                ht["up_proj.weight_scale"].to(self.device, non_blocking=True),
+                ht["up_proj.weight_scale_2"].to(self.device, non_blocking=True),
+            )
+            dw = unpack_nvfp4(
+                ht["down_proj.weight"].to(self.device, non_blocking=True),
+                ht["down_proj.weight_scale"].to(self.device, non_blocking=True),
+                ht["down_proj.weight_scale_2"].to(self.device, non_blocking=True),
+            )
+        else:
+            g_idx = expert_id // 8
+            local_m = expert_id % 8
+            gw, uw, dw = self.groups[g_idx].reconstruct_expert(local_m)
+
         self.slot_gu[slot].copy_(torch.cat([gw, uw], dim=0).to(torch.bfloat16))
         self.slot_d[slot].copy_(dw.to(torch.bfloat16))
 
@@ -149,9 +227,9 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
         sh_gu_out = F.linear(x, self.sh_gu)
         y_shared = sh_score * F.linear(F.silu(sh_gu_out[:, :640]) * sh_gu_out[:, 640:], self.sh_down)
 
-        # 2. Routed Top-10 MoE Branch
-        router_logits = F.linear(x, self.router_w)
-        top_vals, top_ids = torch.topk(router_logits.float(), k=self.top_k, dim=-1)
+        # 2. Routed Top-10 MoE Branch (FP32 router gate for batch-invariant expert selection)
+        router_logits = F.linear(x.float(), self.router_w.float())
+        top_vals, top_ids = torch.topk(router_logits, k=self.top_k, dim=-1)
         top_gates_f32 = F.softmax(top_vals, dim=-1)
         top_gates = top_gates_f32.to(torch.bfloat16)
 
@@ -166,28 +244,7 @@ class ChronosQwen4ExpSparseMoeBlock(nn.Module):
                 y_routed.addcmul_(gates[k_idx : k_idx + 1], y_exp)
             return (y_routed + y_shared).view(orig_shape).to(orig_dtype)
 
-        if vllm_fused_experts is not None and 1 < n_toks and n_toks * self.top_k <= self.hot_cache_size:
-            slot_ids = self.expert_to_slot_gpu[top_ids]
-            if bool((slot_ids < 0).any()):
-                unique_eids = torch.unique(top_ids).tolist()
-                for eid in unique_eids:
-                    self._ensure_expert_slot(int(eid))
-                slot_ids = self.expert_to_slot_gpu[top_ids]
-            else:
-                self.cache_hits += n_toks * self.top_k
-            try:
-                y_routed = vllm_fused_experts(
-                    x,
-                    self.cache_gu_buf,
-                    self.cache_d_buf,
-                    top_gates_f32,
-                    slot_ids,
-                )
-                return (y_routed + y_shared).view(orig_shape).to(orig_dtype)
-            except Exception:
-                pass
-
-        # Multi-token prefill / batch execution
+        # Multi-token prefill / batch execution (grouped per-active-expert GEMM)
         y_routed = torch.zeros_like(x)
         unique_eids = torch.unique(top_ids).tolist()
         for eid in unique_eids:
