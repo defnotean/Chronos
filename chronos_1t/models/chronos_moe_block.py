@@ -385,12 +385,17 @@ class ChronosHolographicExpertGroup(nn.Module):
         self.down_tail_packed = tensors["tail.down_packed"].to(device)
         self.down_tail_scale = tensors["tail.down_scale"].to(device)
         self.down_tail_mask = tensors["tail.down_mask"].to(device) if "tail.down_mask" in tensors else None
+        self._s_gu_deq: torch.Tensor | None = None
+        self._s_down_deq: torch.Tensor | None = None
 
     @torch.no_grad()
     def reconstruct_expert(self, local_m: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reconstructs (gate_w, up_w, down_w) for expert `local_m` in 0..K-1 from the packed tensors."""
-        s_gu = unpack_nvfp4(self.s_gu_packed, self.s_gu_scale, self.s_gu_scale2)
-        s_down = unpack_nvfp4(self.s_down_packed, self.s_down_scale, self.s_down_scale2)
+        if self._s_gu_deq is None:
+            self._s_gu_deq = unpack_nvfp4(self.s_gu_packed, self.s_gu_scale, self.s_gu_scale2)
+            self._s_down_deq = unpack_nvfp4(self.s_down_packed, self.s_down_scale, self.s_down_scale2)
+        s_gu = self._s_gu_deq
+        s_down = self._s_down_deq
 
         r_s1, _, r_inv, r_s2, c_s1, _, c_inv, c_s2 = generate_expert_1d_keys(
             1280, 2560, local_m, seed_base=101 + self.group_idx * 8, device=self.device
