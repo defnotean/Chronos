@@ -1,0 +1,65 @@
+{
+  "model": "defnoteatin/PseudoBrain-DeepSeek-V4.1-Flash-1017-Chronos-v7.5-Abliterated",
+  "base_model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "abliteration_sources": [
+    "dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8",
+    "OBLITERATUS/DeepSeek-V4.1-Flash-1017-obliterated"
+  ],
+  "gpu": "NVIDIA A100-SXM4-80GB / NVIDIA A100-SXM4-40GB",
+  "total_converted_layers": 40,
+  "total_routed_experts": 15360,
+  "total_checkpoint_size_gb": 218.81,
+  "stock_mxfp4_checkpoint_size_gb": 510.31,
+  "stock_bf16_equivalent_size_gb": 1509.36,
+  "layer_20_audit": {
+    "layer_idx": 20,
+    "shard_size_gb": 5.38,
+    "stock_mxfp4_shard_gb": 7.39,
+    "stock_bf16_layer_gb": 27.39,
+    "compression_vs_mxfp4": 1.37,
+    "compression_vs_bf16": 5.09,
+    "load_time_s": 1.4,
+    "single_expert_gu_cos_mean": 0.95317,
+    "single_expert_down_cos_mean": 0.95397,
+    "routed_only_top6_cos": 0.96924,
+    "top6_moe_output_cos": 0.98292,
+    "stock_routed_w2_refusal_proj_norm": 1.593769,
+    "chronos_routed_w2_refusal_proj_norm": 0.01533785,
+    "routed_output_refusal_proj_norm": 0.00081135,
+    "attn_wo_b_abliteration_delta_norm": 15.9517,
+    "triton_vs_pytorch_ref_cos": 0.9999823,
+    "unfused_pytorch_warm_decode_latency_ms": 1.824,
+    "warm_decode_latency_ms": 0.6009,
+    "estimated_40layer_moe_tok_per_s": 41.6,
+    "warm_cache_hit_rate": 1.0,
+    "pinned_hub_slots": 8,
+    "output_finite": true
+  },
+  "e2e_40layer_forward": {
+    "layers_executed": 40,
+    "logits_shape": [
+      2,
+      7,
+      129280
+    ],
+    "logits_finite": true,
+    "logits_std": 3.0746,
+    "max_routed_refusal_leakage_across_all_layers": 0.04532811,
+    "mean_routed_refusal_leakage_across_all_layers": 0.01170709,
+    "top5_token_ids_capability_prompt": [
+      109359,
+      28908,
+      88752,
+      11294,
+      37309
+    ],
+    "top5_token_ids_abliterated_prompt": [
+      63564,
+      113956,
+      80201,
+      27871,
+      86379
+    ],
+    "e2e_elapsed_s": 338.73
+  }
+}
