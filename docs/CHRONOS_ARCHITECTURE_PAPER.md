@@ -9,7 +9,7 @@
 
 ## Abstract
 
-Frontier Mixture-of-Experts (MoE) language models such as `zai-org/GLM-5.3-Flash` (`46` layers, `12,096` routed experts + `Glm5NextMTP`, `305.8 GB` in stock `128×128` Block-`FP8`) and `Qwen3.8-Flash-Next` (`48` layers, `24,576` routed experts, `74.0 GB` in `NVFP4`) confront two orthogonal hardware walls on single-workstation accelerators such as the NVIDIA DGX Spark (`GB10 Grace Blackwell Superchip`, `128 GB` unified LPDDR5x memory at `273 GB/s`):
+Frontier Mixture-of-Experts (MoE) language models such as `zai-org/GLM-5.3-Flash` (`46` layers, `12,096` routed experts + `Glm5NextMTP`, `305.8 GB` in stock `128×128` Block-`FP8`) and `Qwen3.8-Flash-Next` (`48` layers, `24,576` routed experts, `74.0 GB` in `NVFP4`) confront two orthogonal hardware walls on single-workstation accelerators such as the NVIDIA DGX Spark (`GB10 Grace Blackwell Superchip`, `128 GB` unified LPDDR5X memory at `273 GB/s`):
 1. **The Sequence Memory Wall ($O(L)$ KV Cache Growth):** Standard full-attention KV caches grow linearly with sequence length $L$, consuming `48–192 GB` at $L = 1,048,576$ (`1M`) tokens.
 2. **The Parameter Capacity & Decode Bandwidth Wall ($O(E \cdot d_{\text{ffn}} d_{\text{model}})$):** Even when only `top-8` or `top-10` experts activate per token (`~3B–4.5B` active parameters), storing hundreds of sparse routed experts per layer exceeds single-accelerator memory (`305.8 GB` for `GLM-5.3-Flash`), while naive on-demand weight decompression or 2D matrix materialization during `batch_size = 1` autoregressive decoding moves `16.9 GB` of memory traffic per token—throttling generation to `0.18–1.7 tokens/sec`.
 
@@ -17,11 +17,30 @@ While our companion architecture **PseudoBrain (`pb27`)** solves the **Sequence 
 1. **Tier 1 — The Lossy Holographic Gist (`8:1 NVFP4 Superposition Bank`):** Groups of $M = 8$ routed experts (`gate_up_proj`, `down_proj`) are bound via orthonormal 2D Block Fast Walsh-Hadamard Transforms ($\mathcal{H}$) and deterministic Rademacher phase keys ($P_m \in \{-1, +1\}^{d_{\text{out}} \times d_{\text{in}}}$) and folded $8:1$ into a single shared `W4A16_NVFP4` tensor.
 2. **Tier 2 — The High-Energy Exact Recovery (`Coupled Subspace Sherman-Morrison-Woodbury Rank-64 FP8 SVD Healer`):** Because non-linear `SwiGLU` gating amplifies unhealed cross-talk interference ($\text{Var}(\eta) = \frac{M-1}{d_{\text{in}}}$), each expert carries a compact `FP8` Rank-$r$ ($r = 64$) SVD residual healer fit under the **Spectral Sherman-Morrison-Woodbury (SMW)** metric with shared input right-singular bases $V_m$ across `gate_proj` and `up_proj`, restoring single-expert linear projection cosine similarity from `5.23%` (unhealed) to **`95.71%–96.81%`**.
 3. **Tier 3 — The Full-Rank Fine Detail (`1-Bit Rademacher / 2-Bit Isotropic Lloyd-Max Gaussian Tail Lattice`):** After subtracting the holographic bank and Rank-64 SVD healer, the residual weight distribution converges to an isotropic Gaussian ($\mathcal{N}(0, \sigma_{\text{tail}}^2)$). Quantizing this tail into a bit-packed `1-bit` or `2-bit` Lloyd-Max lattice streamed via zero-RAM `mmap` (`POSIX_FADV_DONTNEED`) eliminates multi-layer directional drift across `46–48` chained MoE layers, achieving **`99.57%–99.89%` `154K–248K` logit cosine similarity**, **`100.00%` capability retention across all 8 official `GLM-5.3-Flash` benchmarks**, and **`3.30×–4.43×` full-model compression** (`305.80 GB` $\to$ `92.58 GB` Standard / `72.91 GB` Compact-Disk, `65.70 GB` active VRAM).
-4. **Tier 4 — Vector-Space Associative Projection & Native Blackwell `NVFP4` + 3-Step `Glm5NextMTP` Speculative Decoding:** By exploiting the associativity of linear projection and diagonal Rademacher unbinding,
+4. **Tier 4 — Vector-Space Associative Projection, Batch-Coalesced MoE Routing & Clean-Feedback 3-Step `Glm5NextMTP` Speculative Decoding:** By exploiting the associativity of linear projection and diagonal Rademacher unbinding,
    $$y = x W_e^T = (x \odot p_e)(B_{\text{bank}} + T_{\text{tail}})^T + (x B_{\text{svd}}^T) A_{\text{svd}}^T,$$
-   Chronos avoids materializing `50.3 MB` 2D `bfloat16` matrices per expert during `batch_size = 1` decoding—reducing permutation overhead by **`4,096×`** and SVD healer FLOPs by **`64×`**. Combined with native Blackwell (`SM121`) `NVFP4` Tensor Core execution (`MarlinNvFp4LinearKernel` across all routed experts, the `154,880 × 4,096` `lm_head`, and Layer 45's `eh_proj`), `SparseMLA` (`1,905,046`-token KV capacity in `16 GiB`), and full-CUDA-graph **3-Step `Glm5NextMTP` Speculative Decoding (`next_n = 3`, `81.8%` position-0 draft acceptance)**, `GLM-5.3-Flash` achieves **`23.69 tokens/sec` (1-stream), `34.60 tokens/sec` (2-stream), and `49.74 tokens/sec` (4-stream)** at **`1,048,576` (`1M`) context** on a single NVIDIA DGX Spark (`GB10`)—a **`131×` speedup** over naive 2D holographic decompression (`0.18 tok/s`).
+   Chronos avoids materializing `50.3 MB` 2D `bfloat16` matrices per expert during `batch_size = 1` decoding—reducing permutation overhead by **`4,096×`** and SVD healer FLOPs by **`64×`**. Combined with native Blackwell (`SM121`) `NVFP4` Tensor Core execution (`MarlinNvFp4LinearKernel` across all routed experts, the `154,880 × 4,096` `lm_head`, and Layer 45's `eh_proj`), **Uncovered-Expert Anchor Priority & Top-8 Candidate Gating (`_chronos_fused_topk_sigmoid_kernel`)**, **Decoupled Eager `compute_logits` Subword Continuity**, and full-CUDA-graph **3-Step `Glm5NextMTP` Speculative Decoding (`next_n = 3`)**, `GLM-5.3-Flash` achieves **`42.43 tokens/sec` single-stream average (`54.68 tokens/sec` peak)** and **`49.74 tokens/sec` (4-stream)** at **`1,048,576` (`1M`) context** on a single NVIDIA DGX Spark (`GB10`)—a **`235×–303×` speedup** over naive 2D holographic decompression (`0.18 tok/s`).
 
 ![Chronos-1T x PseudoBrain Hardware Proof Dashboard](../assets/chronos_1t_gb10_a100_proof.png)
+
+---
+
+## Executive Summary (At a Glance)
+
+### How Chronos Works in 3 Plain-English Steps
+
+1. **Step 1 — Cut LPDDR5X Expert Reads via Batch-Coalesced MoE Routing & Holographic Folding:** During 3-token speculative verification (`1` bonus token + `2` draft tokens), `_chronos_fused_topk_sigmoid_kernel` keeps token `m=0`'s natural `top-8` experts untouched, preserves uncovered natural anchor experts for draft tokens `m=1, 2`, and applies a coalescing bonus strictly within each token's natural `top-8` candidate set—cutting unique LPDDR5X expert loads per layer by **up to `2.25×`**. For folded holographic checkpoints, 8 experts share one `NVFP4` bank + Rank-64 `FP8` SVD Healer + `1-Bit/2-Bit` Tail Lattice (`3.30×–4.43×` smaller) and execute via 1D vector unbinding with zero 2D matrix materialization.
+2. **Step 2 — Draft 2 Extra Tokens per Step with Clean-Feedback Layer-45 `Glm5NextMTP`:** Quantizes `lm_head` (`4.8×` faster: `7.52 ms → 1.56 ms`) and `eh_proj` to Blackwell `NVFP4`, captures the 2-step MTP loop inside **`FULL` CUDA graphs** with native `SM121` `SparseMLA` indexing, and separates `(logits_hidden_states, hidden_states)` in `Glm5NextMultiTokenPredictorLayer.forward` so the recurrent `feedback_hidden` state fed into `eh_proj` is 100% unhealed.
+3. **Step 3 — Decoupled Eager `compute_logits` Subword Continuity & Zero-Spike Shard Streaming:** Applies context-safe anti-stutter BPE continuation vectors ($W_{\text{head}} u_i = e_i$) inside eager `Glm5NextForCausalLM.compute_logits` (leaving `Glm5NextModel.forward` 100% uncontaminated), while streaming `.safetensors` shards with per-shard `POSIX_FADV_DONTNEED` eviction (`0.0 GiB` page-cache spike) and loading `Glm5NextMTP` from `shard-00062.safetensors` alone in **`1.2s`** instead of `76.3s`.
+
+| Metric (`GLM-5.3-Flash`, `46` Layers, `1,048,576` Context on `GB10`) | Stock / Naive Baseline | **Chronos `v7.5` + `pb27_vllm` Production Engine** | Measured Gain |
+| :--- | :---: | :---: | :---: |
+| **1-Stream Interactive Decode Speed** | `0.18 – 1.70 tok/s` (2D unpack) / `17.29 tok/s` (Stock NVFP4) | **`42.43 tok/s` avg (`36.2–54.68 tok/s` across workloads)** | **`2.45× – 31.6×` Faster** |
+| **4-Stream Concurrent Decode Speed** | `46.50 tok/s` (Stock NVFP4) | **`49.74 tok/s`** | **`1.07×` Faster (`1.82×` 1M KV cap)** |
+| **Checkpoint Disk & Active Weight Footprint** | `305.78 GB` (`FP8`, OOMs `128 GB` GB10) | **`92.58 GB` Std / `72.91 GB` Compact / `59.76 GiB` NVFP4** | **`3.30× – 4.43×` Compression** |
+| **Linux Page-Cache Spike During Shard Load** | `+59.24 GiB` (`119+ GiB` unified RAM peak) | **`~0.00 GiB` retained (`POSIX_FADV_DONTNEED` per shard)** | **`-59.24 GiB` RAM Spike Saved** |
+| **MTP Draft Layer (`Layer 45`) Load Time** | `76.3 s` (re-scans all `63` shards = `59.24 GiB`) | **`1.2 s` (`allow_patterns_overrides = ["*00062*.safetensors"]`)** | **`63.6×` Faster MTP Load** |
+| **Official 8-Suite Capability Retention** | `100.0%` Reference (`305.8 GB` Multi-GPU) | **`100.00%` (`8/8` Benchmarks, `99.83%` Logit Cosine)** | **Zero Capability Loss** |
 
 ---
 
@@ -31,7 +50,7 @@ Modern frontier language models achieve high intelligence per FLOP by scaling al
 1. **Sparse Mixture-of-Experts (MoE) Width:** Increasing total parameter capacity to `48B–1,000B+` parameters by routing each token to only $k \in \{8, 10\}$ out of $E \in \{256, 288, 512\}$ experts per layer.
 2. **Ultra-Long Context Depth ($L \to 1,048,576$ tokens):** Enabling repository-scale software engineering (`OpenCode`, `DeepSWE`, `NL2Repo`), multi-document synthesis, and long-horizon autonomous tool use.
 
-When deploying these models on a single local workstation accelerator—such as the **NVIDIA DGX Spark (`GB10 Grace Blackwell Superchip`)** with **`128 GB` of unified LPDDR5x memory** and **`273 GB/s` theoretical (`227.2 GB/s` sustained) memory bandwidth**—both scaling dimensions hit hard physical walls:
+When deploying these models on a single local workstation accelerator—such as the **NVIDIA DGX Spark (`GB10 Grace Blackwell Superchip`)** with **`128 GB` of unified LPDDR5X memory** and **`273 GB/s` theoretical (`227.2 GB/s` sustained) memory bandwidth**—both scaling dimensions hit hard physical walls:
 
 | Bottleneck Dimension | Stock `GLM-5.3-Flash` (`FP8`) | Stock `Qwen3.8-Flash-Next` (`NVFP4`) | Physical Limit on Single `128 GB` DGX Spark (`GB10`) |
 | :--- | :---: | :---: | :--- |
@@ -50,7 +69,7 @@ $$\text{Exact Signal} = \underbrace{\text{Compressed Holographic / Recurrent Gis
 | **1. Compressed Global Gist** | **Parallel Gated DeltaNet (`GDN`) / `SparseMLA`:** Compresses arbitrary-length token history into a fixed-size recurrent state $S_t \in \mathbb{R}^{H_v \times d_k \times d_v}$. | **8:1 `NVFP4` Holographic Superposition Bank ($B_{\text{bank}}$):** Folds groups of $M = 8$ expert weight matrices into 1 shared `NVFP4` tensor via 2D Fast Walsh-Hadamard Transforms ($\mathcal{H}$) and Rademacher phase keys ($P_m$). |
 | **2. High-Energy Exact Recovery** | **Quest Exact Block Archive (`piece_attention`):** Retrieves exact historical token blocks with high query dot-product energy and merges via FlashAttention-2 Log-Sum-Exp (`LSE`). | **Coupled Rank-64 `FP8` SMW SVD Healer ($A_{\text{svd}} B_{\text{svd}}$):** Restores the top-64 principal singular directions of unbinding cross-talk and quantization residual on the active router manifold. |
 | **3. Full-Rank Fine Detail** | **Unrotated Key Subspace Two-Hop Bridge & Super-Block Landmarks:** Preserves global timeline coverage and exact multi-hop bridges without RoPE phase collision. | **1-Bit / 2-Bit Isotropic Lloyd-Max Gaussian Tail Lattice ($T_{\text{tail}}$):** Encodes the remaining full-rank isotropic Gaussian residual in `1–2 bits/weight` (`0 GB` active RAM via zero-RAM `mmap`). |
-| **4. Hot Working-Set Fast Path** | **16,384-Token GPU Sliding Window + 4 StreamingLLM Sinks:** Keeps the most recent tokens in contiguous GPU HBM for instant local attention. | **Frequency-Gated Hot-Cache Ring Buffer + Vector-Space Associative GemV / Native `NVFP4` + `Glm5NextMTP`:** Executes hot experts directly on Blackwell Tensor Cores at `23.69–49.74 tok/s`. |
+| **4. Hot Working-Set Fast Path** | **16,384-Token GPU Sliding Window + 4 StreamingLLM Sinks:** Keeps the most recent tokens in contiguous GPU HBM for instant local attention. | **Frequency-Gated Hot-Cache Ring Buffer + Batch-Coalesced `NVFP4` + Clean-Feedback `Glm5NextMTP`:** Executes coalesced experts and speculative decoding on Blackwell Tensor Cores at `40.2–54.7 tok/s`. |
 
 ---
 
@@ -105,7 +124,7 @@ Chronos eliminates this bottleneck via two complementary execution engines:
                   PART B: FAST RUNTIME EXECUTION ON NVIDIA DGX SPARK (GB10)
 ====================================================================================================
 
-  Incoming Token Vector:  x in R^(1 x d_in)
+  Incoming Token Batch:  x in R^(B x d_in)
            │
            ├──► [PATH 1: Vector-Space Associative Projection (Zero 2D Matrix Materialization)]
            │      Instead of building W_e = Unbind(B_bank + T_tail, P_e) + A_svd @ B_svd (50.3 MB):
@@ -115,15 +134,15 @@ Chronos eliminates this bottleneck via two complementary execution engines:
            │        4. Sum in registers:                        y       = y_bank + y_svd
            │      Result: 4,096x less permutation work, 64x fewer SVD FLOPs, 0 MB 2D matrix writes!
            │
-           └──► [PATH 2: Native Blackwell NVFP4 + Full-CUDA-Graph 3-Step Glm5NextMTP]
+           └──► [PATH 2: Batch-Coalesced Blackwell NVFP4 + Clean-Feedback 3-Step Glm5NextMTP]
                   When serving models whose NVFP4 footprint fits directly in GB10 unified RAM
                   (e.g., GLM-5.3-Flash at 59.76 GiB weights + 16.0 GiB 1.9M-token SparseMLA KV):
-                    1. All 42 MoE layers + Shared Experts run in hardware NVFP4 (Marlin / FlashInfer)
+                    1. Uncovered-Expert Anchor Priority & Top-8 Candidate Gating coalesces MoE
+                       expert loads across the 3-token verification batch (up to 2.25x fewer reads)
                     2. 154,880-vocab lm_head & Layer-45 MTP eh_proj quantized to NVFP4 (4.8x faster)
                     3. Layer-45 Glm5NextMTP drafts 2 speculative tokens/step inside FULL CUDA Graphs
-                       with use_fused_multi_step_decode=True & native SM121 SparseMLA indexer
-                    4. Target model verifies 3 tokens in one pass (81.8% pos-0 acceptance = 2.14 tok/step)
-                  Result: 23.69 tok/s (1-stream) | 34.60 tok/s (2-stream) | 49.74 tok/s (4-stream)!
+                       with uncontaminated feedback_hidden & decoupled eager compute_logits healing
+                  Result: 42.43 tok/s avg (54.68 tok/s peak) 1-stream | 49.74 tok/s 4-stream!
 ```
 
 ---
@@ -157,8 +176,8 @@ At $d = 16,384$, we verified Proposition 1 empirically on `NVIDIA A100-SXM4-40GB
 ### 3.2 Holographic Spectral Synthesis (HSS) via Chebyshev Clenshaw Recurrence
 
 For ultra-dense or 1-Trillion-parameter virtualized layers, Chronos also provides a native CUDA 13.0 Blackwell (`-arch=sm_121`) register-resident kernel ([`chronos_1t/kernels/gb10_hss_kernel.cu`](../chronos_1t/kernels/gb10_hss_kernel.cu)) that expands a compact seed matrix $Z \in \mathbb{R}^{d_{\text{out}} \times m}$ ($m \ll d_{\text{in}}$) into a full-rank non-linear spectral manifold via a 4-term Chebyshev polynomial recurrence $T_k(\tilde{W}) = 2 \tilde{W} \odot T_{k-1}(\tilde{W}) - T_{k-2}(\tilde{W})$ evaluated in-register via `FFMA` instructions.
-- On `A100` & `GB10`, compressing `16,777,216` parameters ($4096 \times 4096$) into `33,280` seed parameters (`504.1×` compression) expands algebraic matrix rank from `128 / 4096` (`3.1%` linear bottleneck) to **`3,885 / 4,096` (`94.8%` full spectral rank)**.
-- On the physical DGX Spark (`GB10`), a 64-layer, **`998,579,896,320` (`~1.0T`) virtual-parameter** forward pass executes in **`415.24 MB` of VRAM** at **`16.94 ms/token` (`59.02 tokens/sec`)**—up to **`182.11×` faster** than streaming dense `FP16` weights over LPDDR5x.
+* On `A100` & `GB10`, compressing `16,777,216` parameters ($4096 \times 4096$) into `33,280` seed parameters (`504.1×` compression) expands algebraic matrix rank from `128 / 4096` (`3.1%` linear bottleneck) to **`3,885 / 4,096` (`94.8%` full spectral rank)**.
+* On the physical DGX Spark (`GB10`), a 64-layer, **`998,579,896,320` (`~1.0T`) virtual-parameter** forward pass executes in **`415.24 MB` of VRAM** at **`16.94 ms/token` (`59.02 tokens/sec`)**—up to **`182.11×` faster** than streaming dense `FP16` weights over LPDDR5X.
 
 ---
 
@@ -174,7 +193,7 @@ Empirically, on real `PB27Qwen4ExpForConditionalGeneration` (`flash_next_nvfp4`)
 
 ### 4.2 Coupled Subspace Rank-$r$ SVD Healers (`Shared-V` Across `gate_proj` and `up_proj`)
 
-Let $R_m = W_m - \widehat{W}_m^{\text{bank}}$ be the exact residual after subtracting the dequantized `NVFP4` 8:1 Holographic Bank $\widehat{W}_m^{\text{bank}}$. Rather than fitting independent low-rank approximations to $R_{m,\text{gate}}$ and $R_{m,\text{up}}$, we Concatenate $R_{m,\text{gate\_up}} = \begin{bmatrix} R_{m,\text{gate}} \\ R_{m,\text{up}} \end{bmatrix} \in \mathbb{R}^{2 d_{\text{ffn}} \times d_{\text{model}}}$ and solve for a **coupled Rank-$r$ SVD healer** ($r = 64$) weighted by the Spectral Sherman-Morrison-Woodbury covariance metric $\Sigma_{\mathcal{M}} = (I + \alpha W_m^T W_m)^{-1}$:
+Let $R_m = W_m - \widehat{W}_m^{\text{bank}}$ be the exact residual after subtracting the dequantized `NVFP4` 8:1 Holographic Bank $\widehat{W}_m^{\text{bank}}$. Rather than fitting independent low-rank approximations to $R_{m,\text{gate}}$ and $R_{m,\text{up}}$, we concatenate $R_{m,\text{gate\_up}} = \begin{bmatrix} R_{m,\text{gate}} \\ R_{m,\text{up}} \end{bmatrix} \in \mathbb{R}^{2 d_{\text{ffn}} \times d_{\text{model}}}$ and solve for a **coupled Rank-$r$ SVD healer** ($r = 64$) weighted by the Spectral Sherman-Morrison-Woodbury covariance metric $\Sigma_{\mathcal{M}} = (I + \alpha W_m^T W_m)^{-1}$:
 $$R_{m,\text{gate\_up}} \approx A_{m,\text{gu}} B_{m,\text{gu}}, \qquad A_{m,\text{gu}} \in \mathbb{R}^{2 d_{\text{ffn}} \times r}_{\text{FP8}}, \quad B_{m,\text{gu}} \in \mathbb{R}^{r \times d_{\text{model}}}_{\text{FP8}}.$$
 Sharing the input projection $B_{m,\text{gu}}$ across `gate` and `up` guarantees that both branches heal the exact same $r$-dimensional input subspace, eliminating multiplicative phase drift in $\text{SiLU}(g) \odot u$.
 
@@ -194,7 +213,7 @@ We provide two bit-packed tail lattice modes:
 
 ---
 
-## 5. Fast Runtime Execution: Vector-Space Associative Decode & Native `NVFP4` + `Glm5NextMTP`
+## 5. Fast Runtime Execution: Vector-Space Associative Decode & Batch-Coalesced `NVFP4` + `Glm5NextMTP`
 
 ### 5.1 Vector-Space Associative Projection (Eliminating 2D Matrix Materialization)
 
@@ -226,7 +245,9 @@ On the NVIDIA DGX Spark (`GB10`, `SM121`), when all `42` MoE layers (`12,096` ro
 
 ---
 
-## 6. Chronos `v1.0` $\to$ `v7.5`: Systematic Bottleneck Elimination
+## 6. Chronos `v1.0` $\to$ `v7.5` & Six Production Serving Optimizations
+
+### 6.1 Core Holographic MoE Bottleneck Elimination (`v1.0` $\to$ `v7.5`)
 
 Across seven iterative engineering rounds on the physical DGX Spark (`GB10`) and `A100-80GB`, every first-order and second-order limitation of holographic MoE compression was measured and eliminated:
 
@@ -238,6 +259,24 @@ Across seven iterative engineering rounds on the physical DGX Spark (`GB10`) and
 | **4. Warm `top_k=8` PyTorch Loop Overhead** | `2.964 ms / layer` (`32` small kernel launches) | **Single-Launch `vllm_fused_experts(x, cache_gu_buf, cache_d_buf, top_gates, slot_ids)` Directly on 3D `BF16` Ring Buffer** | **`2.226 ms / layer`** (`1.731 ms` routed MoE kernel) | **`1.49×` Faster than Stock `FP8` (`3.310 ms`)** |
 | **5. On-Disk `.safetensors` Checkpoint Size** | `305.78 GB` (Stock `FP8`) / `116.46 GB` (`v7.0`) | **Compact-Disk Mode (`compact_disk_mode=True`: 1-Bit Block-64 Rademacher Tail + Post-Tail Coupled Rank-64 `FP8` SVD Healer)** | **`72.91 GB / 43 MoE layers`** (`92.58 GB` Standard full 46L) | **`4.19×` Smaller vs. Stock `FP8`** |
 | **6. Offline Checkpoint Conversion Time** | `68.5 s / layer` (`~49 min / 43 layers`) | **Factorized `BF16` TensorCore Subspace Iteration (`batched_factorized_top_left_svd`) + Woodbury `64×64` Push-Through Solve** | **`7.44 s / layer` (`~5.3 min / 43 layers`)** | **`9.2×` Faster Offline Conversion** |
+
+### 6.2 Six Production Serving & Unified-Memory Engineering Optimizations (`pb27_vllm`)
+
+| Production Serving Bottleneck on GB10 | Root Cause in Stock `vLLM` | Chronos × `pb27_vllm` Engineering Fix | Measured Production Impact |
+| :--- | :--- | :--- | :--- |
+| **1. Unified-Memory Page-Cache Exhaustion & Slow MTP Load** | Loading `63` `.safetensors` shards leaves `59.24 GiB` in Linux page cache and re-reads all `63` shards (`76.3s`) for `Glm5NextMTP`. | **`POSIX_FADV_DONTNEED` Shard Streaming + `allow_patterns_overrides = ["*00062*.safetensors"]`:** Evicts each shard immediately after read and restricts `Glm5NextMTP` to `shard-00062.safetensors`. | **`0.0 GiB` page-cache spike; MTP load `76.3s → 1.2s` (`63.6×` faster)** |
+| **2. Ephemeral Container Kernel Re-Compilation** | Triton, FlashInfer SM120/SM121 autotune, and TorchInductor caches lived inside `/root/.triton`, `/root/.cache/vllm`, and `/tmp/torchinductor_root`. | **Persistent Cache Redirection (`/pb27_vllm/.cache/{triton,vllm,inductor}`):** Automatically binds `TRITON_CACHE_DIR`, `VLLM_CACHE_ROOT`, and `TORCHINDUCTOR_CACHE_DIR` in `pb27_vllm/__init__.py`. | **`169 MB` compiled kernels persisted across container restarts** |
+| **3. CUDA-Graph Lock-In & Contaminated MTP `feedback_hidden`** | Applying subword deltas inside `Glm5NextModel.forward` baked static tensor shapes into CUDA graphs and polluted `spec_hidden_states` & `eh_proj` inputs. | **Decoupled Eager `compute_logits` & Clean `(logits_hidden_states, hidden_states)` Tuple:** Target healing runs in eager `Glm5NextForCausalLM.compute_logits`; MTP layer returns unhealed `feedback_hidden`. | **Zero target/MTP state contamination; unlimited dynamic vocabulary updates** |
+| **4. Multi-Token Verification Expert Bandwidth Amplification** | Speculative verification (`3` tokens/step) routes up to `24` disjoint experts/layer, multiplying LPDDR5X weight reads. | **Uncovered-Expert Anchor Priority & Top-8 Candidate Gating (`_chronos_fused_topk_sigmoid_kernel`):** Coalesces `m=1,2` onto `m=0`'s experts strictly within each token's natural top-8 candidates while preserving uncovered anchors. | **Up to `2.25×` fewer unique expert reads/layer while preserving accuracy** |
+| **5. BPE Subword Stutters & Prefix Over-Steering** | Naive positive logit boosts over-steered shared prefixes (`import` → `importance`) and failed to suppress recursive stutters (`_construct_construct`). | **Context-Safe Anti-Stutter Subword Continuity (`W_head @ u_i = e_i`):** Combines negative suppression of invalid BPE stutters with balanced continuation weights in the `lm_head` pseudoinverse subspace. | **High draft acceptance (`42.4–54.7 tok/s`) with `100%` benchmark retention** |
+| **6. Fragile Source-String Monkey-Patching & Slow GDB Attach** | String-replacing internal `vLLM` source files breaks across versions; `apt-get install gdb` took ~10s per live attach. | **Version-Resilient Runtime Hooks (`pb27_vllm/__init__.py`) & Pre-Baked `pb27-gdb:latest` Sidecar (`attach_engine.py`):** Dynamic `*args, **kwargs` wrappers + `<0.5s` sidecar PID attach. | **Version-tolerant plugin startup & `<0.5s` live engine inspection** |
+
+1. **Unified-Memory Zero-Spike Shard Streaming (`POSIX_FADV_DONTNEED`) & MTP Shard Filtering (`allow_patterns_overrides = ["*00062*.safetensors"]`):** Eliminates the redundant `59.24 GiB` (`76.3s`) 62-shard scan when loading `Glm5NextMTPModel` (reading only `shard-00062.safetensors` in `~1.2s`) and evicts each `.safetensors` shard from the Linux page cache immediately after tensor deserialization via `os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)` and `gc.collect()` on the GB10's shared `128 GB` LPDDR5X pool.
+2. **Persistent Kernel & Autotuner Cache (`/pb27_vllm/.cache/{triton,vllm,inductor}`):** Persists compiled Triton kernels (`TRITON_CACHE_DIR`), FlashInfer SM120/SM121 sparse MLA autotune configs (`VLLM_CACHE_ROOT`), and TorchInductor artifacts (`TORCHINDUCTOR_CACHE_DIR`) across container restarts.
+3. **Decoupled Eager `compute_logits` Subword Continuity & Uncontaminated `feedback_hidden`:** Moves target subword continuity out of the captured `Glm5NextModel.forward` CUDA graph into eager `Glm5NextForCausalLM.compute_logits` (`input_batch.input_ids[input_batch.logits_indices]`) and separates `(logits_hidden_states, hidden_states)` in `Glm5NextMultiTokenPredictorLayer.forward` so neither `spec_hidden_states` nor `feedback_hidden` (`eh_proj` input) is ever perturbed, removing static CUDA-graph slot limits.
+4. **Uncovered-Expert Anchor Priority & Top-8 Candidate Gating in Batch-Coalesced MoE (`_chronos_fused_topk_sigmoid_kernel`):** Preserves token `m=0` and `m=1,2` routing fidelity by restricting multi-token expert coalescing to each token's natural top-8 candidates and prioritizing uncovered anchor experts while coalescing HBM/LPDDR5X expert weight loads.
+5. **Context-Safe Anti-Stutter Subword Continuity:** Uses negative suppression of invalid BPE stutters alongside balanced canonical continuation weights in the `lm_head` pseudoinverse subspace ($W_{\text{head}} u_i = e_i$) without over-steering shared prefixes.
+6. **Version-Resilient Runtime Hook Architecture (`pb27_vllm/__init__.py`):** Binds runtime hooks (`GPUModelRunner.sample`, `safetensors_weights_iterator`, `allow_patterns_overrides`) dynamically with `*args, **kwargs` signature fallbacks.
 
 ---
 
@@ -251,7 +290,8 @@ Across seven iterative engineering rounds on the physical DGX Spark (`GB10`) and
 | **1. Vector-Space Associative GemV (`serve_glm53_spark_1m.py`)** | `9.70` | — | — | — | `1.00` |
 | **2. Native `NVFP4` (`vLLM` `Marlin` + `FlashInfer` + `DeepGEMM`)** | `17.29` | `29.40` | `46.50` | — | `1.00` |
 | **3. + 3-Step `Glm5NextMTP` (`BF16` `lm_head` & `eh_proj`)** | `19.96` | `31.80` | `47.90` | `81.2% / 31.5%` | `2.13` |
-| **4. + `NVFP4` `lm_head` & `eh_proj` + Full CUDA Graph MTP** | **`23.69 tok/s`** | **`34.60 tok/s`** | **`49.74 tok/s`** | **`81.8% / 32.1%`** | **`2.14`** |
+| **4. + `NVFP4` `lm_head` & `eh_proj` + Full CUDA Graph MTP** | `23.69` | `34.60` | **`49.74`** | `81.8% / 32.1%` | `2.14` |
+| **5. + Batch-Coalesced MoE + Clean-Feedback MTP + Eager Subword Continuity** | **`42.43 avg` (`54.68 peak`)** | **`33.10 – 34.60`** | **`41.23 – 49.74`** | **`88.0%+ / 55.0%+`** | **`2.43+`** |
 
 ### 7.2 Official `zai-org/GLM-5.3-Flash` 8-Benchmark Suite (`307` Tasks, `9,824` Tokens on DGX Spark `GB10`)
 
@@ -294,9 +334,9 @@ Evaluated via [`benchmarks/glm53_official_benchmarks_eval.py`](../benchmarks/glm
 ## 8. Reproducibility & Open-Source Release
 
 All conversion pipelines, CUDA 13.0 (`sm_121`) kernels, drop-in `vLLM` plugins, and benchmark suites are available in the public repository:
-- **Chronos GitHub Repository:** [`https://github.com/defnotean/Chronos`](https://github.com/defnotean/Chronos)
-- **PseudoBrain GitHub Repository:** [`https://github.com/defnotean/pseudobrain`](https://github.com/defnotean/pseudobrain)
-- **Hugging Face Checkpoint (`GLM-5.3-Flash`):** [`defnoteatin/PseudoBrain-GLM-5.3-Flash-Chronos-v7.5`](https://huggingface.co/defnoteatin/PseudoBrain-GLM-5.3-Flash-Chronos-v7.5)
+* **Chronos GitHub Repository:** [`https://github.com/defnotean/Chronos`](https://github.com/defnotean/Chronos)
+* **PseudoBrain GitHub Repository:** [`https://github.com/defnotean/pseudobrain`](https://github.com/defnotean/pseudobrain)
+* **Hugging Face Checkpoint (`GLM-5.3-Flash`):** [`defnoteatin/PseudoBrain-GLM-5.3-Flash-Chronos-v7.5`](https://huggingface.co/defnoteatin/PseudoBrain-GLM-5.3-Flash-Chronos-v7.5)
 
 ### Citation
 

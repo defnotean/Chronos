@@ -17,6 +17,7 @@ from docx.oxml.ns import nsdecls
 ROOT = Path(__file__).resolve().parents[1]
 MD_PATH = ROOT / "docs" / "CHRONOS_ARCHITECTURE_PAPER.md"
 DOCX_PATH = ROOT / "docs" / "CHRONOS_ARCHITECTURE_PAPER.docx"
+PDF_PATH = ROOT / "docs" / "CHRONOS_ARCHITECTURE_PAPER.pdf"
 FIG_PATH = ROOT / "assets" / "chronos_1t_gb10_a100_proof.png"
 
 HEX_PRIMARY = "0F172A"
@@ -247,6 +248,23 @@ def build_docx() -> None:
     DOCX_PATH.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(DOCX_PATH))
     print(f"Saved {DOCX_PATH} ({DOCX_PATH.stat().st_size:,} bytes)")
+
+    try:
+        import win32com.client
+
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        try:
+            wdoc = word.Documents.Open(str(DOCX_PATH.resolve()))
+            try:
+                wdoc.SaveAs(str(PDF_PATH.resolve()), FileFormat=17)
+            finally:
+                wdoc.Close(False)
+        finally:
+            word.Quit()
+        print(f"Saved {PDF_PATH} ({PDF_PATH.stat().st_size:,} bytes)")
+    except Exception as exc:
+        print(f"PDF export via Word COM warning: {exc}")
 
 
 if __name__ == "__main__":

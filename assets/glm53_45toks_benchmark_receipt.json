@@ -1,0 +1,131 @@
+﻿{
+  "timestamp": "2026-11-01T20:21:40Z",
+  "winning_config": {
+    "P_batch": 12,
+    "P_mtp": 8,
+    "k0_anchor": 8,
+    "k1_anchor": 2,
+    "k_cand": 92,
+    "routed_scale_mult": 1.0,
+    "l2_exp": 0.0,
+    "m1_k_act": 8,
+    "k0_cap": 8,
+    "k_other_cap": 8,
+    "alpha_0": 15.0,
+    "alpha_1": 12.0,
+    "alpha_2": 10.0,
+    "alpha_3": 5.0,
+    "rank_slope": 0.15,
+    "prio_mode": 0
+  },
+  "fast_coalesced_config": {
+    "P_batch": 6,
+    "P_mtp": 6,
+    "k0_anchor": 6,
+    "k1_anchor": 1,
+    "m1_k_act": 6
+  },
+  "single_stream": [
+    {
+      "name": "Raft Consensus Engine",
+      "tokens": 512,
+      "seconds": 12.018,
+      "tok_s": 42.6
+    },
+    {
+      "name": "B+ Tree Storage Engine",
+      "tokens": 512,
+      "seconds": 14.144,
+      "tok_s": 36.2
+    },
+    {
+      "name": "Lock-Free Ring Buffer & WAL",
+      "tokens": 512,
+      "seconds": 12.741,
+      "tok_s": 40.19
+    },
+    {
+      "name": "Distributed Vector Index",
+      "tokens": 512,
+      "seconds": 9.364,
+      "tok_s": 54.68
+    }
+  ],
+  "single_stream_avg_tok_s": 42.43,
+  "single_stream_peak_tok_s": 54.68,
+  "coding_with_thinking_single_stream": [
+    {
+      "name": "dijkstra",
+      "tokens": 188,
+      "seconds": 5.84,
+      "tok_s": 32.2,
+      "passed": true
+    },
+    {
+      "name": "LRUCache",
+      "tokens": 141,
+      "seconds": 4.26,
+      "tok_s": 33.1,
+      "passed": true
+    },
+    {
+      "name": "merge_k_sorted",
+      "tokens": 149,
+      "seconds": 4.65,
+      "tok_s": 32.1,
+      "passed": true
+    },
+    {
+      "name": "min_distance",
+      "tokens": 166,
+      "seconds": 5.14,
+      "tok_s": 32.3,
+      "passed": true
+    },
+    {
+      "name": "tarjan_scc",
+      "tokens": 282,
+      "seconds": 8.77,
+      "tok_s": 32.2,
+      "passed": true
+    },
+    {
+      "name": "total_n_queens",
+      "tokens": 293,
+      "seconds": 9.62,
+      "tok_s": 30.5,
+      "passed": true
+    },
+    {
+      "name": "trap",
+      "tokens": 134,
+      "seconds": 4.21,
+      "tok_s": 31.8,
+      "passed": true
+    },
+    {
+      "name": "length_of_lis",
+      "tokens": 78,
+      "seconds": 2.59,
+      "tok_s": 30.1,
+      "passed": true
+    }
+  ],
+  "multi_stream": {
+    "2_stream": {
+      "total_tokens": 1024,
+      "seconds": 30.935,
+      "tok_s": 33.1
+    },
+    "4_stream": {
+      "total_tokens": 2048,
+      "seconds": 47.006,
+      "tok_s": 43.57
+    }
+  },
+  "coding_pass_rate": "8/8",
+  "gsm8k_pass_rate": "8/8",
+  "mmlu_pass_rate": "8/8",
+  "tool_call_verified": true,
+  "opencode_cli_verified": true
+}
