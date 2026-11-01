@@ -412,6 +412,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         self,
         layer_idx: int = 0,
         shard_path: str | Path | None = None,
+        hot_shard_path: str | Path | None = None,
         device: torch.device | str | None = None,
         top_k: int = 6,
         routed_scaling_factor: float = 1.5,
@@ -550,7 +551,36 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         self._act_inter_buf = torch.empty((self.top_k + 1, 2304), dtype=torch.bfloat16, device=device)
         self._y_partial_buf = torch.empty((self.top_k + 1, 5120), dtype=torch.float32, device=device)
 
-        # Upgrade 2: Pre-seed & pin top Global Router Prior hub experts (or direct MXFP4 hot experts if present in shard)
+        # Upgrade 2: Hybrid Direct Unshared MXFP4 Hot Experts + Chronos v7.5 Holographic Cold Experts
+        self.hot_expert_to_idx: list[int] = [-1] * 384
+        self.num_hot_mxfp4_experts = 0
+        self._hot_tensors: dict[str, torch.Tensor] | None = None
+        self._hot_handle: Any = None
+        self._hot_tp = f"{tp}.hot_experts."
+
+        if hot_shard_path is None:
+            cand = Path(self.shard_path_str).with_name(
+                f"chronos-dsv41-upgrade2-hot96-layer-{layer_idx:05d}-of-00040.safetensors"
+            )
+            if cand.exists():
+                hot_shard_path = cand
+
+        if hot_shard_path is not None and Path(hot_shard_path).exists():
+            self._hot_handle = safe_open(str(hot_shard_path), framework="pt", device="cpu")
+            hot_keys = set(self._hot_handle.keys())
+            if f"{self._hot_tp}expert_ids" not in hot_keys and f"layers.{layer_idx}.ffn.hot_experts.expert_ids" in hot_keys:
+                self._hot_tp = f"layers.{layer_idx}.ffn.hot_experts."
+            hot_eids = self._hot_handle.get_tensor(f"{self._hot_tp}expert_ids").tolist()
+            for idx_h, eid_h in enumerate(hot_eids):
+                self.hot_expert_to_idx[int(eid_h)] = idx_h
+            self.num_hot_mxfp4_experts = len(hot_eids)
+            if not mmap_zero_ram:
+                self._hot_tensors = {
+                    k_s: self._hot_handle.get_tensor(f"{self._hot_tp}{k_s}")
+                    for k_s in ("w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale")
+                }
+                self._hot_handle = None
+
         self.pinned_slots = 0
         with torch.no_grad():
             rw_f = self.router_w.float()
@@ -576,6 +606,31 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         pass
 
     @torch.no_grad()
+    def _reconstruct_hot_mxfp4_into(self, h_idx: int, out_gu: torch.Tensor, out_d: torch.Tensor) -> None:
+        if self._hot_tensors is not None:
+            w1_w = self._hot_tensors["w1.weight"][h_idx]
+            w1_s = self._hot_tensors["w1.scale"][h_idx]
+            w3_w = self._hot_tensors["w3.weight"][h_idx]
+            w3_s = self._hot_tensors["w3.scale"][h_idx]
+            w2_w = self._hot_tensors["w2.weight"][h_idx]
+            w2_s = self._hot_tensors["w2.scale"][h_idx]
+        else:
+            w1_w = self._hot_handle.get_slice(f"{self._hot_tp}w1.weight")[h_idx]
+            w1_s = self._hot_handle.get_slice(f"{self._hot_tp}w1.scale")[h_idx]
+            w3_w = self._hot_handle.get_slice(f"{self._hot_tp}w3.weight")[h_idx]
+            w3_s = self._hot_handle.get_slice(f"{self._hot_tp}w3.scale")[h_idx]
+            w2_w = self._hot_handle.get_slice(f"{self._hot_tp}w2.weight")[h_idx]
+            w2_s = self._hot_handle.get_slice(f"{self._hot_tp}w2.scale")[h_idx]
+
+        out_gu[:2304].copy_(dequantize_mxfp4_32(w1_w, w1_s, self.device, dtype=torch.bfloat16))
+        out_gu[2304:].copy_(dequantize_mxfp4_32(w3_w, w3_s, self.device, dtype=torch.bfloat16))
+        out_d.copy_(dequantize_mxfp4_32(w2_w, w2_s, self.device, dtype=torch.bfloat16))
+        if self.r_basis is not None:
+            rb = self.r_basis.to(torch.bfloat16)
+            proj = torch.matmul(rb, out_d)
+            out_d.addmm_(rb.T, proj, beta=1.0, alpha=-1.0)
+
+    @torch.no_grad()
     def _ensure_expert_slot(
         self,
         expert_id: int,
@@ -597,11 +652,15 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self.expert_to_slot[old_eid] = -1
             self.expert_to_slot_gpu[old_eid] = -1
 
-        g_idx = expert_id // 8
-        local_m = expert_id % 8
-        self.groups[g_idx].reconstruct_expert_into_slot(
-            local_m, self.slot_gu[slot], self.slot_d[slot], s_gu_cached=s_gu_cached, s_dn_cached=s_dn_cached
-        )
+        h_idx = self.hot_expert_to_idx[expert_id]
+        if h_idx >= 0:
+            self._reconstruct_hot_mxfp4_into(h_idx, self.slot_gu[slot], self.slot_d[slot])
+        else:
+            g_idx = expert_id // 8
+            local_m = expert_id % 8
+            self.groups[g_idx].reconstruct_expert_into_slot(
+                local_m, self.slot_gu[slot], self.slot_d[slot], s_gu_cached=s_gu_cached, s_dn_cached=s_dn_cached
+            )
 
         self.expert_to_slot[expert_id] = slot
         self.expert_to_slot_gpu[expert_id] = slot
@@ -645,7 +704,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 slot_ids = []
                 for eid in eids:
                     eid_i = int(eid)
-                    if self.expert_to_slot[eid_i] < 0:
+                    if self.expert_to_slot[eid_i] < 0 and self.hot_expert_to_idx[eid_i] < 0:
                         g_idx = eid_i // 8
                         if g_idx not in group_bank_cache:
                             grp = self.groups[g_idx]
@@ -740,11 +799,29 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             n_admit = min(len(sorted_cold), max(self.top_k, self.hot_cache_size - len(warm_eids)))
             admit_set = set(sorted_cold[:n_admit])
 
-            by_group: dict[int, list[int]] = {}
-            for eid in cold_eids:
-                by_group.setdefault(eid // 8, []).append(eid)
+            hot_bank_colds = [eid for eid in cold_eids if self.hot_expert_to_idx[eid] >= 0]
+            holo_colds = [eid for eid in cold_eids if self.hot_expert_to_idx[eid] < 0]
 
             admitted_ordered: list[tuple[float, int, torch.Tensor, torch.Tensor]] = []
+            for eid in hot_bank_colds:
+                gu_w = torch.empty((4608, 5120), dtype=torch.bfloat16, device=self.device)
+                dw = torch.empty((5120, 2304), dtype=torch.bfloat16, device=self.device)
+                self._reconstruct_hot_mxfp4_into(self.hot_expert_to_idx[eid], gu_w, dw)
+                mask = top_ids == eid
+                tok_indices, slot_indices = torch.where(mask)
+                x_sel = x[tok_indices]
+                g_sel = top_gates[tok_indices, slot_indices].unsqueeze(-1)
+                gu_out = F.linear(x_sel, gu_w)
+                act = dsv41_clamped_swiglu(gu_out, 2304, self.swiglu_limit)
+                y_exp = F.linear(act, dw)
+                y_routed.index_add_(0, tok_indices, g_sel * y_exp)
+                if eid in admit_set:
+                    admitted_ordered.append((float(expert_mass[eid].item()), eid, gu_w, dw))
+
+            by_group: dict[int, list[int]] = {}
+            for eid in holo_colds:
+                by_group.setdefault(eid // 8, []).append(eid)
+
             for g_idx, g_eids in by_group.items():
                 grp = self.groups[g_idx]
                 s_gu_c = unpack_nvfp4(grp.s_gu_packed, grp.s_gu_scale, grp.s_gu_scale2, dtype=torch.bfloat16)

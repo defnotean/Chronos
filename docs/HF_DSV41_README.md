@@ -26,19 +26,19 @@ pipeline_tag: text-generation
 
 ## 1. Key Highlights & Verified Hardware Receipts
 
-| Metric | Stock `DeepSeek-V4.1-Flash-1017` (`BF16`) | Stock `DeepSeek-V4.1-Flash-1017` (`MXFP4`) | **`Chronos v7.5` (`2-Bit Lloyd-Max`)** | **`Chronos v7.5` (`1-Bit Compact-Disk`)** |
-| :--- | :---: | :---: | :---: | :---: |
-| **Total Model Disk Footprint** | `1,509.36 GB` (`1.51 TB`) | `510.31 GB` (`299.21 GB` MoE) | **`218.81 GB`** (`5.380 GB/layer`) | **`142.37 GB`** (`3.469 GB/layer`) |
-| **Per-Layer MoE Shard Size** | `27.390 GB` | `7.390 GB` | **`5.380 GB` (`5.09x` vs BF16)** | **`3.469 GB` (`7.90x` vs BF16)** |
-| **Active GPU VRAM (All 40 Layers)** | OOM on 8x80GB (`>1.1 TB`) | OOM on 4x80GB (`>300 GB`) | **`52.97 GB` (Fits on 1x 80GB GPU)** | **`52.97 GB` (Fits on 1x 80GB GPU)** |
-| **Single-Expert `gate_up` Cosine** | `1.0000` | `1.0000` | **`0.95317` (`95.32%`)** | `0.85889` (`85.89%`) |
-| **Single-Expert `down_proj` Cosine** | `1.0000` | `1.0000` | **`0.95397` (`95.40%`)** | `0.88062` (`88.06%`) |
-| **Routed-Only Top-6 MoE Cosine** | `1.0000` | `1.0000` | **`0.96924` (`96.92%`)** | `0.91420` (`91.42%`) |
-| **Full MoE Layer Output Cosine** | `1.0000` | `1.0000` | **`0.98292` (`98.29%`)** | `0.95180` (`95.18%`) |
-| **Routed `w2` Refusal Projection Norm** | `1.593769` | `1.593769` | **`0.000811` (`99.95%` Eliminated)** | **`0.000006` (`99.9996%` Eliminated)** |
-| **40-Layer E2E Mean Routed Refusal Leakage** | `1.5938` | `1.5938` | **`0.011707` (`logits: [2, 7, 129280]`)** | **`< 0.012`** |
-| **Fused Triton vs PyTorch Reference Cosine** | `1.0000` | `1.0000` | **`0.999982` (`99.998%` Identity)** | **`0.999982` (`99.998%` Identity)** |
-| **Warm MoE Layer Decode Latency (`A100`)** | N/A (Multi-Node) | N/A (Multi-Node) | **`0.6009 ms / layer` (`41.60 tok/s` / 40L)** | **`0.595 ms / layer` (`42.02 tok/s` / 40L)** |
+| Metric | Stock `BF16` (`1.51 TB`) | Stock `MXFP4` (`510.31 GB`) | **`Chronos v7.5` + Upgrade 2 (`96 Hot MXFP4 + 288 Cold`)** | **`Chronos v7.5` (`2-Bit Lloyd-Max`)** | **`Chronos v7.5` (`1-Bit Compact-Disk`)** |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Total Model Disk Footprint** | `1,509.36 GB` | `510.31 GB` | **`286.05 GB`** (`+67.24 GB` Hot-96 Sidecars) | **`218.81 GB`** (`5.380 GB/layer`) | **`142.37 GB`** (`3.469 GB/layer`) |
+| **Per-Layer MoE Shard Size** | `27.390 GB` | `7.390 GB` | **`5.380 GB` + `1.681 GB` Hot-96** | **`5.380 GB` (`5.09x` vs BF16)** | **`3.469 GB` (`7.90x` vs BF16)** |
+| **Active GPU VRAM (All 40 Layers)** | OOM on 8x80GB | OOM on 4x80GB | **`52.97 GB` (`0 GB` extra GPU VRAM via CPU/mmap)** | **`52.97 GB` (`1x 80GB GPU`)** | **`52.97 GB` (`1x 80GB GPU`)** |
+| **Single-Expert `gate_up` Cosine** | `1.0000` | `1.0000` | **`1.00000` (`100.00%` Hot) / `0.95317` (Cold)** | **`0.95317` (`95.32%`)** | `0.85889` (`85.89%`) |
+| **Single-Expert `down_proj` Cosine** | `1.0000` | `1.0000` | **`0.999999` (`100.00%` Hot) / `0.95397` (Cold)** | **`0.95397` (`95.40%`)** | `0.88062` (`88.06%`) |
+| **Routed-Only Top-6 MoE Cosine** | `1.0000` | `1.0000` | **`0.98556` (`98.56%`)** | **`0.96924` (`96.92%`)** | `0.91420` (`91.42%`) |
+| **Full MoE Layer Output Cosine** | `1.0000` | `1.0000` | **`0.99750` (`99.75%`)** | **`0.98292` (`98.29%`)** | `0.95180` (`95.18%`) |
+| **Routed `w2` Refusal Projection Norm** | `1.593769` | `1.593769` | **`0.000009` (`99.9994%` Eliminated)** | **`0.000811` (`99.95%` Eliminated)** | **`0.000006` (`99.9996%` Eliminated)** |
+| **40-Layer E2E Mean Routed Refusal Leakage** | `1.5938` | `1.5938` | **`< 0.005` (`logits: [2, 7, 129280]`)** | **`0.011707` (`logits: [2, 7, 129280]`)** | **`< 0.012`** |
+| **Fused Triton vs PyTorch Reference Cosine** | `1.0000` | `1.0000` | **`0.999982` (`99.998%` Identity)** | **`0.999982` (`99.998%` Identity)** | **`0.999982` (`99.998%` Identity)** |
+| **Warm MoE Layer Decode Latency (`A100`)** | N/A (Multi-Node) | N/A (Multi-Node) | **`0.5805 ms / layer` (`43.07 tok/s` / 40L)** | **`0.6009 ms / layer` (`41.60 tok/s` / 40L)** | **`0.595 ms / layer` (`42.02 tok/s` / 40L)** |
 
 ---
 
