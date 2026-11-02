@@ -201,7 +201,7 @@ try:
         acc3 = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
         if e_idx < TOP_K:
-            slot = tl.load(Slots_ptr + e_idx).to(tl.int64)
+            slot = tl.maximum(tl.load(Slots_ptr + e_idx).to(tl.int64), 0)
             BYTES_PER_ITER: tl.constexpr = sub_blocks_k * 16
             offs_b = tl.arange(0, BYTES_PER_ITER)
             offs_sb = offs_b // 16
@@ -272,7 +272,7 @@ try:
         acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
 
         if e_idx < TOP_K:
-            slot = tl.load(Slots_ptr + e_idx).to(tl.int64)
+            slot = tl.maximum(tl.load(Slots_ptr + e_idx).to(tl.int64), 0)
             BYTES_PER_ITER: tl.constexpr = sub_blocks_k * 16
             offs_b = tl.arange(0, BYTES_PER_ITER)
             offs_sb = offs_b // 16
@@ -873,36 +873,14 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         self._hot_tensors: dict[str, torch.Tensor] | None = None
         self._hot_handle: Any = None
         self._hot_tp = f"{tp}.hot_experts."
-
-        if hot_shard_path is None:
-            cand = Path(self.shard_path_str).with_name(
+        self._hot_shard_cand = (
+            Path(hot_shard_path)
+            if hot_shard_path is not None
+            else Path(self.shard_path_str).with_name(
                 f"chronos-dsv41-upgrade2-hot96-layer-{layer_idx:05d}-of-00040.safetensors"
             )
-            if cand.exists():
-                hot_shard_path = cand
-
-        if hot_shard_path is not None and Path(hot_shard_path).exists():
-            self._hot_handle = safe_open(str(hot_shard_path), framework="pt", device="cpu")
-            hot_keys = set(self._hot_handle.keys())
-            if f"{self._hot_tp}expert_ids" not in hot_keys and f"layers.{layer_idx}.ffn.hot_experts.expert_ids" in hot_keys:
-                self._hot_tp = f"layers.{layer_idx}.ffn.hot_experts."
-            hot_eids = self._hot_handle.get_tensor(f"{self._hot_tp}expert_ids").tolist()
-            for idx_h, eid_h in enumerate(hot_eids):
-                self.hot_expert_to_idx[int(eid_h)] = idx_h
-            self.num_hot_mxfp4_experts = len(hot_eids)
-            if not mmap_zero_ram:
-                self._hot_tensors = {
-                    k_s: self._hot_handle.get_tensor(f"{self._hot_tp}{k_s}")
-                    for k_s in ("w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale")
-                }
-                self._hot_handle = None
-            elif hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
-                try:
-                    fd_h = os.open(str(hot_shard_path), os.O_RDONLY)
-                    os.posix_fadvise(fd_h, 0, 0, os.POSIX_FADV_DONTNEED)
-                    os.close(fd_h)
-                except OSError:
-                    pass
+        )
+        self._try_attach_hot_shard()
 
         self.pinned_slots = 0
         with torch.no_grad():
@@ -919,6 +897,38 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 self.ring_cursor = self.pinned_slots
             self.cache_hits = 0
             self.cache_misses = 0
+
+    def _try_attach_hot_shard(self) -> bool:
+        if self.num_hot_mxfp4_experts > 0:
+            return True
+        if not self._hot_shard_cand.exists():
+            return False
+        try:
+            self._hot_handle = safe_open(str(self._hot_shard_cand), framework="pt", device="cpu")
+            hot_keys = set(self._hot_handle.keys())
+            if f"{self._hot_tp}expert_ids" not in hot_keys and f"layers.{self.layer_idx}.ffn.hot_experts.expert_ids" in hot_keys:
+                self._hot_tp = f"layers.{self.layer_idx}.ffn.hot_experts."
+            hot_eids = self._hot_handle.get_tensor(f"{self._hot_tp}expert_ids").tolist()
+            for idx_h, eid_h in enumerate(hot_eids):
+                self.hot_expert_to_idx[int(eid_h)] = idx_h
+            self.num_hot_mxfp4_experts = len(hot_eids)
+            if not self.mmap_zero_ram:
+                self._hot_tensors = {
+                    k_s: self._hot_handle.get_tensor(f"{self._hot_tp}{k_s}")
+                    for k_s in ("w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale")
+                }
+                self._hot_handle = None
+            elif hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+                try:
+                    fd_h = os.open(str(self._hot_shard_cand), os.O_RDONLY)
+                    os.posix_fadvise(fd_h, 0, 0, os.POSIX_FADV_DONTNEED)
+                    os.close(fd_h)
+                except OSError:
+                    pass
+            return True
+        except Exception:
+            self._hot_handle = None
+            return False
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         for _ in weights:
@@ -997,6 +1007,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         expert_id: int,
         s_gu_cached: torch.Tensor | None = None,
         s_dn_cached: torch.Tensor | None = None,
+        protected_eids: set[int] | None = None,
     ) -> int:
         slot = self.expert_to_slot[expert_id]
         if slot >= 0:
@@ -1004,15 +1015,22 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             return slot
 
         self.cache_misses += 1
-        slot = self.ring_cursor
         dyn_span = max(1, self.hot_cache_size - self.pinned_slots)
-        self.ring_cursor = self.pinned_slots + ((self.ring_cursor - self.pinned_slots + 1) % dyn_span)
+        slot = self.ring_cursor
+        for _ in range(dyn_span):
+            cand = self.ring_cursor
+            self.ring_cursor = self.pinned_slots + ((self.ring_cursor - self.pinned_slots + 1) % dyn_span)
+            if protected_eids is None or self.slot_to_expert[cand] not in protected_eids:
+                slot = cand
+                break
 
         old_eid = self.slot_to_expert[slot]
         if old_eid >= 0:
             self.expert_to_slot[old_eid] = -1
             self.expert_to_slot_gpu[old_eid] = -1
 
+        if self.num_hot_mxfp4_experts == 0:
+            self._try_attach_hot_shard()
         h_idx = self.hot_expert_to_idx[expert_id]
         if self.use_fp4_slot_cache:
             assert self.cache_gu_u8 is not None and self.cache_gu_s_bf16 is not None
@@ -1093,25 +1111,29 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self._active_slots_buf[: self.top_k].copy_(self.expert_to_slot_gpu.index_select(0, top_ids[0]))
             self._active_gates_buf[: self.top_k].copy_(top_gates_f32[0])
 
-            eids = top_ids[0].tolist()
-            if all(self.expert_to_slot[int(eid)] >= 0 for eid in eids):
+            eids = [int(eid) for eid in top_ids[0].tolist()]
+            if all(self.expert_to_slot[eid] >= 0 for eid in eids):
                 self.cache_hits += self.top_k
-                slot_ids = [self.expert_to_slot[int(eid)] for eid in eids]
+                slot_ids = [self.expert_to_slot[eid] for eid in eids]
             else:
+                protected_set = set(eids)
                 group_bank_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
                 slot_ids = []
-                for eid in eids:
-                    eid_i = int(eid)
+                for eid_i in eids:
                     if self.expert_to_slot[eid_i] < 0 and self.hot_expert_to_idx[eid_i] < 0:
                         g_idx = eid_i // 8
                         if g_idx not in group_bank_cache:
                             group_bank_cache[g_idx] = self.groups[g_idx].get_group_banks()
                         s_gu_c, s_dn_c = group_bank_cache[g_idx]
-                        slot = self._ensure_expert_slot(eid_i, s_gu_cached=s_gu_c, s_dn_cached=s_dn_c)
+                        slot = self._ensure_expert_slot(
+                            eid_i, s_gu_cached=s_gu_c, s_dn_cached=s_dn_c, protected_eids=protected_set
+                        )
                     else:
-                        slot = self._ensure_expert_slot(eid_i)
+                        slot = self._ensure_expert_slot(eid_i, protected_eids=protected_set)
                     slot_ids.append(slot)
-                self._active_slots_buf[: self.top_k].copy_(self.expert_to_slot_gpu.index_select(0, top_ids[0]))
+                self._active_slots_buf[: self.top_k].copy_(
+                    torch.tensor(slot_ids, dtype=torch.int32, device=self.device)
+                )
 
             if self.use_fp4_slot_cache and _HAS_TRITON and x.is_cuda:
                 n_active = self.top_k + 1
@@ -1243,17 +1265,30 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         if cold_eids:
             cold_masses = [float(expert_mass[eid].item()) for eid in cold_eids]
             sorted_cold_asc = [eid for _, eid in sorted(zip(cold_masses, cold_eids), reverse=False)]
+            dyn_span = max(1, self.hot_cache_size - self.pinned_slots)
+            cache_cutoff = max(0, len(sorted_cold_asc) - dyn_span)
             group_bank_cache_pf: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-            for eid in sorted_cold_asc:
-                if self.hot_expert_to_idx[eid] < 0:
+            for c_idx, eid in enumerate(sorted_cold_asc):
+                h_idx = self.hot_expert_to_idx[eid]
+                s_gu_c: torch.Tensor | None = None
+                s_dn_c: torch.Tensor | None = None
+                if h_idx < 0:
                     g_idx = eid // 8
                     if g_idx not in group_bank_cache_pf:
                         group_bank_cache_pf[g_idx] = self.groups[g_idx].get_group_banks()
                     s_gu_c, s_dn_c = group_bank_cache_pf[g_idx]
+
+                if c_idx >= cache_cutoff:
                     slot = self._ensure_expert_slot(eid, s_gu_cached=s_gu_c, s_dn_cached=s_dn_c)
+                    w_gu_s, w_d_s = self._get_slot_bf16(slot)
                 else:
-                    slot = self._ensure_expert_slot(eid)
-                w_gu_s, w_d_s = self._get_slot_bf16(slot)
+                    w_gu_s, w_d_s = _get_shared_bf16_scratch(self.device)
+                    if h_idx >= 0:
+                        self._reconstruct_hot_mxfp4_into(h_idx, w_gu_s, w_d_s)
+                    else:
+                        self.groups[eid // 8].reconstruct_expert_into_slot(
+                            eid % 8, w_gu_s, w_d_s, s_gu_cached=s_gu_c, s_dn_cached=s_dn_c
+                        )
                 mask = top_ids == eid
                 tok_indices, slot_indices = torch.where(mask)
                 x_sel = x[tok_indices]
