@@ -302,6 +302,18 @@ def enable_chronos_dsv41_vllm_hook(
     except Exception:
         pass
 
+    try:
+        from flashinfer.mla import _sparse_mla_sm120_cpb as _fi_cpb
+        from flashinfer.mla import _sparse_mla_sm120_plan as _fi_plan
+
+        _fi_plan.prefill_mg_dual_eligible = lambda *args, **kwargs: False
+        _fi_cpb.get_decode_max_tokens = lambda *args, **kwargs: 64
+        _fi_cpb.is_calibration_failed = lambda *args, **kwargs: True
+        _fi_cpb.is_crossover_failed = lambda *args, **kwargs: True
+        _fi_plan._plan_memo.clear()
+    except Exception:
+        pass
+
     return patched
 
 

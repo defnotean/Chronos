@@ -1167,6 +1167,13 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         self.experts = _ChronosDummyExperts()
 
         tp = f"layers.{layer_idx}.ffn"
+        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_RANDOM"):
+            try:
+                _fd_r = os.open(self.shard_path_str, os.O_RDONLY)
+                os.posix_fadvise(_fd_r, 0, 0, os.POSIX_FADV_RANDOM)
+                os.close(_fd_r)
+            except OSError:
+                pass
         self._mmap_handle = safe_open(self.shard_path_str, framework="pt", device="cpu")
         all_keys = set(self._mmap_handle.keys())
         if f"{tp}.gate.weight" not in all_keys and f"model.{tp}.gate.weight" in all_keys:
@@ -1421,13 +1428,39 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         with torch.no_grad():
             if self.use_fp4_slot_cache and self.num_hot_mxfp4_experts > 0:
                 n_pin = min(self.hot_cache_size, self.num_hot_mxfp4_experts)
-                for slot_i in range(n_pin):
-                    eid = int(self.hot_expert_ids_list[slot_i])
-                    h_idx = self.hot_expert_to_idx[eid]
-                    self._load_hot_mxfp4_into_fp4_slot(h_idx, slot_i)
-                    self.expert_to_slot[eid] = slot_i
-                    self.expert_to_slot_gpu[eid] = slot_i
-                    self.slot_to_expert[slot_i] = eid
+                if self._hot_handle is not None:
+                    w1_w_b = self._hot_handle.get_slice(f"{self._hot_tp}w1.weight")[:n_pin].to(self.device, non_blocking=True)
+                    w1_s_b = self._hot_handle.get_slice(f"{self._hot_tp}w1.scale")[:n_pin].to(self.device, non_blocking=True)
+                    w3_w_b = self._hot_handle.get_slice(f"{self._hot_tp}w3.weight")[:n_pin].to(self.device, non_blocking=True)
+                    w3_s_b = self._hot_handle.get_slice(f"{self._hot_tp}w3.scale")[:n_pin].to(self.device, non_blocking=True)
+                    w2_w_b = self._hot_handle.get_slice(f"{self._hot_tp}w2.weight")[:n_pin].to(self.device, non_blocking=True)
+                    w2_s_b = self._hot_handle.get_slice(f"{self._hot_tp}w2.scale")[:n_pin].to(self.device, non_blocking=True)
+                    self.cache_gu_u8[:n_pin, :2304].copy_(w1_w_b.view(torch.uint8))
+                    self.cache_gu_u8[:n_pin, 2304:].copy_(w3_w_b.view(torch.uint8))
+                    self.cache_d_u8[:n_pin].copy_(w2_w_b.view(torch.uint8))
+                    self.cache_gu_s_bf16[:n_pin, :2304].copy_(
+                        ((w1_s_b.view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
+                    )
+                    self.cache_gu_s_bf16[:n_pin, 2304:].copy_(
+                        ((w3_s_b.view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
+                    )
+                    self.cache_d_s_bf16[:n_pin].copy_(
+                        ((w2_s_b.view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
+                    )
+                    del w1_w_b, w1_s_b, w3_w_b, w3_s_b, w2_w_b, w2_s_b
+                    for slot_i in range(n_pin):
+                        eid = int(self.hot_expert_ids_list[slot_i])
+                        self.expert_to_slot[eid] = slot_i
+                        self.expert_to_slot_gpu[eid] = slot_i
+                        self.slot_to_expert[slot_i] = eid
+                else:
+                    for slot_i in range(n_pin):
+                        eid = int(self.hot_expert_ids_list[slot_i])
+                        h_idx = self.hot_expert_to_idx[eid]
+                        self._load_hot_mxfp4_into_fp4_slot(h_idx, slot_i)
+                        self.expert_to_slot[eid] = slot_i
+                        self.expert_to_slot_gpu[eid] = slot_i
+                        self.slot_to_expert[slot_i] = eid
                 self.pinned_slots = n_pin
                 self.ring_cursor = 0
             else:
@@ -1483,6 +1516,13 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         if not self._hot_shard_cand.exists():
             return False
         try:
+            if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_RANDOM"):
+                try:
+                    fd_h = os.open(str(self._hot_shard_cand), os.O_RDONLY)
+                    os.posix_fadvise(fd_h, 0, 0, os.POSIX_FADV_RANDOM)
+                    os.close(fd_h)
+                except OSError:
+                    pass
             self._hot_handle = safe_open(str(self._hot_shard_cand), framework="pt", device="cpu")
             hot_keys = set(self._hot_handle.keys())
             if f"{self._hot_tp}expert_ids" not in hot_keys and f"layers.{self.layer_idx}.ffn.hot_experts.expert_ids" in hot_keys:
@@ -1498,13 +1538,6 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     for k_s in ("w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale")
                 }
                 self._hot_handle = None
-            elif hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
-                try:
-                    fd_h = os.open(str(self._hot_shard_cand), os.O_RDONLY)
-                    os.posix_fadvise(fd_h, 0, 0, os.POSIX_FADV_DONTNEED)
-                    os.close(fd_h)
-                except OSError:
-                    pass
             return True
         except Exception:
             self._hot_handle = None
