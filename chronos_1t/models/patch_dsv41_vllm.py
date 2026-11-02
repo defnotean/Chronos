@@ -487,7 +487,7 @@ def enable_chronos_dsv41_vllm_hook(
                 )
                 for st_file in sorted_files:
                     bname = os.path.basename(st_file)
-                    if "chronos-dsv41-upgrade2-hot96-" in bname:
+                    if "chronos-dsv41-upgrade2-hot96-" in bname or "chronos-dsv41-layer-" in bname:
                         continue
                     try:
                         with safe_open(st_file, framework="pt", device="cpu") as f:
@@ -512,6 +512,7 @@ def enable_chronos_dsv41_vllm_hook(
                             x
                             for x in files
                             if "chronos-dsv41-upgrade2-hot96-" not in os.path.basename(x)
+                            and "chronos-dsv41-layer-" not in os.path.basename(x)
                         ]
                     return files
 
@@ -568,6 +569,8 @@ def enable_chronos_dsv41_vllm_hook(
                 clean_logits: bool = False,
                 indices: torch.Tensor | None = None,
             ) -> torch.Tensor:
+                if kv_cache.shape[0] > 0:
+                    kv_cache[0].zero_()
                 eff_max_len = min(int(max_model_len), max(512, int(block_tables.shape[1]) * 64))
                 if kv_cache.ndim == 4 and kv_cache.shape[1] == 32 and q[1] is None:
                     bsz = block_tables.shape[0]
@@ -667,6 +670,10 @@ def enable_chronos_dsv41_vllm_hook(
                 extra_sparse_topk_lens: torch.Tensor | None = None,
                 **kwargs: Any,
             ) -> torch.Tensor:
+                if swa_kv_cache.shape[0] > 0:
+                    swa_kv_cache[0].zero_()
+                if compressed_kv_cache is not None and compressed_kv_cache.shape[0] > 0:
+                    compressed_kv_cache[0].zero_()
                 n_tok = query.shape[0]
                 if n_tok <= 64:
                     return _orig_fi_dsv4(
