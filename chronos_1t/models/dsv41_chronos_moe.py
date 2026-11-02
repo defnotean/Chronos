@@ -1187,6 +1187,63 @@ try:
         tl.store(Y_out_bf16_ptr + offs, acc.to(tl.bfloat16))
 
     @triton.jit
+    def _triton_stage_t3_dma_kernel(
+        Active_slots_ptr,
+        W1_gu_dst_ptr,
+        W1_gu_src_ptr,
+        S1_gu_dst_ptr,
+        S1_gu_src_ptr,
+        W1_d_dst_ptr,
+        W1_d_src_ptr,
+        S1_d_dst_ptr,
+        S1_d_src_ptr,
+        K_ACT: tl.constexpr,
+        BLOCK_BYTES: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        num_pids = tl.num_programs(0)
+        b_idx = 0
+        for k in range(0, K_ACT):
+            s_val = tl.load(Active_slots_ptr + k)
+            if s_val >= 2048:
+                s1 = (s_val - 2048).to(tl.int64)
+                dst_slot = b_idx
+                gu_bytes = 4608 * 640
+                for off in range(pid * BLOCK_BYTES, gu_bytes, num_pids * BLOCK_BYTES):
+                    cols = (off + tl.arange(0, BLOCK_BYTES)).to(tl.int64)
+                    m = cols < gu_bytes
+                    v = tl.load(W1_gu_src_ptr + s1 * gu_bytes + cols, mask=m)
+                    tl.store(W1_gu_dst_ptr + dst_slot * gu_bytes + cols, v, mask=m)
+                dn_bytes = 5120 * 288
+                for off in range(pid * BLOCK_BYTES, dn_bytes, num_pids * BLOCK_BYTES):
+                    cols = (off + tl.arange(0, BLOCK_BYTES)).to(tl.int64)
+                    m = cols < dn_bytes
+                    v = tl.load(W1_d_src_ptr + s1 * dn_bytes + cols, mask=m)
+                    tl.store(W1_d_dst_ptr + dst_slot * dn_bytes + cols, v, mask=m)
+                sgu_bytes = 4608 * 80
+                for off in range(pid * BLOCK_BYTES, sgu_bytes, num_pids * BLOCK_BYTES):
+                    cols = (off + tl.arange(0, BLOCK_BYTES)).to(tl.int64)
+                    m = cols < sgu_bytes
+                    v = tl.load(S1_gu_src_ptr + s1 * sgu_bytes + cols, mask=m)
+                    tl.store(S1_gu_dst_ptr + dst_slot * sgu_bytes + cols, v, mask=m)
+                sdn_bytes = 5120 * 36
+                for off in range(pid * BLOCK_BYTES, sdn_bytes, num_pids * BLOCK_BYTES):
+                    cols = (off + tl.arange(0, BLOCK_BYTES)).to(tl.int64)
+                    m = cols < sdn_bytes
+                    v = tl.load(S1_d_src_ptr + s1 * sdn_bytes + cols, mask=m)
+                    tl.store(S1_d_dst_ptr + dst_slot * sdn_bytes + cols, v, mask=m)
+                b_idx += 1
+
+    @triton.jit
+    def _triton_remap_t3_slots_kernel(Active_slots_ptr, K_ACT: tl.constexpr):
+        b_idx = 0
+        for k in range(0, K_ACT):
+            s_val = tl.load(Active_slots_ptr + k)
+            if s_val >= 2048:
+                tl.store(Active_slots_ptr + k, 2048 + b_idx)
+                b_idx += 1
+
+    @triton.jit
     def _triton_inv_rope_m1_kernel(
         O_ptr,
         CosSin_ptr,
@@ -2768,6 +2825,23 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
     @torch.no_grad()
     def _stage_t3_bounce_slots(self, k_act: int) -> None:
         if not self.t3_on_cpu or self.w1_gu_cpu is None:
+            return
+        if _HAS_TRITON and _triton_stage_t3_dma_kernel is not None and self.device.type == "cuda" and self.w1_gu_cpu.is_pinned():
+            _triton_stage_t3_dma_kernel[(108,)](
+                self._active_slots_buf,
+                self.w1_gu_u8,
+                self.w1_gu_cpu,
+                self.s1_gu_fp8,
+                self.s1_gu_cpu,
+                self.w1_d_u8,
+                self.w1_d_cpu,
+                self.s1_d_fp8,
+                self.s1_d_cpu,
+                K_ACT=k_act,
+                BLOCK_BYTES=1024,
+                num_warps=4,
+            )
+            _triton_remap_t3_slots_kernel[(1,)](self._active_slots_buf, K_ACT=k_act, num_warps=1)
             return
         slots_list = self._active_slots_buf[:k_act].tolist()
         if not any(s >= 2048 for s in slots_list):
