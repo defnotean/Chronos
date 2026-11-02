@@ -134,7 +134,11 @@ def enable_chronos_dsv41_vllm_hook(
                         for lyr in getattr(self, "layers", [])
                     )
                     if has_chronos_ffn:
-                        filtered = ((n, w) for n, w in weights if ".ffn." not in n)
+                        filtered = (
+                            (n, w)
+                            for n, w in weights
+                            if n.startswith("vision.") or (".ffn." not in n and ".mlp." not in n)
+                        )
                         loaded = _mcls._orig_load_weights_chronos(self, filtered)
                         for lyr_idx, lyr in enumerate(getattr(self, "layers", [])):
                             ffn = getattr(lyr, "ffn", None)
@@ -175,7 +179,7 @@ def enable_chronos_dsv41_vllm_hook(
                     try:
                         with safe_open(st_file, framework="pt", device="cpu") as f:
                             for name in f.keys():
-                                if ".ffn." in name:
+                                if not name.startswith("vision.") and (".ffn." in name or ".mlp." in name):
                                     continue
                                 yield name, f.get_tensor(name)
                     finally:
