@@ -831,7 +831,7 @@ try:
                     tl.where(code == 2, 0.452780, 1.510417),
                 )
                 s_idx = offs_c >> 5
-                t_scale = tl.load(Tail_s_ptr + row * (COLS // 32) + s_idx).to(tl.float32)
+                t_scale = _decode_pos_fp8e4m3_u8_to_f32(tl.load(Tail_s_ptr + row * (COLS // 32) + s_idx))
                 h_val = h_val + q_val * t_scale
             else:
                 byte_idx = offs_c >> 3
@@ -840,7 +840,7 @@ try:
                 bit = (packed >> shift) & 1
                 q_val = tl.where(bit != 0, 1.0, -1.0)
                 s_idx = offs_c >> 6
-                t_scale = tl.load(Tail_s_ptr + row * (COLS // 64) + s_idx).to(tl.float32)
+                t_scale = _decode_pos_fp8e4m3_u8_to_f32(tl.load(Tail_s_ptr + row * (COLS // 64) + s_idx))
                 h_val = h_val + q_val * t_scale
 
         tl.store(Out_ptr + row * COLS + offs_c, h_val.to(tl.bfloat16))
@@ -1760,9 +1760,11 @@ class ChronosDsv41HolographicExpertGroup(nn.Module):
                 gu_p_m, gu_s_m, dn_p_m, dn_s_m = (
                     tail_slices if tail_slices is not None else self._fetch_tail_slices(local_m)
                 )
+                gu_s_u8 = gu_s_m.view(torch.uint8)
+                dn_s_u8 = dn_s_m.view(torch.uint8)
             else:
-                gu_p_m = gu_s_m = slot_gu
-                dn_p_m = dn_s_m = slot_dn
+                gu_p_m = gu_s_u8 = slot_gu.view(torch.uint8)
+                dn_p_m = dn_s_u8 = slot_dn.view(torch.uint8)
 
             x1_gu = torch.matmul(h, (s_gu * r_s2.to(torch.bfloat16).unsqueeze(1)).view(36, 128, 5120)).view(4608, 5120)
             _triton_row_perm_scale_kernel[(4608, 5120 // 256)](
@@ -1772,7 +1774,7 @@ class ChronosDsv41HolographicExpertGroup(nn.Module):
             _triton_col_perm_add_tail_kernel[(4608, 5120 // 256)](
                 x2_gu,
                 gu_p_m,
-                gu_s_m,
+                gu_s_u8,
                 slot_gu,
                 c_inv,
                 c_s1,
@@ -1794,7 +1796,7 @@ class ChronosDsv41HolographicExpertGroup(nn.Module):
             _triton_col_perm_add_tail_kernel[(5120, 2304 // 256)](
                 x2_dn,
                 dn_p_m,
-                dn_s_m,
+                dn_s_u8,
                 slot_dn,
                 dc_inv,
                 dc_s1,
