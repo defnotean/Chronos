@@ -1986,7 +1986,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             try:
                 _fd_r = os.open(self.shard_path_str, os.O_RDONLY)
                 os.posix_fadvise(_fd_r, 0, 0, os.POSIX_FADV_SEQUENTIAL)
-                if hasattr(os, "POSIX_FADV_WILLNEED"):
+                if hasattr(os, "POSIX_FADV_WILLNEED") and layer_idx < 16:
                     os.posix_fadvise(_fd_r, 0, 0, os.POSIX_FADV_WILLNEED)
                 os.close(_fd_r)
             except OSError:
@@ -2053,8 +2053,8 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
 
         default_dec_k = str(self.top_k)
         self.decode_top_k = max(1, min(self.top_k, int(os.environ.get("CHRONOS_DECODE_TOP_K", default_dec_k))))
-        self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "32"))
-        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "64"))
+        self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "16"))
+        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "32"))
         default_n1 = max(0, 384 - self.n4_slots - self.n2_slots)
         self.n1_slots = int(os.environ.get("CHRONOS_TIER3_1BIT_SLOTS", str(default_n1)))
 
@@ -2475,6 +2475,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     del s_gu_c, s_dn_c, u_gu_g, v_gu_g, u_dn_g, v_dn_g, gu_p_g, gu_s_g, dn_p_g, dn_s_g
 
                 del grp_map
+                sub_t = None
                 self.pinned_slots = self.n4_slots
                 self.groups = nn.ModuleList()
                 self._mmap_handle = None
@@ -2533,7 +2534,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 try:
                     fd_h = os.open(str(self._hot_shard_cand), os.O_RDONLY)
                     os.posix_fadvise(fd_h, 0, 0, os.POSIX_FADV_SEQUENTIAL)
-                    if hasattr(os, "POSIX_FADV_WILLNEED"):
+                    if hasattr(os, "POSIX_FADV_WILLNEED") and self.layer_idx < 16:
                         os.posix_fadvise(fd_h, 0, 0, os.POSIX_FADV_WILLNEED)
                     os.close(fd_h)
                 except OSError:

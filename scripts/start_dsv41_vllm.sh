@@ -31,8 +31,9 @@ rm -rf "$SERVING_DIR/chronos_1t/models/__pycache__" "$SERVING_DIR/pb27_vllm/__py
 docker rm -f pb27-vllm >/dev/null 2>&1 || true
 sleep 2
 
-# 3. Launch pb27-vllm container on :$PORT
+# 3. Launch pb27-vllm container on :$PORT (hard-capped at 108g RAM / 0 swap to protect host sshd/OS)
 nohup bash /home/defnotean/gpu_run.sh docker run --rm --name pb27-vllm --gpus all --ipc host --network host \
+  --memory=108g --memory-swap=108g \
   -v /home/defnotean/.cache/huggingface:/root/.cache/huggingface \
   -v /home/defnotean/.cache/vllm:/root/.cache/vllm \
   -v /home/defnotean/.cache/flashinfer:/root/.cache/flashinfer \
@@ -40,23 +41,24 @@ nohup bash /home/defnotean/gpu_run.sh docker run --rm --name pb27-vllm --gpus al
   -v /home/defnotean/.cache/huggingface:/home/defnotean/.cache/huggingface:ro \
   -v "$MODEL_DIR:$MODEL_DIR:ro" \
   -v "$SERVING_DIR:/pb27_vllm" \
+  -e PYTHONFAULTHANDLER=1 \
+  -e PYTHONUNBUFFERED=1 \
   -e HF_HUB_OFFLINE=1 \
   -e PB27_MEMORY=0 \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
   -e VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 \
-  -e CHRONOS_TIER1_4BIT_SLOTS=${CHRONOS_TIER1_4BIT_SLOTS:-32} \
-  -e CHRONOS_TIER2_2BIT_SLOTS=${CHRONOS_TIER2_2BIT_SLOTS:-64} \
-  -e CHRONOS_TIER3_1BIT_SLOTS=${CHRONOS_TIER3_1BIT_SLOTS:-288} \
+  -e CHRONOS_TIER1_4BIT_SLOTS=${CHRONOS_TIER1_4BIT_SLOTS:-16} \
+  -e CHRONOS_TIER2_2BIT_SLOTS=${CHRONOS_TIER2_2BIT_SLOTS:-32} \
+  -e CHRONOS_TIER3_1BIT_SLOTS=${CHRONOS_TIER3_1BIT_SLOTS:-336} \
   -e CHRONOS_DECODE_TOP_K=${CHRONOS_DECODE_TOP_K:-6} \
   --entrypoint bash vllm/vllm-openai:v0.31.0-aarch64 \
   -c "pip install --no-deps --no-build-isolation -q -e /pb27_vllm && exec vllm serve $MODEL_DIR \
     --served-model-name $SERVED_NAME --port $PORT --host 127.0.0.1 \
     --max-model-len 1048576 --max-num-batched-tokens 1024 --max-num-seqs 4 \
-    --gpu-memory-utilization 0.92 --kv-cache-memory-bytes 4G --block-size 64 \
+    --gpu-memory-utilization 0.88 --kv-cache-memory-bytes 2G --block-size 64 \
     --no-enable-prefix-caching \
-    --compilation-config '{\"cudagraph_capture_sizes\":[1,2,4,8,16]}' \
-    --reasoning-parser deepseek_v41 --enable-auto-tool-choice --tool-call-parser deepseek_v41 \
-    --safetensors-load-strategy eager" \
+    --compilation-config '{\"cudagraph_capture_sizes\":[1,2,4,8]}' \
+    --reasoning-parser deepseek_v41 --enable-auto-tool-choice --tool-call-parser deepseek_v41" \
   > "$ROOT/vllm_dsv41.log" 2>&1 < /dev/null &
 
 # 4. Ensure studio_proxy.py is running on :18080

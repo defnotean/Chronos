@@ -487,7 +487,7 @@ def enable_chronos_dsv41_vllm_hook(
                 )
                 for st_file in sorted_files:
                     bname = os.path.basename(st_file)
-                    if "chronos-dsv41-upgrade2-hot96-" in bname:
+                    if "chronos-dsv41-upgrade2-hot96-" in bname or "chronos-dsv41-layer-" in bname:
                         continue
                     try:
                         with safe_open(st_file, framework="pt", device="cpu") as f:
@@ -502,6 +502,21 @@ def enable_chronos_dsv41_vllm_hook(
             _wu._chronos_dsv41_st_hooked = True
             if hasattr(_dl, "safetensors_weights_iterator"):
                 _dl.safetensors_weights_iterator = _chronos_dsv41_safetensors_weights_iterator
+            if hasattr(_dl, "DefaultModelLoader") and hasattr(_dl.DefaultModelLoader, "_prepare_weights"):
+                _orig_prep_w = _dl.DefaultModelLoader._prepare_weights
+
+                def _chronos_prepare_weights(self_dl: Any, *p_args: Any, **p_kwargs: Any):
+                    files = _orig_prep_w(self_dl, *p_args, **p_kwargs)
+                    if isinstance(files, list) and any("chronos-dsv41-" in os.path.basename(x) for x in files):
+                        files = [
+                            x
+                            for x in files
+                            if "chronos-dsv41-upgrade2-hot96-" not in os.path.basename(x)
+                            and "chronos-dsv41-layer-" not in os.path.basename(x)
+                        ]
+                    return files
+
+                _dl.DefaultModelLoader._prepare_weights = _chronos_prepare_weights
     except Exception:
         pass
 
