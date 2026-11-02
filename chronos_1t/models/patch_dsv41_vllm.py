@@ -192,9 +192,11 @@ def enable_chronos_dsv41_vllm_hook(
     except Exception:
         pass
 
-    # Patch DeepseekV4SWACache block_size=32 -> 64 on SM120 (Blackwell GB10) and chunk >64-token
-    # prefill calls to flashinfer_trtllm_batch_decode_sparse_mla_dsv4 so pbs_extra=128 (ratio=1)
-    # layers always dispatch through the instantiated SM120 decode-dsv4 kernel.
+    # Patch DeepseekV4SWACache block_size=32 -> 64 on SM120 (Blackwell GB10),
+    # set kv cache block_size=64 on DeepseekV41IndexerBackend & DeepseekV4FlashInferMLASparseBackend
+    # (so compress_ratio=2 -> block_kv=32 and compress_ratio=1 -> block_kv=64, satisfying DeepGEMM's
+    # block_kv in {32, 64} assertion), and chunk >64-token prefill calls to
+    # flashinfer_trtllm_batch_decode_sparse_mla_dsv4.
     try:
         from vllm.v1.attention.backends.mla import sparse_swa as _swa_mod
 
@@ -212,7 +214,27 @@ def enable_chronos_dsv41_vllm_hook(
         pass
 
     try:
+        from vllm.v1.attention.backends.mla import indexer as _idx_mod
+
+        if hasattr(_idx_mod, "DeepseekV41IndexerBackend"):
+            _idx_mod.DeepseekV41IndexerBackend.get_supported_kernel_block_sizes = staticmethod(
+                lambda kv_cache_spec=None: [64]
+            )
+    except Exception:
+        pass
+
+    try:
+        from vllm.models.deepseek_v41 import sparse_mla as _smla_mod
         from vllm.models.deepseek_v41.nvidia import flashinfer_sparse as _fis_mod
+
+        if hasattr(_smla_mod, "DeepseekV4SparseMLABackend"):
+            _smla_mod.DeepseekV4SparseMLABackend.get_supported_kernel_block_sizes = staticmethod(
+                lambda kv_cache_spec=None: [64]
+            )
+        if hasattr(_fis_mod, "DeepseekV4FlashInferMLASparseBackend"):
+            _fis_mod.DeepseekV4FlashInferMLASparseBackend.get_supported_kernel_block_sizes = staticmethod(
+                lambda kv_cache_spec=None: [64]
+            )
 
         if not getattr(_fis_mod, "_chronos_sm120_chunk_patched", False):
             _orig_fi_dsv4 = _fis_mod.flashinfer_trtllm_batch_decode_sparse_mla_dsv4
