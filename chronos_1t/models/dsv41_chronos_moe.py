@@ -675,6 +675,24 @@ try:
         tl.store(Y_final_bf16_ptr + offs, acc_routed.to(tl.bfloat16))
 
     @triton.jit
+    def _encode_pos_f32_to_fp8e4m3_u8(val_f32):
+        v = tl.minimum(tl.maximum(val_f32, 0.0), 448.0)
+        is_sub = v < 0.015625
+        sub_u8 = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(v * 512.0), 0.0), 7.0).to(tl.uint8)
+        bits = v.to(tl.int32, bitcast=True) + (1 << 19)
+        exp4 = tl.minimum(tl.maximum(((bits >> 23) & 0xFF) - 120, 1), 15)
+        man3 = (bits >> 20) & 0x07
+        norm_u8 = tl.minimum((exp4 << 3) | man3, 126).to(tl.uint8)
+        return tl.where(is_sub, sub_u8, norm_u8)
+
+    @triton.jit
+    def _decode_pos_fp8e4m3_u8_to_f32(u8_val):
+        u = u8_val.to(tl.int32) & 0x7F
+        norm_f = ((u + 960) << 20).to(tl.float32, bitcast=True)
+        sub_f = u.to(tl.float32) * 0.001953125
+        return tl.where(u < 8, sub_f, norm_f)
+
+    @triton.jit
     def _triton_quantize_2bit_g64_kernel(
         W_ptr,
         Out_u8_ptr,
@@ -710,7 +728,7 @@ try:
         q3 = c3.to(tl.float32) - 1.5
         q_sq = tl.sum(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3, axis=0)
         packed = c0 | (c1 << 2) | (c2 << 4) | (c3 << 6)
-        s_norm = tl.minimum(tl.sqrt(sq_sum / (q_sq + 1e-12)), 448.0).to(tl.float8e4nv)
+        s_norm = _encode_pos_f32_to_fp8e4m3_u8(tl.sqrt(sq_sum / (q_sq + 1e-12)))
         tl.store(Out_s_fp8_ptr + row * N_GROUPS_C + grp, s_norm)
         tl.store(Out_u8_ptr + row * (N_GROUPS_C * 16) + grp * 16 + offs16, packed)
 
@@ -745,7 +763,7 @@ try:
             + w7 * w7,
             axis=0,
         )
-        s_rms = tl.minimum(tl.sqrt(sq_sum * (1.0 / 64.0) + 1e-12), 448.0).to(tl.float8e4nv)
+        s_rms = _encode_pos_f32_to_fp8e4m3_u8(tl.sqrt(sq_sum * (1.0 / 64.0) + 1e-12))
 
         b0 = tl.where(w0 >= 0.0, 1, 0).to(tl.uint8)
         b1 = tl.where(w1 >= 0.0, 2, 0).to(tl.uint8)
@@ -947,7 +965,7 @@ try:
                 x_sum = (x0 + x1 + x2 + x3) * 1.5
 
                 w1_b = tl.load(w1_base2 + b_idx[None, :])
-                s1_f = tl.load(s1_base2 + sg_idx[None, :]).to(tl.float32)
+                s1_f = _decode_pos_fp8e4m3_u8_to_f32(tl.load(s1_base2 + sg_idx[None, :]))
                 v1 = (
                     (w1_b & 3).to(tl.float32) * x0[None, :]
                     + ((w1_b >> 2) & 3).to(tl.float32) * x1[None, :]
@@ -958,7 +976,7 @@ try:
                 acc1 += tl.sum(v1, axis=1)
 
                 w3_b = tl.load(w3_base2 + b_idx[None, :])
-                s3_f = tl.load(s3_base2 + sg_idx[None, :]).to(tl.float32)
+                s3_f = _decode_pos_fp8e4m3_u8_to_f32(tl.load(s3_base2 + sg_idx[None, :]))
                 v3 = (
                     (w3_b & 3).to(tl.float32) * x0[None, :]
                     + ((w3_b >> 2) & 3).to(tl.float32) * x1[None, :]
@@ -995,7 +1013,7 @@ try:
                 x_half_sum = (x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7) * 0.5
 
                 w1_b = tl.load(w1_base1 + b_idx[None, :])
-                s1_f2 = tl.load(s1_base1 + sg_idx[None, :]).to(tl.float32) * 2.0
+                s1_f2 = _decode_pos_fp8e4m3_u8_to_f32(tl.load(s1_base1 + sg_idx[None, :])) * 2.0
                 v1 = (
                     (w1_b & 1).to(tl.float32) * x0[None, :]
                     + ((w1_b >> 1) & 1).to(tl.float32) * x1[None, :]
@@ -1010,7 +1028,7 @@ try:
                 acc1 += tl.sum(v1, axis=1)
 
                 w3_b = tl.load(w3_base1 + b_idx[None, :])
-                s3_f2 = tl.load(s3_base1 + sg_idx[None, :]).to(tl.float32) * 2.0
+                s3_f2 = _decode_pos_fp8e4m3_u8_to_f32(tl.load(s3_base1 + sg_idx[None, :])) * 2.0
                 v3 = (
                     (w3_b & 1).to(tl.float32) * x0[None, :]
                     + ((w3_b >> 1) & 1).to(tl.float32) * x1[None, :]
@@ -1101,7 +1119,7 @@ try:
                 a3 = tl.load(act_base + a_base_idx + 48).to(tl.float32)
                 a_sum = (a0 + a1 + a2 + a3) * 1.5
                 wd_b = tl.load(wd_base2 + b_idx[None, :])
-                sd_f = tl.load(sd_base2 + sg_idx[None, :]).to(tl.float32)
+                sd_f = _decode_pos_fp8e4m3_u8_to_f32(tl.load(sd_base2 + sg_idx[None, :]))
                 vd = (
                     (wd_b & 3).to(tl.float32) * a0[None, :]
                     + ((wd_b >> 2) & 3).to(tl.float32) * a1[None, :]
@@ -1135,7 +1153,7 @@ try:
                 a7 = tl.load(act_base + a_base_idx + 56).to(tl.float32)
                 a_half_sum = (a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7) * 0.5
                 wd_b = tl.load(wd_base1 + b_idx[None, :])
-                sd_f2 = tl.load(sd_base1 + sg_idx[None, :]).to(tl.float32) * 2.0
+                sd_f2 = _decode_pos_fp8e4m3_u8_to_f32(tl.load(sd_base1 + sg_idx[None, :])) * 2.0
                 vd = (
                     (wd_b & 1).to(tl.float32) * a0[None, :]
                     + ((wd_b >> 1) & 1).to(tl.float32) * a1[None, :]
@@ -2093,23 +2111,23 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self.cache_d_s_bf16 = self.s4_d_bf16
 
             self.w2_gu_u8 = torch.empty((self.n2_slots, 4608, 1280), dtype=torch.uint8, device=device)
-            self.s2_gu_fp8 = torch.empty((self.n2_slots, 4608, 80), dtype=torch.float8_e4m3fn, device=device)
+            self.s2_gu_fp8 = torch.empty((self.n2_slots, 4608, 80), dtype=torch.uint8, device=device)
             self.w2_d_u8 = torch.empty((self.n2_slots, 5120, 576), dtype=torch.uint8, device=device)
-            self.s2_d_fp8 = torch.empty((self.n2_slots, 5120, 36), dtype=torch.float8_e4m3fn, device=device)
+            self.s2_d_fp8 = torch.empty((self.n2_slots, 5120, 36), dtype=torch.uint8, device=device)
 
             t3_cpu_from = int(os.environ.get("CHRONOS_T3_CPU_FROM_LAYER", "40"))
             self.t3_on_cpu = bool(self.n1_slots > 0 and layer_idx >= t3_cpu_from)
             if self.t3_on_cpu:
                 try:
                     self.w1_gu_cpu = torch.empty((self.n1_slots, 4608, 640), dtype=torch.uint8, device="cpu", pin_memory=True)
-                    self.s1_gu_cpu = torch.empty((self.n1_slots, 4608, 80), dtype=torch.float8_e4m3fn, device="cpu", pin_memory=True)
+                    self.s1_gu_cpu = torch.empty((self.n1_slots, 4608, 80), dtype=torch.uint8, device="cpu", pin_memory=True)
                     self.w1_d_cpu = torch.empty((self.n1_slots, 5120, 288), dtype=torch.uint8, device="cpu", pin_memory=True)
-                    self.s1_d_cpu = torch.empty((self.n1_slots, 5120, 36), dtype=torch.float8_e4m3fn, device="cpu", pin_memory=True)
+                    self.s1_d_cpu = torch.empty((self.n1_slots, 5120, 36), dtype=torch.uint8, device="cpu", pin_memory=True)
                 except Exception:
                     self.w1_gu_cpu = torch.empty((self.n1_slots, 4608, 640), dtype=torch.uint8, device="cpu")
-                    self.s1_gu_cpu = torch.empty((self.n1_slots, 4608, 80), dtype=torch.float8_e4m3fn, device="cpu")
+                    self.s1_gu_cpu = torch.empty((self.n1_slots, 4608, 80), dtype=torch.uint8, device="cpu")
                     self.w1_d_cpu = torch.empty((self.n1_slots, 5120, 288), dtype=torch.uint8, device="cpu")
-                    self.s1_d_cpu = torch.empty((self.n1_slots, 5120, 36), dtype=torch.float8_e4m3fn, device="cpu")
+                    self.s1_d_cpu = torch.empty((self.n1_slots, 5120, 36), dtype=torch.uint8, device="cpu")
                 n1_gpu_alloc = max(1, self.top_k)
             else:
                 self.w1_gu_cpu = None
@@ -2119,9 +2137,9 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 n1_gpu_alloc = self.n1_slots
 
             self.w1_gu_u8 = torch.empty((n1_gpu_alloc, 4608, 640), dtype=torch.uint8, device=device)
-            self.s1_gu_fp8 = torch.empty((n1_gpu_alloc, 4608, 80), dtype=torch.float8_e4m3fn, device=device)
+            self.s1_gu_fp8 = torch.empty((n1_gpu_alloc, 4608, 80), dtype=torch.uint8, device=device)
             self.w1_d_u8 = torch.empty((n1_gpu_alloc, 5120, 288), dtype=torch.uint8, device=device)
-            self.s1_d_fp8 = torch.empty((n1_gpu_alloc, 5120, 36), dtype=torch.float8_e4m3fn, device=device)
+            self.s1_d_fp8 = torch.empty((n1_gpu_alloc, 5120, 36), dtype=torch.uint8, device=device)
             self.tier_slot_map_gpu = torch.full((384,), -1, dtype=torch.int32, device=device)
 
             _triton_quantize_mse_fp4_32_kernel[(4608, 160)](
