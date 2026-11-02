@@ -192,6 +192,94 @@ def enable_chronos_dsv41_vllm_hook(
     except Exception:
         pass
 
+    # Patch DeepseekV4SWACache block_size=32 -> 64 on SM120 (Blackwell GB10) and chunk >64-token
+    # prefill calls to flashinfer_trtllm_batch_decode_sparse_mla_dsv4 so pbs_extra=128 (ratio=1)
+    # layers always dispatch through the instantiated SM120 decode-dsv4 kernel.
+    try:
+        from vllm.v1.attention.backends.mla import sparse_swa as _swa_mod
+
+        if not getattr(_swa_mod.DeepseekV4SWACache, "_chronos_sm120_pbs_patched", False):
+            _orig_swa_init = _swa_mod.DeepseekV4SWACache.__init__
+
+            def _chronos_swa_init(self: Any, *args: Any, **kwargs: Any) -> None:
+                if kwargs.get("block_size") == 32:
+                    kwargs["block_size"] = 64
+                _orig_swa_init(self, *args, **kwargs)
+
+            _swa_mod.DeepseekV4SWACache.__init__ = _chronos_swa_init
+            _swa_mod.DeepseekV4SWACache._chronos_sm120_pbs_patched = True
+    except Exception:
+        pass
+
+    try:
+        from vllm.models.deepseek_v41.nvidia import flashinfer_sparse as _fis_mod
+
+        if not getattr(_fis_mod, "_chronos_sm120_chunk_patched", False):
+            _orig_fi_dsv4 = _fis_mod.flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+
+            def _chronos_fi_dsv4(
+                *,
+                query: torch.Tensor,
+                swa_kv_cache: torch.Tensor,
+                workspace_buffer: torch.Tensor,
+                sparse_indices: torch.Tensor,
+                compressed_kv_cache: torch.Tensor | None = None,
+                out: torch.Tensor | None = None,
+                bmm1_scale: float = 1.0,
+                sinks: torch.Tensor | None = None,
+                kv_layout: str = "NHD",
+                swa_topk_lens: torch.Tensor | None = None,
+                extra_sparse_indices: torch.Tensor | None = None,
+                extra_sparse_topk_lens: torch.Tensor | None = None,
+                **kwargs: Any,
+            ) -> torch.Tensor:
+                n_tok = query.shape[0]
+                if n_tok <= 64:
+                    return _orig_fi_dsv4(
+                        query=query,
+                        swa_kv_cache=swa_kv_cache,
+                        workspace_buffer=workspace_buffer,
+                        sparse_indices=sparse_indices,
+                        compressed_kv_cache=compressed_kv_cache,
+                        out=out,
+                        bmm1_scale=bmm1_scale,
+                        sinks=sinks,
+                        kv_layout=kv_layout,
+                        swa_topk_lens=swa_topk_lens,
+                        extra_sparse_indices=extra_sparse_indices,
+                        extra_sparse_topk_lens=extra_sparse_lengths if False else extra_sparse_topk_lens,
+                        **kwargs,
+                    )
+                if out is None:
+                    out = torch.empty_like(query)
+                for s in range(0, n_tok, 64):
+                    e = min(s + 64, n_tok)
+                    _orig_fi_dsv4(
+                        query=query[s:e],
+                        swa_kv_cache=swa_kv_cache,
+                        workspace_buffer=workspace_buffer,
+                        sparse_indices=sparse_indices[s:e],
+                        compressed_kv_cache=compressed_kv_cache,
+                        out=out[s:e],
+                        bmm1_scale=bmm1_scale,
+                        sinks=sinks,
+                        kv_layout=kv_layout,
+                        swa_topk_lens=swa_topk_lens[s:e] if swa_topk_lens is not None else None,
+                        extra_sparse_indices=(
+                            extra_sparse_indices[s:e] if extra_sparse_indices is not None else None
+                        ),
+                        extra_sparse_topk_lens=(
+                            extra_sparse_topk_lens[s:e] if extra_sparse_topk_lens is not None else None
+                        ),
+                        **kwargs,
+                    )
+                return out
+
+            _fis_mod.flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _chronos_fi_dsv4
+            _fis_mod._chronos_sm120_chunk_patched = True
+    except Exception:
+        pass
+
     return patched
 
 
