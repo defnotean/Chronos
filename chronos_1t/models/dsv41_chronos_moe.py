@@ -858,10 +858,12 @@ try:
     ):
         offs = tl.arange(0, 512)
         mask = offs < 384
-        logit = tl.load(Logits_ptr + offs, mask=mask, other=-1e30).to(tl.float32)
-        sp = tl.where(logit > 20.0, logit, tl.log(1.0 + tl.exp(logit)))
-        score = tl.sqrt(sp)
-        bias = tl.load(Bias_ptr + offs, mask=mask, other=-1e30).to(tl.float32)
+        logit_raw = tl.load(Logits_ptr + offs, mask=mask, other=-1e30).to(tl.float32)
+        logit = tl.where(logit_raw == logit_raw, logit_raw, 0.0)
+        sp = tl.where(logit > 20.0, logit, tl.log(1.0 + tl.exp(tl.maximum(logit, -80.0))))
+        score = tl.sqrt(tl.maximum(sp, 0.0))
+        bias_raw = tl.load(Bias_ptr + offs, mask=mask, other=-1e30).to(tl.float32)
+        bias = tl.where(bias_raw == bias_raw, bias_raw, 0.0)
         tslot_all = tl.load(Tier_slot_map_ptr + offs, mask=mask, other=-1).to(tl.int32)
         valid_mask = mask & (tslot_all >= 0)
         biased = tl.where(valid_mask, score + bias, -1e30)
@@ -870,8 +872,9 @@ try:
         kept_vec = tl.zeros((8,), dtype=tl.float32)
         for k in tl.static_range(K_ACT):
             best_idx = tl.argmax(biased, axis=0)
+            in_bounds = (best_idx >= 0) & (best_idx < 384)
             w_k = tl.max(tl.where(offs == best_idx, score, 0.0), axis=0)
-            tslot = tl.load(Tier_slot_map_ptr + best_idx).to(tl.int32)
+            tslot = tl.load(Tier_slot_map_ptr + best_idx, mask=in_bounds, other=-1).to(tl.int32)
             tl.store(Active_slots_ptr + k, tslot)
             is_kept = tl.where(tslot >= 0, w_k, 0.0)
             kept_vec = tl.where(k_offs == k, is_kept, kept_vec)
@@ -2937,8 +2940,8 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     N_BLOCKS_K4=160,
                     N_GROUPS_K2=80,
                     BLOCK_N=8,
-                    sub_blocks_k4=16,
-                    sub_groups_k2=8,
+                    sub_blocks_k4=8,
+                    sub_groups_k2=4,
                     HAS_TIER2=has_t2,
                     HAS_TIER3=has_t3,
                     num_warps=4,
@@ -3013,8 +3016,8 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     N_BLOCKS_K4=160,
                     N_GROUPS_K2=80,
                     BLOCK_N=8,
-                    sub_blocks_k4=16,
-                    sub_groups_k2=8,
+                    sub_blocks_k4=8,
+                    sub_groups_k2=4,
                     HAS_TIER2=has_t2,
                     HAS_TIER3=has_t3,
                     num_warps=4,
