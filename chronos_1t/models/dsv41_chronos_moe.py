@@ -2054,7 +2054,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         default_dec_k = str(self.top_k)
         self.decode_top_k = max(1, min(self.top_k, int(os.environ.get("CHRONOS_DECODE_TOP_K", default_dec_k))))
         self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "16"))
-        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "32"))
+        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "80"))
         default_n1 = max(0, 384 - self.n4_slots - self.n2_slots)
         self.n1_slots = int(os.environ.get("CHRONOS_TIER3_1BIT_SLOTS", str(default_n1)))
 

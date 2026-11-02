@@ -48,8 +48,8 @@ nohup bash /home/defnotean/gpu_run.sh docker run --rm --name pb27-vllm --gpus al
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
   -e VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 \
   -e CHRONOS_TIER1_4BIT_SLOTS=${CHRONOS_TIER1_4BIT_SLOTS:-16} \
-  -e CHRONOS_TIER2_2BIT_SLOTS=${CHRONOS_TIER2_2BIT_SLOTS:-32} \
-  -e CHRONOS_TIER3_1BIT_SLOTS=${CHRONOS_TIER3_1BIT_SLOTS:-336} \
+  -e CHRONOS_TIER2_2BIT_SLOTS=${CHRONOS_TIER2_2BIT_SLOTS:-80} \
+  -e CHRONOS_TIER3_1BIT_SLOTS=${CHRONOS_TIER3_1BIT_SLOTS:-288} \
   -e CHRONOS_DECODE_TOP_K=${CHRONOS_DECODE_TOP_K:-6} \
   --entrypoint bash vllm/vllm-openai:v0.31.0-aarch64 \
   -c "pip install --no-deps --no-build-isolation -q -e /pb27_vllm && exec vllm serve $MODEL_DIR \
