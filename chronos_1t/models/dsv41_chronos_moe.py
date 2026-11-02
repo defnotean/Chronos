@@ -895,6 +895,8 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self.pinned_slots = n_pin
             if self.ring_cursor < self.pinned_slots:
                 self.ring_cursor = self.pinned_slots
+            if layer_idx == 2 and self.use_fp4_slot_cache and _HAS_TRITON and self.device.type == "cuda":
+                _ = self.forward(torch.zeros((1, 5120), dtype=torch.bfloat16, device=self.device))
             self.cache_hits = 0
             self.cache_misses = 0
 
