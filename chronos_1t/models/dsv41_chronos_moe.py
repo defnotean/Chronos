@@ -169,11 +169,9 @@ try:
 
     @triton.jit
     def _decode_e2m1_x4(nib):
-        mag = nib & 0x07
-        e = mag >> 1
-        f = mag & 0x01
-        v_abs = tl.where(e == 0, f << 1, (2 | f) << e).to(tl.float32)
-        return tl.where((nib & 0x08) != 0, -v_abs, v_abs)
+        i32 = nib.to(tl.int32)
+        mag = ((((-932957680 >> ((i32 & 7) << 2)) & 0xF) << 1)).to(tl.float32)
+        return tl.where((i32 & 8) != 0, -mag, mag)
 
     @triton.jit
     def _triton_dsv41_hybrid_gu_swiglu_kernel(
@@ -302,6 +300,378 @@ try:
             acc = acc * tl.load(Sh_d_s_ptr + offs_d)
 
         tl.store(Y_partial_ptr + e_idx * D_OUT + offs_d, acc)
+
+    @triton.jit
+    def _fwht128(v):
+        for _ in tl.static_range(7):
+            v2 = tl.reshape(v, (64, 2))
+            a, b = tl.split(v2)
+            j = tl.join(a + b, a - b)
+            v = tl.reshape(tl.trans(j), (128,))
+        return v * 0.08838834764831845
+
+    @triton.jit
+    def _triton_dsv41_router_top6_kernel(
+        Logits_ptr,
+        Bias_ptr,
+        Top_ids_ptr,
+        Gates_ptr,
+        routed_scaling_factor,
+        K_ACT: tl.constexpr,
+    ):
+        offs = tl.arange(0, 512)
+        mask = offs < 384
+        logit = tl.load(Logits_ptr + offs, mask=mask, other=-1e30).to(tl.float32)
+        sp = tl.where(logit > 20.0, logit, tl.log(1.0 + tl.exp(logit)))
+        score = tl.sqrt(sp)
+        bias = tl.load(Bias_ptr + offs, mask=mask, other=-1e30).to(tl.float32)
+        biased = tl.where(mask, score + bias, -1e30)
+
+        k_offs = tl.arange(0, 8)
+        w_vec = tl.zeros((8,), dtype=tl.float32)
+        for k in tl.static_range(6):
+            best_idx = tl.argmax(biased, axis=0)
+            if k < K_ACT:
+                tl.store(Top_ids_ptr + k, best_idx.to(tl.int32))
+            w_k = tl.max(tl.where(offs == best_idx, score, -1.0), axis=0)
+            w_vec = tl.where(k_offs == k, w_k, w_vec)
+            biased = tl.where(offs == best_idx, -1e30, biased)
+
+        w_sum6 = tl.sum(w_vec, axis=0) + 1e-20
+        gates = (w_vec / w_sum6) * routed_scaling_factor
+        tl.store(Gates_ptr + k_offs, gates, mask=k_offs < K_ACT)
+        tl.store(Gates_ptr + K_ACT, 1.0)
+
+    @triton.jit
+    def _triton_dsv41_fused_pre_unbind_healer_v_kernel(
+        X_in_ptr,
+        V_fp8_ptr,
+        Top_ids_ptr,
+        Hot_slot_map_ptr,
+        C_perm_ptr,
+        C_s1_perm_ptr,
+        C_s2_ptr,
+        X_hrr_out_ptr,
+        H_mid_out_ptr,
+        D_IN: tl.constexpr,
+        N_UNBIND_BLKS: tl.constexpr,
+        X_STRIDE_E: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        e_idx = tl.program_id(1)
+        eid = tl.load(Top_ids_ptr + e_idx).to(tl.int64)
+        hot_slot = tl.load(Hot_slot_map_ptr + eid)
+        if hot_slot >= 0:
+            return
+        if pid < N_UNBIND_BLKS:
+            offs = pid * 128 + tl.arange(0, 128)
+            key_base = eid * D_IN + offs
+            perm_idx = tl.load(C_perm_ptr + key_base).to(tl.int64)
+            s1 = tl.load(C_s1_perm_ptr + key_base).to(tl.float32)
+            s2 = tl.load(C_s2_ptr + key_base).to(tl.float32)
+            x_val = tl.load(X_in_ptr + e_idx * X_STRIDE_E + perm_idx).to(tl.float32) * s1
+            h_val = _fwht128(x_val) * s2
+            tl.store(X_hrr_out_ptr + e_idx * D_IN + offs, h_val.to(tl.bfloat16))
+        else:
+            r_blk = pid - N_UNBIND_BLKS
+            offs_r = r_blk * 16 + tl.arange(0, 16)
+            offs_k = tl.arange(0, BLOCK_K)
+            x_base = X_in_ptr + e_idx * X_STRIDE_E
+            v_base = V_fp8_ptr + eid * (64 * D_IN) + offs_r[:, None] * D_IN
+            acc = tl.zeros((16,), dtype=tl.float32)
+            for k_start in range(0, D_IN, BLOCK_K):
+                k_idx = k_start + offs_k
+                x_k = tl.load(x_base + k_idx).to(tl.float32)
+                v_tile = tl.load(v_base + k_idx[None, :]).to(tl.float32)
+                acc += tl.sum(v_tile * x_k[None, :], axis=1)
+            tl.store(H_mid_out_ptr + e_idx * 64 + offs_r, acc)
+
+    @triton.jit
+    def _triton_dsv41_resident_gu_kernel(
+        X_raw_ptr,
+        X_hrr_ptr,
+        W_hot_gu_u8_ptr,
+        S_hot_gu_bf16_ptr,
+        W_grp_gu_u8_ptr,
+        S_grp_gu_fp8_ptr,
+        Cold_scale_gu_ptr,
+        Gu_r_s2_ptr,
+        U_gu_fp8_ptr,
+        H_gu_mid_ptr,
+        Top_ids_ptr,
+        Hot_slot_map_ptr,
+        Gates_ptr,
+        Z_hrr_out_ptr,
+        Z_gu_healer_out_ptr,
+        Act_out_ptr,
+        swiglu_limit,
+        TOP_K: tl.constexpr,
+        SHARED_SLOT: tl.constexpr,
+        N_INTER: tl.constexpr,
+        N_BLOCKS_K: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        sub_blocks_k: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        e_idx = tl.program_id(1)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        acc1 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        acc3 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+        if e_idx < TOP_K:
+            eid = tl.load(Top_ids_ptr + e_idx).to(tl.int64)
+            hot_slot = tl.load(Hot_slot_map_ptr + eid).to(tl.int64)
+        else:
+            eid = tl.zeros((), dtype=tl.int64)
+            hot_slot = tl.zeros((), dtype=tl.int64) + SHARED_SLOT
+
+        BYTES_PER_ITER: tl.constexpr = sub_blocks_k * 16
+        offs_b = tl.arange(0, BYTES_PER_ITER)
+        w_stride_slot = 2 * N_INTER * (N_BLOCKS_K * 16)
+
+        if hot_slot >= 0:
+            offs_sb = offs_b // 16
+            s_stride_slot = 2 * N_INTER * N_BLOCKS_K
+            w1_hot_base = W_hot_gu_u8_ptr + hot_slot * w_stride_slot + offs_n[:, None] * (N_BLOCKS_K * 16)
+            w3_hot_base = W_hot_gu_u8_ptr + hot_slot * w_stride_slot + (offs_n[:, None] + N_INTER) * (N_BLOCKS_K * 16)
+            s1_hot_base = S_hot_gu_bf16_ptr + hot_slot * s_stride_slot + offs_n[:, None] * N_BLOCKS_K
+            s3_hot_base = S_hot_gu_bf16_ptr + hot_slot * s_stride_slot + (offs_n[:, None] + N_INTER) * N_BLOCKS_K
+
+            for sb_start in range(0, N_BLOCKS_K, sub_blocks_k):
+                b_idx = sb_start * 16 + offs_b
+                sb_idx = sb_start + offs_sb
+                x_even = tl.load(X_raw_ptr + b_idx * 2).to(tl.float32)
+                x_odd = tl.load(X_raw_ptr + b_idx * 2 + 1).to(tl.float32)
+
+                w1_b = tl.load(w1_hot_base + b_idx[None, :])
+                s1_f = tl.load(s1_hot_base + sb_idx[None, :]).to(tl.float32)
+                v1 = (_decode_e2m1_x4(w1_b & 0x0F) * x_even[None, :] + _decode_e2m1_x4(w1_b >> 4) * x_odd[None, :]) * s1_f
+                acc1 += tl.sum(v1, axis=1)
+
+                w3_b = tl.load(w3_hot_base + b_idx[None, :])
+                s3_f = tl.load(s3_hot_base + sb_idx[None, :]).to(tl.float32)
+                v3 = (_decode_e2m1_x4(w3_b & 0x0F) * x_even[None, :] + _decode_e2m1_x4(w3_b >> 4) * x_odd[None, :]) * s3_f
+                acc3 += tl.sum(v3, axis=1)
+
+            gate_scale = tl.load(Gates_ptr + e_idx).to(tl.float32)
+            g = tl.minimum(acc1, swiglu_limit)
+            u = tl.maximum(tl.minimum(acc3, swiglu_limit), -swiglu_limit)
+            act = (g * tl.sigmoid(g)) * u * gate_scale
+            tl.store(Act_out_ptr + e_idx * N_INTER + offs_n, act.to(tl.bfloat16))
+        else:
+            grp_id = eid // 8
+            offs_sb_grp = offs_b // 8
+            N_SCALES_GRP: tl.constexpr = N_BLOCKS_K * 2
+            s_stride_grp = 2 * N_INTER * N_SCALES_GRP
+            w1_grp_base = W_grp_gu_u8_ptr + grp_id * w_stride_slot + offs_n[:, None] * (N_BLOCKS_K * 16)
+            w3_grp_base = W_grp_gu_u8_ptr + grp_id * w_stride_slot + (offs_n[:, None] + N_INTER) * (N_BLOCKS_K * 16)
+            s1_grp_base = S_grp_gu_fp8_ptr + grp_id * s_stride_grp + offs_n[:, None] * N_SCALES_GRP
+            s3_grp_base = S_grp_gu_fp8_ptr + grp_id * s_stride_grp + (offs_n[:, None] + N_INTER) * N_SCALES_GRP
+            x_hrr_base = X_hrr_ptr + e_idx * (N_BLOCKS_K * 32)
+
+            for sb_start in range(0, N_BLOCKS_K, sub_blocks_k):
+                b_idx = sb_start * 16 + offs_b
+                sb_idx = sb_start * 2 + offs_sb_grp
+                x_even = tl.load(x_hrr_base + b_idx * 2).to(tl.float32)
+                x_odd = tl.load(x_hrr_base + b_idx * 2 + 1).to(tl.float32)
+
+                w1_b = tl.load(w1_grp_base + b_idx[None, :])
+                s1_f = tl.load(s1_grp_base + sb_idx[None, :]).to(tl.float32)
+                v1 = (_decode_e2m1_x4(w1_b & 0x0F) * x_even[None, :] + _decode_e2m1_x4(w1_b >> 4) * x_odd[None, :]) * s1_f
+                acc1 += tl.sum(v1, axis=1)
+
+                w3_b = tl.load(w3_grp_base + b_idx[None, :])
+                s3_f = tl.load(s3_grp_base + sb_idx[None, :]).to(tl.float32)
+                v3 = (_decode_e2m1_x4(w3_b & 0x0F) * x_even[None, :] + _decode_e2m1_x4(w3_b >> 4) * x_odd[None, :]) * s3_f
+                acc3 += tl.sum(v3, axis=1)
+
+            cold_s = tl.load(Cold_scale_gu_ptr + eid).to(tl.float32)
+            rs2_1 = tl.load(Gu_r_s2_ptr + eid * (2 * N_INTER) + offs_n).to(tl.float32)
+            rs2_3 = tl.load(Gu_r_s2_ptr + eid * (2 * N_INTER) + N_INTER + offs_n).to(tl.float32)
+            tl.store(Z_hrr_out_ptr + e_idx * (2 * N_INTER) + offs_n, (acc1 * cold_s * rs2_1).to(tl.bfloat16))
+            tl.store(Z_hrr_out_ptr + e_idx * (2 * N_INTER) + N_INTER + offs_n, (acc3 * cold_s * rs2_3).to(tl.bfloat16))
+
+            offs_r = tl.arange(0, 64)
+            h_mid = tl.load(H_gu_mid_ptr + e_idx * 64 + offs_r).to(tl.float32)
+            u_base = U_gu_fp8_ptr + eid * (2 * N_INTER * 64)
+            u1_tile = tl.load(u_base + offs_n[:, None] * 64 + offs_r[None, :]).to(tl.float32)
+            u3_tile = tl.load(u_base + (offs_n[:, None] + N_INTER) * 64 + offs_r[None, :]).to(tl.float32)
+            h1 = tl.sum(u1_tile * h_mid[None, :], axis=1)
+            h3 = tl.sum(u3_tile * h_mid[None, :], axis=1)
+            tl.store(Z_gu_healer_out_ptr + e_idx * (2 * N_INTER) + offs_n, h1.to(tl.bfloat16))
+            tl.store(Z_gu_healer_out_ptr + e_idx * (2 * N_INTER) + N_INTER + offs_n, h3.to(tl.bfloat16))
+
+    @triton.jit
+    def _triton_dsv41_fwht_post_kernel(
+        Buf_ptr,
+        Top_ids_ptr,
+        Hot_slot_map_ptr,
+        D_OUT: tl.constexpr,
+    ):
+        blk_idx = tl.program_id(0)
+        e_idx = tl.program_id(1)
+        eid = tl.load(Top_ids_ptr + e_idx).to(tl.int64)
+        hot_slot = tl.load(Hot_slot_map_ptr + eid)
+        if hot_slot >= 0:
+            return
+        offs = blk_idx * 128 + tl.arange(0, 128)
+        v = tl.load(Buf_ptr + e_idx * D_OUT + offs).to(tl.float32)
+        u = _fwht128(v)
+        tl.store(Buf_ptr + e_idx * D_OUT + offs, u.to(tl.bfloat16))
+
+    @triton.jit
+    def _triton_dsv41_cold_swiglu_kernel(
+        Z_hrr_ptr,
+        Z_gu_healer_ptr,
+        Top_ids_ptr,
+        Hot_slot_map_ptr,
+        Gates_ptr,
+        Gu_r_inv_ptr,
+        Gu_r_s1_ptr,
+        Act_out_ptr,
+        swiglu_limit,
+        N_INTER: tl.constexpr,
+    ):
+        blk_idx = tl.program_id(0)
+        e_idx = tl.program_id(1)
+        eid = tl.load(Top_ids_ptr + e_idx).to(tl.int64)
+        hot_slot = tl.load(Hot_slot_map_ptr + eid)
+        if hot_slot >= 0:
+            return
+        offs = blk_idx * 128 + tl.arange(0, 128)
+        key_base1 = eid * (2 * N_INTER) + offs
+        key_base3 = key_base1 + N_INTER
+        inv1 = tl.load(Gu_r_inv_ptr + key_base1).to(tl.int64)
+        inv3 = tl.load(Gu_r_inv_ptr + key_base3).to(tl.int64)
+        s1_1 = tl.load(Gu_r_s1_ptr + key_base1).to(tl.float32)
+        s1_3 = tl.load(Gu_r_s1_ptr + key_base3).to(tl.float32)
+
+        z_hrr_base = Z_hrr_ptr + e_idx * (2 * N_INTER)
+        z_hlr_base = Z_gu_healer_ptr + e_idx * (2 * N_INTER)
+        acc1 = tl.load(z_hrr_base + inv1).to(tl.float32) * s1_1 + tl.load(z_hlr_base + offs).to(tl.float32)
+        acc3 = tl.load(z_hrr_base + inv3).to(tl.float32) * s1_3 + tl.load(z_hlr_base + N_INTER + offs).to(tl.float32)
+
+        gate_scale = tl.load(Gates_ptr + e_idx).to(tl.float32)
+        g = tl.minimum(acc1, swiglu_limit)
+        u = tl.maximum(tl.minimum(acc3, swiglu_limit), -swiglu_limit)
+        act = (g * tl.sigmoid(g)) * u * gate_scale
+        tl.store(Act_out_ptr + e_idx * N_INTER + offs, act.to(tl.bfloat16))
+
+    @triton.jit
+    def _triton_dsv41_resident_down_kernel(
+        Act_ptr,
+        Act_hrr_ptr,
+        W_hot_d_u8_ptr,
+        S_hot_d_bf16_ptr,
+        W_grp_d_u8_ptr,
+        S_grp_d_fp8_ptr,
+        Cold_scale_d_ptr,
+        Dn_r_s2_ptr,
+        U_d_fp8_ptr,
+        H_d_mid_ptr,
+        Top_ids_ptr,
+        Hot_slot_map_ptr,
+        Y_hrr_out_ptr,
+        Y_out_ptr,
+        TOP_K: tl.constexpr,
+        SHARED_SLOT: tl.constexpr,
+        D_OUT: tl.constexpr,
+        N_BLOCKS_K: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        sub_blocks_k: tl.constexpr,
+    ):
+        pid_d = tl.program_id(0)
+        e_idx = tl.program_id(1)
+        offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+        if e_idx < TOP_K:
+            eid = tl.load(Top_ids_ptr + e_idx).to(tl.int64)
+            hot_slot = tl.load(Hot_slot_map_ptr + eid).to(tl.int64)
+        else:
+            eid = tl.zeros((), dtype=tl.int64)
+            hot_slot = tl.zeros((), dtype=tl.int64) + SHARED_SLOT
+
+        BYTES_PER_ITER: tl.constexpr = sub_blocks_k * 16
+        offs_b = tl.arange(0, BYTES_PER_ITER)
+        w_stride_slot = D_OUT * (N_BLOCKS_K * 16)
+
+        if hot_slot >= 0:
+            offs_sb = offs_b // 16
+            act_hot_base = Act_ptr + e_idx * (N_BLOCKS_K * 32)
+            wd_hot_base = W_hot_d_u8_ptr + hot_slot * w_stride_slot + offs_d[:, None] * (N_BLOCKS_K * 16)
+            sd_hot_base = S_hot_d_bf16_ptr + hot_slot * (D_OUT * N_BLOCKS_K) + offs_d[:, None] * N_BLOCKS_K
+
+            for sb_start in range(0, N_BLOCKS_K, sub_blocks_k):
+                b_idx = sb_start * 16 + offs_b
+                sb_idx = sb_start + offs_sb
+                a_even = tl.load(act_hot_base + b_idx * 2).to(tl.float32)
+                a_odd = tl.load(act_hot_base + b_idx * 2 + 1).to(tl.float32)
+                wd_b = tl.load(wd_hot_base + b_idx[None, :])
+                sd_f = tl.load(sd_hot_base + sb_idx[None, :]).to(tl.float32)
+                vd = (_decode_e2m1_x4(wd_b & 0x0F) * a_even[None, :] + _decode_e2m1_x4(wd_b >> 4) * a_odd[None, :]) * sd_f
+                acc += tl.sum(vd, axis=1)
+
+            tl.store(Y_out_ptr + e_idx * D_OUT + offs_d, acc)
+        else:
+            grp_id = eid // 8
+            offs_sb_grp = offs_b // 8
+            N_SCALES_GRP: tl.constexpr = N_BLOCKS_K * 2
+            act_hrr_base = Act_hrr_ptr + e_idx * (N_BLOCKS_K * 32)
+            wd_grp_base = W_grp_d_u8_ptr + grp_id * w_stride_slot + offs_d[:, None] * (N_BLOCKS_K * 16)
+            sd_grp_base = S_grp_d_fp8_ptr + grp_id * (D_OUT * N_SCALES_GRP) + offs_d[:, None] * N_SCALES_GRP
+
+            for sb_start in range(0, N_BLOCKS_K, sub_blocks_k):
+                b_idx = sb_start * 16 + offs_b
+                sb_idx = sb_start * 2 + offs_sb_grp
+                a_even = tl.load(act_hrr_base + b_idx * 2).to(tl.float32)
+                a_odd = tl.load(act_hrr_base + b_idx * 2 + 1).to(tl.float32)
+                wd_b = tl.load(wd_grp_base + b_idx[None, :])
+                sd_f = tl.load(sd_grp_base + sb_idx[None, :]).to(tl.float32)
+                vd = (_decode_e2m1_x4(wd_b & 0x0F) * a_even[None, :] + _decode_e2m1_x4(wd_b >> 4) * a_odd[None, :]) * sd_f
+                acc += tl.sum(vd, axis=1)
+
+            cold_s = tl.load(Cold_scale_d_ptr + eid).to(tl.float32)
+            drs2 = tl.load(Dn_r_s2_ptr + eid * D_OUT + offs_d).to(tl.float32)
+            tl.store(Y_hrr_out_ptr + e_idx * D_OUT + offs_d, (acc * cold_s * drs2).to(tl.bfloat16))
+
+            offs_r = tl.arange(0, 64)
+            h_d_mid = tl.load(H_d_mid_ptr + e_idx * 64 + offs_r).to(tl.float32)
+            ud_tile = tl.load(U_d_fp8_ptr + eid * (D_OUT * 64) + offs_d[:, None] * 64 + offs_r[None, :]).to(tl.float32)
+            hd = tl.sum(ud_tile * h_d_mid[None, :], axis=1)
+            tl.store(Y_out_ptr + e_idx * D_OUT + offs_d, hd)
+
+    @triton.jit
+    def _triton_dsv41_reduce_down_kernel(
+        Y_hrr_ptr,
+        Y_out_ptr,
+        Top_ids_ptr,
+        Hot_slot_map_ptr,
+        Dn_r_inv_ptr,
+        Dn_r_s1_ptr,
+        Y_final_bf16_ptr,
+        TOP_K: tl.constexpr,
+        D_OUT: tl.constexpr,
+    ):
+        blk_idx = tl.program_id(0)
+        offs = blk_idx * 128 + tl.arange(0, 128)
+        acc_routed = tl.load(Y_out_ptr + TOP_K * D_OUT + offs).to(tl.float32)
+
+        for e_idx in range(TOP_K):
+            eid = tl.load(Top_ids_ptr + e_idx).to(tl.int64)
+            hot_slot = tl.load(Hot_slot_map_ptr + eid)
+            y_base_val = tl.load(Y_out_ptr + e_idx * D_OUT + offs).to(tl.float32)
+            if hot_slot >= 0:
+                acc_routed += y_base_val
+            else:
+                key_base = eid * D_OUT + offs
+                inv_d = tl.load(Dn_r_inv_ptr + key_base).to(tl.int64)
+                s1_d = tl.load(Dn_r_s1_ptr + key_base).to(tl.float32)
+                hrr_val = tl.load(Y_hrr_ptr + e_idx * D_OUT + inv_d).to(tl.float32) * s1_d
+                acc_routed += hrr_val + y_base_val
+
+        tl.store(Y_final_bf16_ptr + offs, acc_routed.to(tl.bfloat16))
 
 except Exception:
     _HAS_TRITON = False
@@ -647,6 +1017,66 @@ class _ChronosDummyExperts(nn.Module):
 
 _SHARED_SCRATCH_GU_BF16: dict[torch.device, torch.Tensor] = {}
 _SHARED_SCRATCH_D_BF16: dict[torch.device, torch.Tensor] = {}
+_SHARED_384_KEYS: dict[torch.device, dict[str, torch.Tensor]] = {}
+
+
+def _get_shared_384_keys(device: torch.device) -> dict[str, torch.Tensor]:
+    cached = _SHARED_384_KEYS.get(device)
+    if cached is not None:
+        return cached
+    gu_c_perm = torch.empty((384, 5120), dtype=torch.int16, device=device)
+    gu_c_s1_perm = torch.empty((384, 5120), dtype=torch.bfloat16, device=device)
+    gu_c_s2 = torch.empty((384, 5120), dtype=torch.bfloat16, device=device)
+    gu_r_s2 = torch.empty((384, 4608), dtype=torch.bfloat16, device=device)
+    gu_r_inv = torch.empty((384, 4608), dtype=torch.int16, device=device)
+    gu_r_s1 = torch.empty((384, 4608), dtype=torch.bfloat16, device=device)
+
+    dn_c_perm = torch.empty((384, 2304), dtype=torch.int16, device=device)
+    dn_c_s1_perm = torch.empty((384, 2304), dtype=torch.bfloat16, device=device)
+    dn_c_s2 = torch.empty((384, 2304), dtype=torch.bfloat16, device=device)
+    dn_r_s2 = torch.empty((384, 5120), dtype=torch.bfloat16, device=device)
+    dn_r_inv = torch.empty((384, 5120), dtype=torch.int16, device=device)
+    dn_r_s1 = torch.empty((384, 5120), dtype=torch.bfloat16, device=device)
+
+    for eid in range(384):
+        g_idx = eid // 8
+        local_m = eid % 8
+        r_s1, _, r_inv, r_s2, c_s1, c_perm, _, c_s2 = generate_expert_1d_keys(
+            4608, 5120, local_m, seed_base=101 + g_idx * 8, device=device
+        )
+        gu_c_perm[eid].copy_(c_perm.to(torch.int16))
+        gu_c_s1_perm[eid].copy_(c_s1[c_perm].to(torch.bfloat16))
+        gu_c_s2[eid].copy_(c_s2.to(torch.bfloat16))
+        gu_r_s2[eid].copy_(r_s2.to(torch.bfloat16))
+        gu_r_inv[eid].copy_(r_inv.to(torch.int16))
+        gu_r_s1[eid].copy_(r_s1.to(torch.bfloat16))
+
+        dr_s1, _, dr_inv, dr_s2, dc_s1, dc_perm, _, dc_s2 = generate_expert_1d_keys(
+            5120, 2304, local_m, seed_base=303 + g_idx * 8, device=device
+        )
+        dn_c_perm[eid].copy_(dc_perm.to(torch.int16))
+        dn_c_s1_perm[eid].copy_(dc_s1[dc_perm].to(torch.bfloat16))
+        dn_c_s2[eid].copy_(dc_s2.to(torch.bfloat16))
+        dn_r_s2[eid].copy_(dr_s2.to(torch.bfloat16))
+        dn_r_inv[eid].copy_(dr_inv.to(torch.int16))
+        dn_r_s1[eid].copy_(dr_s1.to(torch.bfloat16))
+
+    out = {
+        "gu_c_perm": gu_c_perm,
+        "gu_c_s1_perm": gu_c_s1_perm,
+        "gu_c_s2": gu_c_s2,
+        "gu_r_s2": gu_r_s2,
+        "gu_r_inv": gu_r_inv,
+        "gu_r_s1": gu_r_s1,
+        "dn_c_perm": dn_c_perm,
+        "dn_c_s1_perm": dn_c_s1_perm,
+        "dn_c_s2": dn_c_s2,
+        "dn_r_s2": dn_r_s2,
+        "dn_r_inv": dn_r_inv,
+        "dn_r_s1": dn_r_s1,
+    }
+    _SHARED_384_KEYS[device] = out
+    return out
 
 
 def _get_shared_bf16_scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -776,65 +1206,158 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
 
         shared_h128 = build_hadamard_128(device, dtype=torch.bfloat16)
         self.groups = nn.ModuleList()
-        eager_keys = (
-            ("s_gu.weight_scale_2", "s_gu.beta", "s_down.weight_scale_2", "s_down.beta", "tail.gu_bits", "tail.down_bits")
-            if mmap_zero_ram
-            else (
-                "s_gu.weight", "s_gu.weight_scale", "s_gu.weight_scale_2", "s_gu.beta",
-                "s_down.weight", "s_down.weight_scale", "s_down.weight_scale_2", "s_down.beta",
-                "healer.u_gu", "healer.v_gu", "healer.u_down", "healer.v_down",
-                "tail.gu_bits", "tail.down_bits",
-                "tail.gu_packed", "tail.gu_scale", "tail.down_packed", "tail.down_scale",
-            )
-        )
-        for g_idx in range(48):
-            gp = f"{tp}.chronos_groups.{g_idx}."
-            if f"{gp}s_gu.weight" not in all_keys:
-                gp = f"{tp}.chronos_groups.0."
-            sub_t: dict[str, torch.Tensor] = {}
-            for k_suffix in eager_keys:
-                full_k = f"{gp}{k_suffix}"
-                if full_k in all_keys:
-                    sub_t[k_suffix] = self._mmap_handle.get_tensor(full_k)
-            self.groups.append(
-                ChronosDsv41HolographicExpertGroup(
+
+        if self.use_fp4_slot_cache:
+            self._keys_384 = _get_shared_384_keys(device)
+            self.group_gu_u8 = torch.empty((48, 4608, 2560), dtype=torch.uint8, device=device)
+            self.group_gu_s_fp8 = torch.empty((48, 4608, 320), dtype=torch.float8_e4m3fn, device=device)
+            self.group_d_u8 = torch.empty((48, 5120, 1152), dtype=torch.uint8, device=device)
+            self.group_d_s_fp8 = torch.empty((48, 5120, 144), dtype=torch.float8_e4m3fn, device=device)
+            self.healer_u_gu = torch.empty((384, 4608, 64), dtype=torch.float8_e4m3fn, device=device)
+            self.healer_v_gu = torch.empty((384, 64, 5120), dtype=torch.float8_e4m3fn, device=device)
+            self.healer_u_d = torch.empty((384, 5120, 64), dtype=torch.float8_e4m3fn, device=device)
+            self.healer_v_d = torch.empty((384, 64, 2304), dtype=torch.float8_e4m3fn, device=device)
+            self.cold_scale_gu_f32 = torch.empty((384,), dtype=torch.float32, device=device)
+            self.cold_scale_d_f32 = torch.empty((384,), dtype=torch.float32, device=device)
+
+            for g_idx in range(48):
+                gp = f"{tp}.chronos_groups.{g_idx}."
+                if f"{gp}s_gu.weight" not in all_keys:
+                    gp = f"{tp}.chronos_groups.0."
+                e_s, e_e = g_idx * 8, (g_idx + 1) * 8
+                self.group_gu_u8[g_idx].copy_(self._mmap_handle.get_tensor(f"{gp}s_gu.weight"), non_blocking=True)
+                self.group_gu_s_fp8[g_idx].copy_(self._mmap_handle.get_tensor(f"{gp}s_gu.weight_scale"), non_blocking=True)
+                self.group_d_u8[g_idx].copy_(self._mmap_handle.get_tensor(f"{gp}s_down.weight"), non_blocking=True)
+                self.group_d_s_fp8[g_idx].copy_(self._mmap_handle.get_tensor(f"{gp}s_down.weight_scale"), non_blocking=True)
+                self.healer_u_gu[e_s:e_e].copy_(self._mmap_handle.get_tensor(f"{gp}healer.u_gu"), non_blocking=True)
+                self.healer_v_gu[e_s:e_e].copy_(self._mmap_handle.get_tensor(f"{gp}healer.v_gu"), non_blocking=True)
+                self.healer_u_d[e_s:e_e].copy_(self._mmap_handle.get_tensor(f"{gp}healer.u_down"), non_blocking=True)
+                self.healer_v_d[e_s:e_e].copy_(self._mmap_handle.get_tensor(f"{gp}healer.v_down"), non_blocking=True)
+
+                s_gu_s2 = self._mmap_handle.get_tensor(f"{gp}s_gu.weight_scale_2")
+                b_gu = self._mmap_handle.get_tensor(f"{gp}s_gu.beta")
+                s_dn_s2 = self._mmap_handle.get_tensor(f"{gp}s_down.weight_scale_2")
+                b_dn = self._mmap_handle.get_tensor(f"{gp}s_down.beta")
+                self.cold_scale_gu_f32[e_s:e_e].copy_(
+                    (0.25 * s_gu_s2.float() * b_gu.float()).to(device, non_blocking=True)
+                )
+                self.cold_scale_d_f32[e_s:e_e].copy_(
+                    (0.25 * s_dn_s2.float() * b_dn.float()).to(device, non_blocking=True)
+                )
+
+                sub_t = {
+                    "s_gu.weight_scale_2": s_gu_s2,
+                    "s_gu.beta": b_gu,
+                    "s_down.weight_scale_2": s_dn_s2,
+                    "s_down.beta": b_dn,
+                    "tail.gu_bits": self._mmap_handle.get_tensor(f"{gp}tail.gu_bits") if f"{gp}tail.gu_bits" in all_keys else torch.tensor(1),
+                    "tail.down_bits": self._mmap_handle.get_tensor(f"{gp}tail.down_bits") if f"{gp}tail.down_bits" in all_keys else torch.tensor(1),
+                }
+                grp = ChronosDsv41HolographicExpertGroup(
                     group_idx=g_idx,
                     tensors=sub_t,
                     device=device,
                     offload_tail_to_cpu=offload_tail_to_cpu,
-                    mmap_zero_ram=mmap_zero_ram,
-                    mmap_handle=self._mmap_handle if mmap_zero_ram else None,
+                    mmap_zero_ram=True,
+                    mmap_handle=self._mmap_handle,
                     mmap_prefix=gp,
                     h128=shared_h128,
                     r_basis=self.r_basis,
                     swiglu_limit=swiglu_limit,
                 )
+                grp.s_gu_packed = self.group_gu_u8[g_idx]
+                grp.s_gu_scale = self.group_gu_s_fp8[g_idx]
+                grp.s_down_packed = self.group_d_u8[g_idx]
+                grp.s_down_scale = self.group_d_s_fp8[g_idx]
+                grp.u_gu = self.healer_u_gu[e_s:e_e]
+                grp.v_gu = self.healer_v_gu[e_s:e_e]
+                grp.u_down = self.healer_u_d[e_s:e_e]
+                grp.v_down = self.healer_v_d[e_s:e_e]
+                grp.mmap_zero_ram = False
+                grp.mmap_handle = None
+                self.groups.append(grp)
+        else:
+            self._keys_384 = None
+            self.group_gu_u8 = None
+            self.group_gu_s_fp8 = None
+            self.group_d_u8 = None
+            self.group_d_s_fp8 = None
+            self.healer_u_gu = None
+            self.healer_v_gu = None
+            self.healer_u_d = None
+            self.healer_v_d = None
+            self.cold_scale_gu_f32 = None
+            self.cold_scale_d_f32 = None
+            eager_keys = (
+                ("s_gu.weight_scale_2", "s_gu.beta", "s_down.weight_scale_2", "s_down.beta", "tail.gu_bits", "tail.down_bits")
+                if mmap_zero_ram
+                else (
+                    "s_gu.weight", "s_gu.weight_scale", "s_gu.weight_scale_2", "s_gu.beta",
+                    "s_down.weight", "s_down.weight_scale", "s_down.weight_scale_2", "s_down.beta",
+                    "healer.u_gu", "healer.v_gu", "healer.u_down", "healer.v_down",
+                    "tail.gu_bits", "tail.down_bits",
+                    "tail.gu_packed", "tail.gu_scale", "tail.down_packed", "tail.down_scale",
+                )
             )
-        if not mmap_zero_ram:
-            self._mmap_handle = None
-        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
-            try:
-                fd = os.open(self.shard_path_str, os.O_RDONLY)
-                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                os.close(fd)
-            except OSError:
-                pass
+            for g_idx in range(48):
+                gp = f"{tp}.chronos_groups.{g_idx}."
+                if f"{gp}s_gu.weight" not in all_keys:
+                    gp = f"{tp}.chronos_groups.0."
+                sub_t = {}
+                for k_suffix in eager_keys:
+                    full_k = f"{gp}{k_suffix}"
+                    if full_k in all_keys:
+                        sub_t[k_suffix] = self._mmap_handle.get_tensor(full_k)
+                self.groups.append(
+                    ChronosDsv41HolographicExpertGroup(
+                        group_idx=g_idx,
+                        tensors=sub_t,
+                        device=device,
+                        offload_tail_to_cpu=offload_tail_to_cpu,
+                        mmap_zero_ram=mmap_zero_ram,
+                        mmap_handle=self._mmap_handle if mmap_zero_ram else None,
+                        mmap_prefix=gp,
+                        h128=shared_h128,
+                        r_basis=self.r_basis,
+                        swiglu_limit=swiglu_limit,
+                    )
+                )
+            if not mmap_zero_ram:
+                self._mmap_handle = None
 
         self.shared_slot = self.hot_cache_size
+        default_dec_k = "4" if layer_idx in (2, 3, 38, 39) else "3"
+        self.decode_top_k = max(1, min(self.top_k, int(os.environ.get("CHRONOS_DECODE_TOP_K", default_dec_k))))
         if self.use_fp4_slot_cache:
-            self.sh_gu_fp8, self.sh_gu_s = _quantize_row_fp8(sh_gu_tmp)
-            self.sh_d_fp8, self.sh_d_s = _quantize_row_fp8(sh_down_tmp)
-            del sh_gu_tmp, sh_down_tmp, sh_w1, sh_w3
+            self.sh_gu_fp8 = None
+            self.sh_gu_s = None
+            self.sh_d_fp8 = None
+            self.sh_d_s = None
             self.sh_gu = None
             self.sh_down = None
             self.cache_gu_buf = None
             self.cache_d_buf = None
             self.slot_gu = []
             self.slot_d = []
-            self.cache_gu_u8 = torch.empty((self.hot_cache_size, 4608, 2560), dtype=torch.uint8, device=device)
-            self.cache_gu_s_bf16 = torch.empty((self.hot_cache_size, 4608, 160), dtype=torch.bfloat16, device=device)
-            self.cache_d_u8 = torch.empty((self.hot_cache_size, 5120, 1152), dtype=torch.uint8, device=device)
-            self.cache_d_s_bf16 = torch.empty((self.hot_cache_size, 5120, 72), dtype=torch.bfloat16, device=device)
+            self.cache_gu_u8 = torch.empty((self.hot_cache_size + 1, 4608, 2560), dtype=torch.uint8, device=device)
+            self.cache_gu_s_bf16 = torch.empty((self.hot_cache_size + 1, 4608, 160), dtype=torch.bfloat16, device=device)
+            self.cache_d_u8 = torch.empty((self.hot_cache_size + 1, 5120, 1152), dtype=torch.uint8, device=device)
+            self.cache_d_s_bf16 = torch.empty((self.hot_cache_size + 1, 5120, 72), dtype=torch.bfloat16, device=device)
+            _triton_quantize_mse_fp4_32_kernel[(4608, 160)](
+                sh_gu_tmp,
+                self.cache_gu_u8[self.shared_slot],
+                self.cache_gu_s_bf16[self.shared_slot],
+                N_BLOCKS_C=160,
+                num_warps=1,
+            )
+            _triton_quantize_mse_fp4_32_kernel[(5120, 72)](
+                sh_down_tmp,
+                self.cache_d_u8[self.shared_slot],
+                self.cache_d_s_bf16[self.shared_slot],
+                N_BLOCKS_C=72,
+                num_warps=1,
+            )
+            del sh_gu_tmp, sh_down_tmp, sh_w1, sh_w3
         else:
             self.sh_gu_fp8 = None
             self.sh_gu_s = None
@@ -861,14 +1384,26 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         self.cache_hits = 0
         self.cache_misses = 0
 
+        self._top_ids_buf = torch.zeros((self.top_k,), dtype=torch.int32, device=device)
         self._active_slots_buf = torch.empty((self.top_k + 1,), dtype=torch.int32, device=device)
         self._active_slots_buf[self.top_k] = self.shared_slot
         self._active_gates_buf = torch.ones((self.top_k + 1,), dtype=torch.float32, device=device)
         self._act_inter_buf = torch.empty((self.top_k + 1, 2304), dtype=torch.bfloat16, device=device)
         self._y_partial_buf = torch.empty((self.top_k + 1, 5120), dtype=torch.float32, device=device)
+        if self.use_fp4_slot_cache:
+            self._x_hrr_buf = torch.empty((self.top_k, 5120), dtype=torch.bfloat16, device=device)
+            self._h_gu_mid_buf = torch.empty((self.top_k, 64), dtype=torch.float32, device=device)
+            self._z_hrr_buf = torch.empty((self.top_k, 4608), dtype=torch.bfloat16, device=device)
+            self._z_gu_hlr_buf = torch.empty((self.top_k, 4608), dtype=torch.bfloat16, device=device)
+            self._act_hrr_buf = torch.empty((self.top_k, 2304), dtype=torch.bfloat16, device=device)
+            self._h_d_mid_buf = torch.empty((self.top_k, 64), dtype=torch.float32, device=device)
+            self._y_hrr_buf = torch.empty((self.top_k, 5120), dtype=torch.bfloat16, device=device)
+            self._y_routed_buf = torch.empty((1, 5120), dtype=torch.float32, device=device)
+            self._y_final_buf = torch.empty((1, 5120), dtype=torch.bfloat16, device=device)
 
         # Upgrade 2: Hybrid Direct Unshared MXFP4 Hot Experts + Chronos v7.5 Holographic Cold Experts
         self.hot_expert_to_idx: list[int] = [-1] * 384
+        self.hot_expert_ids_list: list[int] = []
         self.num_hot_mxfp4_experts = 0
         self._hot_tensors: dict[str, torch.Tensor] | None = None
         self._hot_handle: Any = None
@@ -884,21 +1419,63 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
 
         self.pinned_slots = 0
         with torch.no_grad():
-            rw_f = self.router_w.float()
-            _, _, vh_rt = torch.linalg.svd(rw_f, full_matrices=False)
-            u_ctx = vh_rt[:32, :].T
-            prior_scores = torch.linalg.norm(rw_f @ u_ctx, dim=-1) + self.e_score_bias
-            n_pin = min(8, max(0, self.hot_cache_size - self.top_k))
-            _, top_hub_ids = torch.topk(prior_scores, k=n_pin)
-            for eid in top_hub_ids.tolist():
-                self._ensure_expert_slot(int(eid))
-            self.pinned_slots = n_pin
-            if self.ring_cursor < self.pinned_slots:
-                self.ring_cursor = self.pinned_slots
+            if self.use_fp4_slot_cache and self.num_hot_mxfp4_experts > 0:
+                n_pin = min(self.hot_cache_size, self.num_hot_mxfp4_experts)
+                for slot_i in range(n_pin):
+                    eid = int(self.hot_expert_ids_list[slot_i])
+                    h_idx = self.hot_expert_to_idx[eid]
+                    self._load_hot_mxfp4_into_fp4_slot(h_idx, slot_i)
+                    self.expert_to_slot[eid] = slot_i
+                    self.expert_to_slot_gpu[eid] = slot_i
+                    self.slot_to_expert[slot_i] = eid
+                self.pinned_slots = n_pin
+                self.ring_cursor = 0
+            else:
+                rw_f = self.router_w.float()
+                _, _, vh_rt = torch.linalg.svd(rw_f, full_matrices=False)
+                u_ctx = vh_rt[:32, :].T
+                prior_scores = torch.linalg.norm(rw_f @ u_ctx, dim=-1) + self.e_score_bias
+                n_pin = self.hot_cache_size if self.use_fp4_slot_cache else min(8, max(0, self.hot_cache_size - self.top_k))
+                _, top_hub_ids = torch.topk(prior_scores, k=n_pin)
+                for slot_i, eid in enumerate(top_hub_ids.tolist()):
+                    if self.use_fp4_slot_cache:
+                        g_idx = int(eid) // 8
+                        local_m = int(eid) % 8
+                        self.groups[g_idx].mmap_zero_ram = True
+                        self.groups[g_idx].mmap_handle = self._mmap_handle
+                    self._ensure_expert_slot(int(eid))
+                    if self.use_fp4_slot_cache:
+                        self.groups[g_idx].mmap_zero_ram = False
+                        self.groups[g_idx].mmap_handle = None
+                self.pinned_slots = n_pin
+                if self.ring_cursor < self.pinned_slots:
+                    self.ring_cursor = self.pinned_slots % self.hot_cache_size
+
+            if self.use_fp4_slot_cache:
+                self._mmap_handle = None
+                self._hot_handle = None
+                if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+                    for fpath in (self.shard_path_str, str(self._hot_shard_cand)):
+                        try:
+                            if os.path.exists(fpath):
+                                fd = os.open(fpath, os.O_RDONLY)
+                                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                                os.close(fd)
+                        except OSError:
+                            pass
+
             if layer_idx == 2 and self.use_fp4_slot_cache and _HAS_TRITON and self.device.type == "cuda":
                 _ = self.forward(torch.zeros((1, 5120), dtype=torch.bfloat16, device=self.device))
             self.cache_hits = 0
             self.cache_misses = 0
+
+        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+            try:
+                fd = os.open(self.shard_path_str, os.O_RDONLY)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(fd)
+            except OSError:
+                pass
 
     def _try_attach_hot_shard(self) -> bool:
         if self.num_hot_mxfp4_experts > 0:
@@ -911,6 +1488,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             if f"{self._hot_tp}expert_ids" not in hot_keys and f"layers.{self.layer_idx}.ffn.hot_experts.expert_ids" in hot_keys:
                 self._hot_tp = f"layers.{self.layer_idx}.ffn.hot_experts."
             hot_eids = self._hot_handle.get_tensor(f"{self._hot_tp}expert_ids").tolist()
+            self.hot_expert_ids_list = [int(x) for x in hot_eids]
             for idx_h, eid_h in enumerate(hot_eids):
                 self.hot_expert_to_idx[int(eid_h)] = idx_h
             self.num_hot_mxfp4_experts = len(hot_eids)
@@ -1093,6 +1671,151 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         if n_toks == 0:
             return hidden_states
 
+        # Zero-sync 100% GPU-Resident Fused Triton Decode Path for n_toks == 1
+        if n_toks == 1 and self.use_fp4_slot_cache and _HAS_TRITON and x.is_cuda:
+            raw_logits = F.linear(x, self.router_w)
+            bias_vec = self.e_score_bias
+            if image_mask is not None and self.bias_vl is not None and image_mask.numel() == 1:
+                bias_vec = torch.where(image_mask.view(1), self.bias_vl, self.e_score_bias)
+
+            k_act = self.decode_top_k
+            _triton_dsv41_router_top6_kernel[(1,)](
+                raw_logits,
+                bias_vec,
+                self._top_ids_buf,
+                self._active_gates_buf,
+                float(self.routed_scaling_factor),
+                K_ACT=k_act,
+                num_warps=4,
+            )
+
+            keys = self._keys_384
+            assert keys is not None
+            n_active = k_act + 1
+
+            _triton_dsv41_fused_pre_unbind_healer_v_kernel[(44, k_act)](
+                x,
+                self.healer_v_gu,
+                self._top_ids_buf,
+                self.expert_to_slot_gpu,
+                keys["gu_c_perm"],
+                keys["gu_c_s1_perm"],
+                keys["gu_c_s2"],
+                self._x_hrr_buf,
+                self._h_gu_mid_buf,
+                D_IN=5120,
+                N_UNBIND_BLKS=40,
+                X_STRIDE_E=0,
+                BLOCK_K=256,
+                num_warps=4,
+            )
+            _triton_dsv41_resident_gu_kernel[(2304 // 8, n_active)](
+                x,
+                self._x_hrr_buf,
+                self.cache_gu_u8,
+                self.cache_gu_s_bf16,
+                self.group_gu_u8,
+                self.group_gu_s_fp8,
+                self.cold_scale_gu_f32,
+                keys["gu_r_s2"],
+                self.healer_u_gu,
+                self._h_gu_mid_buf,
+                self._top_ids_buf,
+                self.expert_to_slot_gpu,
+                self._active_gates_buf,
+                self._z_hrr_buf,
+                self._z_gu_hlr_buf,
+                self._act_inter_buf,
+                float(self.swiglu_limit),
+                TOP_K=k_act,
+                SHARED_SLOT=self.shared_slot,
+                N_INTER=2304,
+                N_BLOCKS_K=160,
+                BLOCK_N=8,
+                sub_blocks_k=32,
+                num_warps=8,
+            )
+            _triton_dsv41_fwht_post_kernel[(36, k_act)](
+                self._z_hrr_buf,
+                self._top_ids_buf,
+                self.expert_to_slot_gpu,
+                D_OUT=4608,
+                num_warps=2,
+            )
+            _triton_dsv41_cold_swiglu_kernel[(18, k_act)](
+                self._z_hrr_buf,
+                self._z_gu_hlr_buf,
+                self._top_ids_buf,
+                self.expert_to_slot_gpu,
+                self._active_gates_buf,
+                keys["gu_r_inv"],
+                keys["gu_r_s1"],
+                self._act_inter_buf,
+                float(self.swiglu_limit),
+                N_INTER=2304,
+                num_warps=2,
+            )
+            _triton_dsv41_fused_pre_unbind_healer_v_kernel[(22, k_act)](
+                self._act_inter_buf,
+                self.healer_v_d,
+                self._top_ids_buf,
+                self.expert_to_slot_gpu,
+                keys["dn_c_perm"],
+                keys["dn_c_s1_perm"],
+                keys["dn_c_s2"],
+                self._act_hrr_buf,
+                self._h_d_mid_buf,
+                D_IN=2304,
+                N_UNBIND_BLKS=18,
+                X_STRIDE_E=2304,
+                BLOCK_K=256,
+                num_warps=4,
+            )
+            _triton_dsv41_resident_down_kernel[(5120 // 8, n_active)](
+                self._act_inter_buf,
+                self._act_hrr_buf,
+                self.cache_d_u8,
+                self.cache_d_s_bf16,
+                self.group_d_u8,
+                self.group_d_s_fp8,
+                self.cold_scale_d_f32,
+                keys["dn_r_s2"],
+                self.healer_u_d,
+                self._h_d_mid_buf,
+                self._top_ids_buf,
+                self.expert_to_slot_gpu,
+                self._y_hrr_buf,
+                self._y_partial_buf,
+                TOP_K=k_act,
+                SHARED_SLOT=self.shared_slot,
+                D_OUT=5120,
+                N_BLOCKS_K=72,
+                BLOCK_D=8,
+                sub_blocks_k=8,
+                num_warps=8,
+            )
+            _triton_dsv41_fwht_post_kernel[(40, k_act)](
+                self._y_hrr_buf,
+                self._top_ids_buf,
+                self.expert_to_slot_gpu,
+                D_OUT=5120,
+                num_warps=2,
+            )
+            _triton_dsv41_reduce_down_kernel[(40,)](
+                self._y_hrr_buf,
+                self._y_partial_buf,
+                self._top_ids_buf,
+                self.expert_to_slot_gpu,
+                keys["dn_r_inv"],
+                keys["dn_r_s1"],
+                self._y_final_buf,
+                TOP_K=k_act,
+                D_OUT=5120,
+                num_warps=2,
+            )
+            out_y = self._y_final_buf.view(orig_shape)
+            return out_y if orig_dtype == torch.bfloat16 else out_y.to(orig_dtype)
+
         if image_mask is None and input_ids is not None:
             if input_ids.dtype == torch.bool:
                 image_mask = input_ids
@@ -1136,47 +1859,6 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 self._active_slots_buf[: self.top_k].copy_(
                     torch.tensor(slot_ids, dtype=torch.int32, device=self.device)
                 )
-
-            if self.use_fp4_slot_cache and _HAS_TRITON and x.is_cuda:
-                n_active = self.top_k + 1
-                _triton_dsv41_hybrid_gu_swiglu_kernel[(2304 // 16, n_active)](
-                    x,
-                    self.cache_gu_u8,
-                    self.cache_gu_s_bf16,
-                    self.sh_gu_fp8,
-                    self.sh_gu_s,
-                    self._active_slots_buf,
-                    self._active_gates_buf,
-                    self._act_inter_buf,
-                    float(self.swiglu_limit),
-                    TOP_K=self.top_k,
-                    N_INTER=2304,
-                    N_BLOCKS_K=160,
-                    BLOCK_N=16,
-                    sub_blocks_k=8,
-                    num_warps=8,
-                )
-                _triton_dsv41_hybrid_down_kernel[(5120 // 16, n_active)](
-                    self._act_inter_buf,
-                    self.cache_d_u8,
-                    self.cache_d_s_bf16,
-                    self.sh_d_fp8,
-                    self.sh_d_s,
-                    self._active_slots_buf,
-                    self._y_partial_buf,
-                    TOP_K=self.top_k,
-                    D_OUT=5120,
-                    N_BLOCKS_K=72,
-                    BLOCK_D=16,
-                    sub_blocks_k=8,
-                    num_warps=8,
-                )
-                y_routed_f32 = self._y_partial_buf[: self.top_k].sum(dim=0, keepdim=True)
-                if self.r_basis_f32 is not None:
-                    rb = self.r_basis_f32
-                    y_routed_f32 = y_routed_f32 - (y_routed_f32 @ rb.T) @ rb
-                y_tot = y_routed_f32 + self._y_partial_buf[self.top_k : self.top_k + 1]
-                return y_tot.view(orig_shape).to(orig_dtype)
 
             if _HAS_TRITON and x.is_cuda:
                 n_active = self.top_k + 1
@@ -1230,11 +1912,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         # Shared Expert Branch for n_toks > 1
         top_gates = top_gates_f32.to(torch.bfloat16)
         if self.use_fp4_slot_cache:
-            assert self.sh_gu_fp8 is not None and self.sh_gu_s is not None
-            assert self.sh_d_fp8 is not None and self.sh_d_s is not None
-            scr_gu, scr_d = _get_shared_bf16_scratch(self.device)
-            scr_gu.copy_((self.sh_gu_fp8.to(torch.float32) * self.sh_gu_s.unsqueeze(-1)).to(torch.bfloat16))
-            scr_d.copy_((self.sh_d_fp8.to(torch.float32) * self.sh_d_s.unsqueeze(-1)).to(torch.bfloat16))
+            scr_gu, scr_d = self._get_slot_bf16(self.shared_slot)
             sh_gu_out = F.linear(x, scr_gu)
             y_shared = F.linear(dsv41_clamped_swiglu(sh_gu_out, 2304, self.swiglu_limit), scr_d)
         else:
@@ -1242,18 +1920,12 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             y_shared = F.linear(dsv41_clamped_swiglu(sh_gu_out, 2304, self.swiglu_limit), self.sh_down)
 
         y_routed = torch.zeros_like(x)
-        flat_ids = top_ids.view(-1)
-        flat_gates = top_gates.view(-1).float()
-        expert_mass = torch.zeros(384, dtype=torch.float32, device=self.device)
-        expert_mass.scatter_add_(0, flat_ids, flat_gates)
-        expert_mass.scatter_add_(0, top_ids[0], torch.full((self.top_k,), 100.0, dtype=torch.float32, device=self.device))
-
         unique_eids = torch.unique(top_ids).tolist()
         warm_eids = [int(eid) for eid in unique_eids if self.expert_to_slot[int(eid)] >= 0]
         cold_eids = [int(eid) for eid in unique_eids if self.expert_to_slot[int(eid)] < 0]
 
         for eid in warm_eids:
-            slot = self._ensure_expert_slot(eid)
+            slot = self.expert_to_slot[eid]
             w_gu_s, w_d_s = self._get_slot_bf16(slot)
             mask = top_ids == eid
             tok_indices, slot_indices = torch.where(mask)
@@ -1265,40 +1937,62 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             y_routed.index_add_(0, tok_indices, g_sel * y_exp)
 
         if cold_eids:
-            cold_masses = [float(expert_mass[eid].item()) for eid in cold_eids]
-            sorted_cold_asc = [eid for _, eid in sorted(zip(cold_masses, cold_eids), reverse=False)]
-            dyn_span = max(1, self.hot_cache_size - self.pinned_slots)
-            cache_cutoff = max(0, len(sorted_cold_asc) - dyn_span)
-            group_bank_cache_pf: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-            for c_idx, eid in enumerate(sorted_cold_asc):
-                h_idx = self.hot_expert_to_idx[eid]
-                s_gu_c: torch.Tensor | None = None
-                s_dn_c: torch.Tensor | None = None
-                if h_idx < 0:
-                    g_idx = eid // 8
-                    if g_idx not in group_bank_cache_pf:
-                        group_bank_cache_pf[g_idx] = self.groups[g_idx].get_group_banks()
-                    s_gu_c, s_dn_c = group_bank_cache_pf[g_idx]
-
-                if c_idx >= cache_cutoff:
-                    slot = self._ensure_expert_slot(eid, s_gu_cached=s_gu_c, s_dn_cached=s_dn_c)
-                    w_gu_s, w_d_s = self._get_slot_bf16(slot)
-                else:
-                    w_gu_s, w_d_s = _get_shared_bf16_scratch(self.device)
-                    if h_idx >= 0:
-                        self._reconstruct_hot_mxfp4_into(h_idx, w_gu_s, w_d_s)
-                    else:
-                        self.groups[eid // 8].reconstruct_expert_into_slot(
-                            eid % 8, w_gu_s, w_d_s, s_gu_cached=s_gu_c, s_dn_cached=s_dn_c
+            if self.use_fp4_slot_cache:
+                cold_by_group: dict[int, list[int]] = {}
+                for eid in cold_eids:
+                    cold_by_group.setdefault(eid // 8, []).append(eid)
+                for g_idx, g_eids in cold_by_group.items():
+                    s_gu_c, s_dn_c = self.groups[g_idx].get_group_banks()
+                    for eid in g_eids:
+                        mask = top_ids == eid
+                        tok_indices, slot_indices = torch.where(mask)
+                        x_sel = x[tok_indices]
+                        g_sel = top_gates[tok_indices, slot_indices].unsqueeze(-1)
+                        y_exp = self.groups[g_idx].forward_cold_fast(
+                            x_sel, eid % 8, s_gu_cached=s_gu_c, s_dn_cached=s_dn_c
                         )
-                mask = top_ids == eid
-                tok_indices, slot_indices = torch.where(mask)
-                x_sel = x[tok_indices]
-                g_sel = top_gates[tok_indices, slot_indices].unsqueeze(-1)
-                gu_out = F.linear(x_sel, w_gu_s)
-                act = dsv41_clamped_swiglu(gu_out, 2304, self.swiglu_limit)
-                y_exp = F.linear(act, w_d_s)
-                y_routed.index_add_(0, tok_indices, g_sel * y_exp)
+                        y_routed.index_add_(0, tok_indices, g_sel * y_exp)
+                    del s_gu_c, s_dn_c
+            else:
+                flat_ids = top_ids.view(-1)
+                flat_gates = top_gates.view(-1).float()
+                expert_mass = torch.zeros(384, dtype=torch.float32, device=self.device)
+                expert_mass.scatter_add_(0, flat_ids, flat_gates)
+                expert_mass.scatter_add_(0, top_ids[0], torch.full((self.top_k,), 100.0, dtype=torch.float32, device=self.device))
+                cold_masses = [float(expert_mass[eid].item()) for eid in cold_eids]
+                sorted_cold_asc = [eid for _, eid in sorted(zip(cold_masses, cold_eids), reverse=False)]
+                dyn_span = max(1, self.hot_cache_size - self.pinned_slots)
+                cache_cutoff = max(0, len(sorted_cold_asc) - dyn_span)
+                group_bank_cache_pf: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+                for c_idx, eid in enumerate(sorted_cold_asc):
+                    h_idx = self.hot_expert_to_idx[eid]
+                    s_gu_c_pf: torch.Tensor | None = None
+                    s_dn_c_pf: torch.Tensor | None = None
+                    if h_idx < 0:
+                        g_idx = eid // 8
+                        if g_idx not in group_bank_cache_pf:
+                            group_bank_cache_pf[g_idx] = self.groups[g_idx].get_group_banks()
+                        s_gu_c_pf, s_dn_c_pf = group_bank_cache_pf[g_idx]
+
+                    if c_idx >= cache_cutoff:
+                        slot = self._ensure_expert_slot(eid, s_gu_cached=s_gu_c_pf, s_dn_cached=s_dn_c_pf)
+                        w_gu_s, w_d_s = self._get_slot_bf16(slot)
+                    else:
+                        w_gu_s, w_d_s = _get_shared_bf16_scratch(self.device)
+                        if h_idx >= 0:
+                            self._reconstruct_hot_mxfp4_into(h_idx, w_gu_s, w_d_s)
+                        else:
+                            self.groups[eid // 8].reconstruct_expert_into_slot(
+                                eid % 8, w_gu_s, w_d_s, s_gu_cached=s_gu_c_pf, s_dn_cached=s_dn_c_pf
+                            )
+                    mask = top_ids == eid
+                    tok_indices, slot_indices = torch.where(mask)
+                    x_sel = x[tok_indices]
+                    g_sel = top_gates[tok_indices, slot_indices].unsqueeze(-1)
+                    gu_out = F.linear(x_sel, w_gu_s)
+                    act = dsv41_clamped_swiglu(gu_out, 2304, self.swiglu_limit)
+                    y_exp = F.linear(act, w_d_s)
+                    y_routed.index_add_(0, tok_indices, g_sel * y_exp)
 
         if self.use_fp4_slot_cache and self.r_basis is not None:
             rb = self.r_basis.to(y_routed.dtype)
