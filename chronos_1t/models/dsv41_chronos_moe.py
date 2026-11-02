@@ -2097,10 +2097,31 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self.w2_d_u8 = torch.empty((self.n2_slots, 5120, 576), dtype=torch.uint8, device=device)
             self.s2_d_fp8 = torch.empty((self.n2_slots, 5120, 36), dtype=torch.float8_e4m3fn, device=device)
 
-            self.w1_gu_u8 = torch.empty((self.n1_slots, 4608, 640), dtype=torch.uint8, device=device)
-            self.s1_gu_fp8 = torch.empty((self.n1_slots, 4608, 80), dtype=torch.float8_e4m3fn, device=device)
-            self.w1_d_u8 = torch.empty((self.n1_slots, 5120, 288), dtype=torch.uint8, device=device)
-            self.s1_d_fp8 = torch.empty((self.n1_slots, 5120, 36), dtype=torch.float8_e4m3fn, device=device)
+            t3_cpu_from = int(os.environ.get("CHRONOS_T3_CPU_FROM_LAYER", "40"))
+            self.t3_on_cpu = bool(self.n1_slots > 0 and layer_idx >= t3_cpu_from)
+            if self.t3_on_cpu:
+                try:
+                    self.w1_gu_cpu = torch.empty((self.n1_slots, 4608, 640), dtype=torch.uint8, device="cpu", pin_memory=True)
+                    self.s1_gu_cpu = torch.empty((self.n1_slots, 4608, 80), dtype=torch.float8_e4m3fn, device="cpu", pin_memory=True)
+                    self.w1_d_cpu = torch.empty((self.n1_slots, 5120, 288), dtype=torch.uint8, device="cpu", pin_memory=True)
+                    self.s1_d_cpu = torch.empty((self.n1_slots, 5120, 36), dtype=torch.float8_e4m3fn, device="cpu", pin_memory=True)
+                except Exception:
+                    self.w1_gu_cpu = torch.empty((self.n1_slots, 4608, 640), dtype=torch.uint8, device="cpu")
+                    self.s1_gu_cpu = torch.empty((self.n1_slots, 4608, 80), dtype=torch.float8_e4m3fn, device="cpu")
+                    self.w1_d_cpu = torch.empty((self.n1_slots, 5120, 288), dtype=torch.uint8, device="cpu")
+                    self.s1_d_cpu = torch.empty((self.n1_slots, 5120, 36), dtype=torch.float8_e4m3fn, device="cpu")
+                n1_gpu_alloc = max(1, self.top_k)
+            else:
+                self.w1_gu_cpu = None
+                self.s1_gu_cpu = None
+                self.w1_d_cpu = None
+                self.s1_d_cpu = None
+                n1_gpu_alloc = self.n1_slots
+
+            self.w1_gu_u8 = torch.empty((n1_gpu_alloc, 4608, 640), dtype=torch.uint8, device=device)
+            self.s1_gu_fp8 = torch.empty((n1_gpu_alloc, 4608, 80), dtype=torch.float8_e4m3fn, device=device)
+            self.w1_d_u8 = torch.empty((n1_gpu_alloc, 5120, 288), dtype=torch.uint8, device=device)
+            self.s1_d_fp8 = torch.empty((n1_gpu_alloc, 5120, 36), dtype=torch.float8_e4m3fn, device=device)
             self.tier_slot_map_gpu = torch.full((384,), -1, dtype=torch.int32, device=device)
 
             _triton_quantize_mse_fp4_32_kernel[(4608, 160)](
@@ -2142,6 +2163,11 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self.s1_gu_fp8 = None
             self.w1_d_u8 = None
             self.s1_d_fp8 = None
+            self.w1_gu_cpu = None
+            self.s1_gu_cpu = None
+            self.w1_d_cpu = None
+            self.s1_d_cpu = None
+            self.t3_on_cpu = False
             self.tier_slot_map_gpu = None
             eager_keys = (
                 ("s_gu.weight_scale_2", "s_gu.beta", "s_down.weight_scale_2", "s_down.beta", "tail.gu_bits", "tail.down_bits")
@@ -2405,6 +2431,9 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                         )
                         _dequantize_fp4_bf16scale_into(tmp_u8_gu, tmp_s_gu, scr_gu)
                         _dequantize_fp4_bf16scale_into(tmp_u8_d, tmp_s_d, scr_d)
+                        if self.r_basis is not None:
+                            rb = self.r_basis.to(torch.bfloat16)
+                            scr_d.addmm_(rb.T, torch.matmul(rb, scr_d), beta=1.0, alpha=-1.0)
                         if tier_id == 2:
                             _triton_quantize_2bit_g64_kernel[(4608, 80)](
                                 scr_gu, self.w2_gu_u8[slot_i], self.s2_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
@@ -2412,6 +2441,17 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                             _triton_quantize_2bit_g64_kernel[(5120, 36)](
                                 scr_d, self.w2_d_u8[slot_i], self.s2_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
                             )
+                        elif self.t3_on_cpu:
+                            _triton_quantize_1bit_g64_kernel[(4608, 80)](
+                                scr_gu, self.w1_gu_u8[0], self.s1_gu_fp8[0], N_GROUPS_C=80, num_warps=1
+                            )
+                            _triton_quantize_1bit_g64_kernel[(5120, 36)](
+                                scr_d, self.w1_d_u8[0], self.s1_d_fp8[0], N_GROUPS_C=36, num_warps=1
+                            )
+                            self.w1_gu_cpu[slot_i].copy_(self.w1_gu_u8[0], non_blocking=False)
+                            self.s1_gu_cpu[slot_i].copy_(self.s1_gu_fp8[0], non_blocking=False)
+                            self.w1_d_cpu[slot_i].copy_(self.w1_d_u8[0], non_blocking=False)
+                            self.s1_d_cpu[slot_i].copy_(self.s1_d_fp8[0], non_blocking=False)
                         else:
                             _triton_quantize_1bit_g64_kernel[(4608, 80)](
                                 scr_gu, self.w1_gu_u8[slot_i], self.s1_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
@@ -2465,6 +2505,17 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                             _triton_quantize_2bit_g64_kernel[(5120, 36)](
                                 scr_d, self.w2_d_u8[slot_i], self.s2_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
                             )
+                        elif self.t3_on_cpu:
+                            _triton_quantize_1bit_g64_kernel[(4608, 80)](
+                                scr_gu, self.w1_gu_u8[0], self.s1_gu_fp8[0], N_GROUPS_C=80, num_warps=1
+                            )
+                            _triton_quantize_1bit_g64_kernel[(5120, 36)](
+                                scr_d, self.w1_d_u8[0], self.s1_d_fp8[0], N_GROUPS_C=36, num_warps=1
+                            )
+                            self.w1_gu_cpu[slot_i].copy_(self.w1_gu_u8[0], non_blocking=False)
+                            self.s1_gu_cpu[slot_i].copy_(self.s1_gu_fp8[0], non_blocking=False)
+                            self.w1_d_cpu[slot_i].copy_(self.w1_d_u8[0], non_blocking=False)
+                            self.s1_d_cpu[slot_i].copy_(self.s1_d_fp8[0], non_blocking=False)
                         else:
                             _triton_quantize_1bit_g64_kernel[(4608, 80)](
                                 scr_gu, self.w1_gu_u8[slot_i], self.s1_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
@@ -2695,6 +2746,27 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         return slot
 
     @torch.no_grad()
+    def _stage_t3_bounce_slots(self, k_act: int) -> None:
+        if not self.t3_on_cpu or self.w1_gu_cpu is None:
+            return
+        slots_list = self._active_slots_buf[:k_act].tolist()
+        if not any(s >= 2048 for s in slots_list):
+            return
+        b_idx = 0
+        for idx_k, s_val in enumerate(slots_list):
+            if s_val >= 2048:
+                s1 = s_val - 2048
+                self.w1_gu_u8[b_idx].copy_(self.w1_gu_cpu[s1], non_blocking=True)
+                self.s1_gu_fp8[b_idx].copy_(self.s1_gu_cpu[s1], non_blocking=True)
+                self.w1_d_u8[b_idx].copy_(self.w1_d_cpu[s1], non_blocking=True)
+                self.s1_d_fp8[b_idx].copy_(self.s1_d_cpu[s1], non_blocking=True)
+                slots_list[idx_k] = 2048 + b_idx
+                b_idx += 1
+        self._active_slots_buf[:k_act].copy_(
+            torch.tensor(slots_list, dtype=torch.int32, device=self.device)
+        )
+
+    @torch.no_grad()
     def _get_slot_bf16(self, slot: int) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.use_fp4_slot_cache:
             return self.slot_gu[slot], self.slot_d[slot]
@@ -2749,6 +2821,8 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     K_ACT=k_act,
                     num_warps=4,
                 )
+                if self.t3_on_cpu:
+                    self._stage_t3_bounce_slots(k_act)
                 _triton_dsv41_tiered_gu_swiglu_kernel[(2304 // 8, n_active)](
                     x,
                     self.w4_gu_u8,
@@ -2798,6 +2872,9 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     D_OUT=5120,
                     num_warps=2,
                 )
+                if self.r_basis is not None:
+                    rb = self.r_basis.to(out_y.dtype)
+                    out_y.addmm_(out_y @ rb.T, rb, beta=1.0, alpha=-1.0)
                 out_y_v = out_y.view(orig_shape)
                 return out_y_v if orig_dtype == torch.bfloat16 else out_y_v.to(orig_dtype)
 
@@ -2819,6 +2896,8 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     K_ACT=k_act,
                     num_warps=4,
                 )
+                if self.t3_on_cpu:
+                    self._stage_t3_bounce_slots(k_act)
                 _triton_dsv41_tiered_gu_swiglu_kernel[(2304 // 8, n_active)](
                     x[t_i : t_i + 1],
                     self.w4_gu_u8,
@@ -2868,6 +2947,9 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     D_OUT=5120,
                     num_warps=2,
                 )
+            if self.r_basis is not None:
+                rb = self.r_basis.to(out_y.dtype)
+                out_y.addmm_(out_y @ rb.T, rb, beta=1.0, alpha=-1.0)
             out_y_v = out_y.view(orig_shape)
             return out_y_v if orig_dtype == torch.bfloat16 else out_y_v.to(orig_dtype)
 
