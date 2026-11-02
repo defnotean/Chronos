@@ -16,6 +16,7 @@ Implements runtime execution for converted `DeepSeek-V4.1-Flash-1017` (`Deepseek
 """
 from __future__ import annotations
 
+import gc
 import os
 from pathlib import Path
 import re
@@ -673,11 +674,757 @@ try:
 
         tl.store(Y_final_bf16_ptr + offs, acc_routed.to(tl.bfloat16))
 
+    @triton.jit
+    def _triton_quantize_2bit_g64_kernel(
+        W_ptr,
+        Out_u8_ptr,
+        Out_s_fp8_ptr,
+        N_GROUPS_C: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        grp = tl.program_id(1)
+        offs16 = tl.arange(0, 16)
+        base_w = W_ptr + row * (N_GROUPS_C * 64) + grp * 64
+        w0 = tl.load(base_w + offs16 + 0).to(tl.float32)
+        w1 = tl.load(base_w + offs16 + 16).to(tl.float32)
+        w2 = tl.load(base_w + offs16 + 32).to(tl.float32)
+        w3 = tl.load(base_w + offs16 + 48).to(tl.float32)
+
+        sq_sum = tl.sum(w0 * w0 + w1 * w1 + w2 * w2 + w3 * w3, axis=0)
+        sigma = tl.sqrt(sq_sum / 64.0 + 1e-12)
+        inv_sig = 1.0 / sigma
+
+        z0 = w0 * inv_sig
+        z1 = w1 * inv_sig
+        z2 = w2 * inv_sig
+        z3 = w3 * inv_sig
+
+        c0 = (tl.where(z0 >= -0.996, 1, 0) + tl.where(z0 >= 0.0, 1, 0) + tl.where(z0 >= 0.996, 1, 0)).to(tl.uint8)
+        c1 = (tl.where(z1 >= -0.996, 1, 0) + tl.where(z1 >= 0.0, 1, 0) + tl.where(z1 >= 0.996, 1, 0)).to(tl.uint8)
+        c2 = (tl.where(z2 >= -0.996, 1, 0) + tl.where(z2 >= 0.0, 1, 0) + tl.where(z2 >= 0.996, 1, 0)).to(tl.uint8)
+        c3 = (tl.where(z3 >= -0.996, 1, 0) + tl.where(z3 >= 0.0, 1, 0) + tl.where(z3 >= 0.996, 1, 0)).to(tl.uint8)
+
+        q0 = c0.to(tl.float32) - 1.5
+        q1 = c1.to(tl.float32) - 1.5
+        q2 = c2.to(tl.float32) - 1.5
+        q3 = c3.to(tl.float32) - 1.5
+        q_sq = tl.sum(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3, axis=0)
+        packed = c0 | (c1 << 2) | (c2 << 4) | (c3 << 6)
+        s_norm = tl.minimum(tl.sqrt(sq_sum / (q_sq + 1e-12)), 448.0).to(tl.float8e4nv)
+        tl.store(Out_s_fp8_ptr + row * N_GROUPS_C + grp, s_norm)
+        tl.store(Out_u8_ptr + row * (N_GROUPS_C * 16) + grp * 16 + offs16, packed)
+
+    @triton.jit
+    def _triton_quantize_1bit_g64_kernel(
+        W_ptr,
+        Out_u8_ptr,
+        Out_s_fp8_ptr,
+        N_GROUPS_C: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        grp = tl.program_id(1)
+        offs8 = tl.arange(0, 8)
+        base_w = W_ptr + row * (N_GROUPS_C * 64) + grp * 64
+        w0 = tl.load(base_w + offs8 + 0).to(tl.float32)
+        w1 = tl.load(base_w + offs8 + 8).to(tl.float32)
+        w2 = tl.load(base_w + offs8 + 16).to(tl.float32)
+        w3 = tl.load(base_w + offs8 + 24).to(tl.float32)
+        w4 = tl.load(base_w + offs8 + 32).to(tl.float32)
+        w5 = tl.load(base_w + offs8 + 40).to(tl.float32)
+        w6 = tl.load(base_w + offs8 + 48).to(tl.float32)
+        w7 = tl.load(base_w + offs8 + 56).to(tl.float32)
+
+        sq_sum = tl.sum(
+            w0 * w0
+            + w1 * w1
+            + w2 * w2
+            + w3 * w3
+            + w4 * w4
+            + w5 * w5
+            + w6 * w6
+            + w7 * w7,
+            axis=0,
+        )
+        s_rms = tl.minimum(tl.sqrt(sq_sum * (1.0 / 64.0) + 1e-12), 448.0).to(tl.float8e4nv)
+
+        b0 = tl.where(w0 >= 0.0, 1, 0).to(tl.uint8)
+        b1 = tl.where(w1 >= 0.0, 2, 0).to(tl.uint8)
+        b2 = tl.where(w2 >= 0.0, 4, 0).to(tl.uint8)
+        b3 = tl.where(w3 >= 0.0, 8, 0).to(tl.uint8)
+        b4 = tl.where(w4 >= 0.0, 16, 0).to(tl.uint8)
+        b5 = tl.where(w5 >= 0.0, 32, 0).to(tl.uint8)
+        b6 = tl.where(w6 >= 0.0, 64, 0).to(tl.uint8)
+        b7 = tl.where(w7 >= 0.0, 128, 0).to(tl.uint8)
+        packed = b0 | b1 | b2 | b3 | b4 | b5 | b6 | b7
+
+        tl.store(Out_s_fp8_ptr + row * N_GROUPS_C + grp, s_rms)
+        tl.store(Out_u8_ptr + row * (N_GROUPS_C * 8) + grp * 8 + offs8, packed)
+
+    @triton.jit
+    def _triton_row_perm_scale_kernel(
+        In_ptr,
+        Out_ptr,
+        R_inv_ptr,
+        R_s1_ptr,
+        C_s2_ptr,
+        COLS: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        src_row = tl.load(R_inv_ptr + row).to(tl.int64)
+        r_s = tl.load(R_s1_ptr + row).to(tl.float32)
+        c_s = tl.load(C_s2_ptr + offs_c).to(tl.float32)
+        val = tl.load(In_ptr + src_row * COLS + offs_c).to(tl.float32)
+        tl.store(Out_ptr + row * COLS + offs_c, (val * (r_s * c_s)).to(tl.bfloat16))
+
+    @triton.jit
+    def _triton_col_perm_add_tail_kernel(
+        In_ptr,
+        Tail_p_ptr,
+        Tail_s_ptr,
+        Out_ptr,
+        C_inv_ptr,
+        C_s1_ptr,
+        Beta_ptr,
+        COLS: tl.constexpr,
+        TAIL_BITS: tl.constexpr,
+        HAS_TAIL: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        src_col = tl.load(C_inv_ptr + offs_c).to(tl.int64)
+        c_s = tl.load(C_s1_ptr + offs_c).to(tl.float32)
+        beta = tl.load(Beta_ptr).to(tl.float32)
+        h_val = tl.load(In_ptr + row * COLS + src_col).to(tl.float32) * (c_s * beta)
+
+        if HAS_TAIL:
+            if TAIL_BITS == 2:
+                byte_idx = offs_c >> 2
+                shift = (offs_c & 3) << 1
+                packed = tl.load(Tail_p_ptr + row * (COLS // 4) + byte_idx)
+                code = (packed >> shift) & 3
+                q_val = tl.where(
+                    code < 2,
+                    tl.where(code == 0, -1.510417, -0.452780),
+                    tl.where(code == 2, 0.452780, 1.510417),
+                )
+                s_idx = offs_c >> 5
+                t_scale = tl.load(Tail_s_ptr + row * (COLS // 32) + s_idx).to(tl.float32)
+                h_val = h_val + q_val * t_scale
+            else:
+                byte_idx = offs_c >> 3
+                shift = offs_c & 7
+                packed = tl.load(Tail_p_ptr + row * (COLS // 8) + byte_idx)
+                bit = (packed >> shift) & 1
+                q_val = tl.where(bit != 0, 1.0, -1.0)
+                s_idx = offs_c >> 6
+                t_scale = tl.load(Tail_s_ptr + row * (COLS // 64) + s_idx).to(tl.float32)
+                h_val = h_val + q_val * t_scale
+
+        tl.store(Out_ptr + row * COLS + offs_c, h_val.to(tl.bfloat16))
+
+    @triton.jit
+    def _triton_dsv41_tiered_router_kernel(
+        Logits_ptr,
+        Bias_ptr,
+        Tier_slot_map_ptr,
+        Active_slots_ptr,
+        Gates_ptr,
+        routed_scaling_factor,
+        SHARED_SLOT: tl.constexpr,
+        K_ACT: tl.constexpr,
+    ):
+        offs = tl.arange(0, 512)
+        mask = offs < 384
+        logit = tl.load(Logits_ptr + offs, mask=mask, other=-1e30).to(tl.float32)
+        sp = tl.where(logit > 20.0, logit, tl.log(1.0 + tl.exp(logit)))
+        score = tl.sqrt(sp)
+        bias = tl.load(Bias_ptr + offs, mask=mask, other=-1e30).to(tl.float32)
+        tslot_all = tl.load(Tier_slot_map_ptr + offs, mask=mask, other=-1).to(tl.int32)
+        valid_mask = mask & (tslot_all >= 0)
+        biased = tl.where(valid_mask, score + bias, -1e30)
+
+        k_offs = tl.arange(0, 8)
+        kept_vec = tl.zeros((8,), dtype=tl.float32)
+        for k in tl.static_range(K_ACT):
+            best_idx = tl.argmax(biased, axis=0)
+            w_k = tl.max(tl.where(offs == best_idx, score, 0.0), axis=0)
+            tslot = tl.load(Tier_slot_map_ptr + best_idx).to(tl.int32)
+            tl.store(Active_slots_ptr + k, tslot)
+            is_kept = tl.where(tslot >= 0, w_k, 0.0)
+            kept_vec = tl.where(k_offs == k, is_kept, kept_vec)
+            biased = tl.where(offs == best_idx, -1e30, biased)
+
+        w_kept_sum = tl.sum(kept_vec, axis=0) + 1e-20
+        gates = (kept_vec / w_kept_sum) * routed_scaling_factor
+        tl.store(Gates_ptr + k_offs, gates, mask=k_offs < K_ACT)
+        tl.store(Active_slots_ptr + K_ACT, SHARED_SLOT)
+        tl.store(Gates_ptr + K_ACT, 1.0)
+
+    @triton.jit
+    def _triton_dsv41_tiered_gu_swiglu_kernel(
+        X_ptr,
+        W4_gu_u8_ptr,
+        S4_gu_bf16_ptr,
+        W2_gu_u8_ptr,
+        S2_gu_fp8_ptr,
+        W1_gu_u8_ptr,
+        S1_gu_fp8_ptr,
+        Active_slots_ptr,
+        Gates_ptr,
+        Act_out_ptr,
+        swiglu_limit,
+        N_INTER: tl.constexpr,
+        N_BLOCKS_K4: tl.constexpr,
+        N_GROUPS_K2: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        sub_blocks_k4: tl.constexpr,
+        sub_groups_k2: tl.constexpr,
+        HAS_TIER2: tl.constexpr = False,
+        HAS_TIER3: tl.constexpr = False,
+    ):
+        pid_n = tl.program_id(0)
+        e_idx = tl.program_id(1)
+        tslot = tl.load(Active_slots_ptr + e_idx).to(tl.int64)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        if tslot < 0:
+            tl.store(Act_out_ptr + e_idx * N_INTER + offs_n, tl.zeros((BLOCK_N,), dtype=tl.bfloat16))
+            return
+
+        acc1 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        acc3 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+        if tslot < 1024 or (not HAS_TIER2 and not HAS_TIER3):
+            slot4 = tslot
+            BYTES_PER_ITER4: tl.constexpr = sub_blocks_k4 * 16
+            offs_b4 = tl.arange(0, BYTES_PER_ITER4)
+            offs_sb4 = offs_b4 // 16
+            w_stride4 = 2 * N_INTER * (N_BLOCKS_K4 * 16)
+            s_stride4 = 2 * N_INTER * N_BLOCKS_K4
+            w1_base4 = W4_gu_u8_ptr + slot4 * w_stride4 + offs_n[:, None] * (N_BLOCKS_K4 * 16)
+            w3_base4 = W4_gu_u8_ptr + slot4 * w_stride4 + (offs_n[:, None] + N_INTER) * (N_BLOCKS_K4 * 16)
+            s1_base4 = S4_gu_bf16_ptr + slot4 * s_stride4 + offs_n[:, None] * N_BLOCKS_K4
+            s3_base4 = S4_gu_bf16_ptr + slot4 * s_stride4 + (offs_n[:, None] + N_INTER) * N_BLOCKS_K4
+
+            for sb_start in range(0, N_BLOCKS_K4, sub_blocks_k4):
+                b_idx = sb_start * 16 + offs_b4
+                sb_idx = sb_start + offs_sb4
+                x_even = tl.load(X_ptr + b_idx * 2).to(tl.float32)
+                x_odd = tl.load(X_ptr + b_idx * 2 + 1).to(tl.float32)
+                w1_b = tl.load(w1_base4 + b_idx[None, :])
+                s1_f = tl.load(s1_base4 + sb_idx[None, :]).to(tl.float32)
+                v1 = (_decode_e2m1_x4(w1_b & 0x0F) * x_even[None, :] + _decode_e2m1_x4(w1_b >> 4) * x_odd[None, :]) * s1_f
+                acc1 += tl.sum(v1, axis=1)
+                w3_b = tl.load(w3_base4 + b_idx[None, :])
+                s3_f = tl.load(s3_base4 + sb_idx[None, :]).to(tl.float32)
+                v3 = (_decode_e2m1_x4(w3_b & 0x0F) * x_even[None, :] + _decode_e2m1_x4(w3_b >> 4) * x_odd[None, :]) * s3_f
+                acc3 += tl.sum(v3, axis=1)
+        elif HAS_TIER2 and (tslot < 2048 or not HAS_TIER3):
+            slot2 = tslot - 1024
+            BYTES_PER_ITER2: tl.constexpr = sub_groups_k2 * 16
+            offs_b2 = tl.arange(0, BYTES_PER_ITER2)
+            offs_sg2 = offs_b2 // 16
+            offs_in16 = offs_b2 & 15
+            w_stride2 = 2 * N_INTER * (N_GROUPS_K2 * 16)
+            s_stride2 = 2 * N_INTER * N_GROUPS_K2
+            w1_base2 = W2_gu_u8_ptr + slot2 * w_stride2 + offs_n[:, None] * (N_GROUPS_K2 * 16)
+            w3_base2 = W2_gu_u8_ptr + slot2 * w_stride2 + (offs_n[:, None] + N_INTER) * (N_GROUPS_K2 * 16)
+            s1_base2 = S2_gu_fp8_ptr + slot2 * s_stride2 + offs_n[:, None] * N_GROUPS_K2
+            s3_base2 = S2_gu_fp8_ptr + slot2 * s_stride2 + (offs_n[:, None] + N_INTER) * N_GROUPS_K2
+
+            for sg_start in range(0, N_GROUPS_K2, sub_groups_k2):
+                b_idx = sg_start * 16 + offs_b2
+                sg_idx = sg_start + offs_sg2
+                x_base_idx = sg_idx * 64 + offs_in16
+                x0 = tl.load(X_ptr + x_base_idx + 0).to(tl.float32)
+                x1 = tl.load(X_ptr + x_base_idx + 16).to(tl.float32)
+                x2 = tl.load(X_ptr + x_base_idx + 32).to(tl.float32)
+                x3 = tl.load(X_ptr + x_base_idx + 48).to(tl.float32)
+                x_sum = (x0 + x1 + x2 + x3) * 1.5
+
+                w1_b = tl.load(w1_base2 + b_idx[None, :])
+                s1_f = tl.load(s1_base2 + sg_idx[None, :]).to(tl.float32)
+                v1 = (
+                    (w1_b & 3).to(tl.float32) * x0[None, :]
+                    + ((w1_b >> 2) & 3).to(tl.float32) * x1[None, :]
+                    + ((w1_b >> 4) & 3).to(tl.float32) * x2[None, :]
+                    + (w1_b >> 6).to(tl.float32) * x3[None, :]
+                    - x_sum[None, :]
+                ) * s1_f
+                acc1 += tl.sum(v1, axis=1)
+
+                w3_b = tl.load(w3_base2 + b_idx[None, :])
+                s3_f = tl.load(s3_base2 + sg_idx[None, :]).to(tl.float32)
+                v3 = (
+                    (w3_b & 3).to(tl.float32) * x0[None, :]
+                    + ((w3_b >> 2) & 3).to(tl.float32) * x1[None, :]
+                    + ((w3_b >> 4) & 3).to(tl.float32) * x2[None, :]
+                    + (w3_b >> 6).to(tl.float32) * x3[None, :]
+                    - x_sum[None, :]
+                ) * s3_f
+                acc3 += tl.sum(v3, axis=1)
+        else:
+            slot1 = tslot - 2048
+            BYTES_PER_ITER1: tl.constexpr = sub_groups_k2 * 8
+            offs_b1 = tl.arange(0, BYTES_PER_ITER1)
+            offs_sg1 = offs_b1 // 8
+            offs_in8 = offs_b1 & 7
+            w_stride1 = 2 * N_INTER * (N_GROUPS_K2 * 8)
+            s_stride1 = 2 * N_INTER * N_GROUPS_K2
+            w1_base1 = W1_gu_u8_ptr + slot1 * w_stride1 + offs_n[:, None] * (N_GROUPS_K2 * 8)
+            w3_base1 = W1_gu_u8_ptr + slot1 * w_stride1 + (offs_n[:, None] + N_INTER) * (N_GROUPS_K2 * 8)
+            s1_base1 = S1_gu_fp8_ptr + slot1 * s_stride1 + offs_n[:, None] * N_GROUPS_K2
+            s3_base1 = S1_gu_fp8_ptr + slot1 * s_stride1 + (offs_n[:, None] + N_INTER) * N_GROUPS_K2
+
+            for sg_start in range(0, N_GROUPS_K2, sub_groups_k2):
+                b_idx = sg_start * 8 + offs_b1
+                sg_idx = sg_start + offs_sg1
+                x_base_idx = sg_idx * 64 + offs_in8
+                x0 = tl.load(X_ptr + x_base_idx + 0).to(tl.float32)
+                x1 = tl.load(X_ptr + x_base_idx + 8).to(tl.float32)
+                x2 = tl.load(X_ptr + x_base_idx + 16).to(tl.float32)
+                x3 = tl.load(X_ptr + x_base_idx + 24).to(tl.float32)
+                x4 = tl.load(X_ptr + x_base_idx + 32).to(tl.float32)
+                x5 = tl.load(X_ptr + x_base_idx + 40).to(tl.float32)
+                x6 = tl.load(X_ptr + x_base_idx + 48).to(tl.float32)
+                x7 = tl.load(X_ptr + x_base_idx + 56).to(tl.float32)
+                x_half_sum = (x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7) * 0.5
+
+                w1_b = tl.load(w1_base1 + b_idx[None, :])
+                s1_f2 = tl.load(s1_base1 + sg_idx[None, :]).to(tl.float32) * 2.0
+                v1 = (
+                    (w1_b & 1).to(tl.float32) * x0[None, :]
+                    + ((w1_b >> 1) & 1).to(tl.float32) * x1[None, :]
+                    + ((w1_b >> 2) & 1).to(tl.float32) * x2[None, :]
+                    + ((w1_b >> 3) & 1).to(tl.float32) * x3[None, :]
+                    + ((w1_b >> 4) & 1).to(tl.float32) * x4[None, :]
+                    + ((w1_b >> 5) & 1).to(tl.float32) * x5[None, :]
+                    + ((w1_b >> 6) & 1).to(tl.float32) * x6[None, :]
+                    + (w1_b >> 7).to(tl.float32) * x7[None, :]
+                    - x_half_sum[None, :]
+                ) * s1_f2
+                acc1 += tl.sum(v1, axis=1)
+
+                w3_b = tl.load(w3_base1 + b_idx[None, :])
+                s3_f2 = tl.load(s3_base1 + sg_idx[None, :]).to(tl.float32) * 2.0
+                v3 = (
+                    (w3_b & 1).to(tl.float32) * x0[None, :]
+                    + ((w3_b >> 1) & 1).to(tl.float32) * x1[None, :]
+                    + ((w3_b >> 2) & 1).to(tl.float32) * x2[None, :]
+                    + ((w3_b >> 3) & 1).to(tl.float32) * x3[None, :]
+                    + ((w3_b >> 4) & 1).to(tl.float32) * x4[None, :]
+                    + ((w3_b >> 5) & 1).to(tl.float32) * x5[None, :]
+                    + ((w3_b >> 6) & 1).to(tl.float32) * x6[None, :]
+                    + (w3_b >> 7).to(tl.float32) * x7[None, :]
+                    - x_half_sum[None, :]
+                ) * s3_f2
+                acc3 += tl.sum(v3, axis=1)
+
+        gate_scale = tl.load(Gates_ptr + e_idx).to(tl.float32)
+        g = tl.minimum(acc1, swiglu_limit)
+        u = tl.maximum(tl.minimum(acc3, swiglu_limit), -swiglu_limit)
+        act = (g * tl.sigmoid(g)) * u * gate_scale
+        tl.store(Act_out_ptr + e_idx * N_INTER + offs_n, act.to(tl.bfloat16))
+
+    @triton.jit
+    def _triton_dsv41_tiered_down_kernel(
+        Act_ptr,
+        W4_d_u8_ptr,
+        S4_d_bf16_ptr,
+        W2_d_u8_ptr,
+        S2_d_fp8_ptr,
+        W1_d_u8_ptr,
+        S1_d_fp8_ptr,
+        Active_slots_ptr,
+        Y_partial_ptr,
+        D_OUT: tl.constexpr,
+        N_BLOCKS_K4: tl.constexpr,
+        N_GROUPS_K2: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        sub_blocks_k4: tl.constexpr,
+        sub_groups_k2: tl.constexpr,
+        HAS_TIER2: tl.constexpr = False,
+        HAS_TIER3: tl.constexpr = False,
+    ):
+        pid_d = tl.program_id(0)
+        e_idx = tl.program_id(1)
+        tslot = tl.load(Active_slots_ptr + e_idx).to(tl.int64)
+        offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        if tslot < 0:
+            tl.store(Y_partial_ptr + e_idx * D_OUT + offs_d, tl.zeros((BLOCK_D,), dtype=tl.float32))
+            return
+
+        acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        act_base = Act_ptr + e_idx * (N_BLOCKS_K4 * 32)
+
+        if tslot < 1024 or (not HAS_TIER2 and not HAS_TIER3):
+            slot4 = tslot
+            BYTES_PER_ITER4: tl.constexpr = sub_blocks_k4 * 16
+            offs_b4 = tl.arange(0, BYTES_PER_ITER4)
+            offs_sb4 = offs_b4 // 16
+            w_stride4 = D_OUT * (N_BLOCKS_K4 * 16)
+            s_stride4 = D_OUT * N_BLOCKS_K4
+            wd_base4 = W4_d_u8_ptr + slot4 * w_stride4 + offs_d[:, None] * (N_BLOCKS_K4 * 16)
+            sd_base4 = S4_d_bf16_ptr + slot4 * s_stride4 + offs_d[:, None] * N_BLOCKS_K4
+
+            for sb_start in range(0, N_BLOCKS_K4, sub_blocks_k4):
+                b_idx = sb_start * 16 + offs_b4
+                sb_idx = sb_start + offs_sb4
+                a_even = tl.load(act_base + b_idx * 2).to(tl.float32)
+                a_odd = tl.load(act_base + b_idx * 2 + 1).to(tl.float32)
+                wd_b = tl.load(wd_base4 + b_idx[None, :])
+                sd_f = tl.load(sd_base4 + sb_idx[None, :]).to(tl.float32)
+                vd = (_decode_e2m1_x4(wd_b & 0x0F) * a_even[None, :] + _decode_e2m1_x4(wd_b >> 4) * a_odd[None, :]) * sd_f
+                acc += tl.sum(vd, axis=1)
+        elif HAS_TIER2 and (tslot < 2048 or not HAS_TIER3):
+            slot2 = tslot - 1024
+            BYTES_PER_ITER2: tl.constexpr = sub_groups_k2 * 16
+            offs_b2 = tl.arange(0, BYTES_PER_ITER2)
+            offs_sg2 = offs_b2 // 16
+            offs_in16 = offs_b2 & 15
+            w_stride2 = D_OUT * (N_GROUPS_K2 * 16)
+            s_stride2 = D_OUT * N_GROUPS_K2
+            wd_base2 = W2_d_u8_ptr + slot2 * w_stride2 + offs_d[:, None] * (N_GROUPS_K2 * 16)
+            sd_base2 = S2_d_fp8_ptr + slot2 * s_stride2 + offs_d[:, None] * N_GROUPS_K2
+
+            for sg_start in range(0, N_GROUPS_K2, sub_groups_k2):
+                b_idx = sg_start * 16 + offs_b2
+                sg_idx = sg_start + offs_sg2
+                a_base_idx = sg_idx * 64 + offs_in16
+                a0 = tl.load(act_base + a_base_idx + 0).to(tl.float32)
+                a1 = tl.load(act_base + a_base_idx + 16).to(tl.float32)
+                a2 = tl.load(act_base + a_base_idx + 32).to(tl.float32)
+                a3 = tl.load(act_base + a_base_idx + 48).to(tl.float32)
+                a_sum = (a0 + a1 + a2 + a3) * 1.5
+                wd_b = tl.load(wd_base2 + b_idx[None, :])
+                sd_f = tl.load(sd_base2 + sg_idx[None, :]).to(tl.float32)
+                vd = (
+                    (wd_b & 3).to(tl.float32) * a0[None, :]
+                    + ((wd_b >> 2) & 3).to(tl.float32) * a1[None, :]
+                    + ((wd_b >> 4) & 3).to(tl.float32) * a2[None, :]
+                    + (wd_b >> 6).to(tl.float32) * a3[None, :]
+                    - a_sum[None, :]
+                ) * sd_f
+                acc += tl.sum(vd, axis=1)
+        else:
+            slot1 = tslot - 2048
+            BYTES_PER_ITER1: tl.constexpr = sub_groups_k2 * 8
+            offs_b1 = tl.arange(0, BYTES_PER_ITER1)
+            offs_sg1 = offs_b1 // 8
+            offs_in8 = offs_b1 & 7
+            w_stride1 = D_OUT * (N_GROUPS_K2 * 8)
+            s_stride1 = D_OUT * N_GROUPS_K2
+            wd_base1 = W1_d_u8_ptr + slot1 * w_stride1 + offs_d[:, None] * (N_GROUPS_K2 * 8)
+            sd_base1 = S1_d_fp8_ptr + slot1 * s_stride1 + offs_d[:, None] * N_GROUPS_K2
+
+            for sg_start in range(0, N_GROUPS_K2, sub_groups_k2):
+                b_idx = sg_start * 8 + offs_b1
+                sg_idx = sg_start + offs_sg1
+                a_base_idx = sg_idx * 64 + offs_in8
+                a0 = tl.load(act_base + a_base_idx + 0).to(tl.float32)
+                a1 = tl.load(act_base + a_base_idx + 8).to(tl.float32)
+                a2 = tl.load(act_base + a_base_idx + 16).to(tl.float32)
+                a3 = tl.load(act_base + a_base_idx + 24).to(tl.float32)
+                a4 = tl.load(act_base + a_base_idx + 32).to(tl.float32)
+                a5 = tl.load(act_base + a_base_idx + 40).to(tl.float32)
+                a6 = tl.load(act_base + a_base_idx + 48).to(tl.float32)
+                a7 = tl.load(act_base + a_base_idx + 56).to(tl.float32)
+                a_half_sum = (a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7) * 0.5
+                wd_b = tl.load(wd_base1 + b_idx[None, :])
+                sd_f2 = tl.load(sd_base1 + sg_idx[None, :]).to(tl.float32) * 2.0
+                vd = (
+                    (wd_b & 1).to(tl.float32) * a0[None, :]
+                    + ((wd_b >> 1) & 1).to(tl.float32) * a1[None, :]
+                    + ((wd_b >> 2) & 1).to(tl.float32) * a2[None, :]
+                    + ((wd_b >> 3) & 1).to(tl.float32) * a3[None, :]
+                    + ((wd_b >> 4) & 1).to(tl.float32) * a4[None, :]
+                    + ((wd_b >> 5) & 1).to(tl.float32) * a5[None, :]
+                    + ((wd_b >> 6) & 1).to(tl.float32) * a6[None, :]
+                    + (wd_b >> 7).to(tl.float32) * a7[None, :]
+                    - a_half_sum[None, :]
+                ) * sd_f2
+                acc += tl.sum(vd, axis=1)
+
+        tl.store(Y_partial_ptr + e_idx * D_OUT + offs_d, acc)
+
+    _triton_moe_w2_grouped_gemm_m1_kernel = _triton_dsv41_tiered_gu_swiglu_kernel
+    _triton_moe_w2_down_gemm_m1_kernel = _triton_dsv41_tiered_down_kernel
+
+    @triton.jit
+    def _triton_dsv41_reduce_sum_bf16_kernel(
+        Y_partial_ptr,
+        Y_out_bf16_ptr,
+        N_ACT: tl.constexpr,
+        D_OUT: tl.constexpr,
+    ):
+        blk = tl.program_id(0)
+        offs = blk * 128 + tl.arange(0, 128)
+        acc = tl.zeros((128,), dtype=tl.float32)
+        for e_i in tl.static_range(N_ACT):
+            acc += tl.load(Y_partial_ptr + e_i * D_OUT + offs)
+        tl.store(Y_out_bf16_ptr + offs, acc.to(tl.bfloat16))
+
+    @triton.jit
+    def _triton_inv_rope_m1_kernel(
+        O_ptr,
+        CosSin_ptr,
+        Positions_ptr,
+        Out_ptr,
+        stride_h,
+    ):
+        head_idx = tl.program_id(0)
+        pos = tl.load(Positions_ptr).to(tl.int64)
+        cs_base = CosSin_ptr + pos * 64
+        o_base = O_ptr + head_idx * stride_h
+        out_base = Out_ptr + head_idx * 512
+
+        offs128 = tl.arange(0, 128)
+        for c in tl.static_range(3):
+            v = tl.load(o_base + c * 128 + offs128)
+            tl.store(out_base + c * 128 + offs128, v)
+        offs64 = tl.arange(0, 64)
+        v_last = tl.load(o_base + 384 + offs64)
+        tl.store(out_base + 384 + offs64, v_last)
+
+        offs32 = tl.arange(0, 32)
+        cos = tl.load(cs_base + offs32).to(tl.float32)
+        sin = tl.load(cs_base + 32 + offs32).to(tl.float32)
+        r_even = tl.load(o_base + 448 + offs32 * 2).to(tl.float32)
+        r_odd = tl.load(o_base + 448 + offs32 * 2 + 1).to(tl.float32)
+        out_e = (r_even * cos + r_odd * sin).to(tl.bfloat16)
+        out_o = (r_odd * cos - r_even * sin).to(tl.bfloat16)
+        tl.store(out_base + 448 + offs32 * 2, out_e)
+        tl.store(out_base + 448 + offs32 * 2 + 1, out_o)
+
+    @triton.jit
+    def _triton_bmm_fp4_m1_kernel(
+        X_ptr,
+        W_u8_ptr,
+        S_bf16_ptr,
+        Z_out_ptr,
+        N_OUT: tl.constexpr,
+        N_BLOCKS_K: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        sub_blocks_k: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        g_idx = tl.program_id(1)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        BYTES_PER_ITER: tl.constexpr = sub_blocks_k * 16
+        offs_b = tl.arange(0, BYTES_PER_ITER)
+        offs_sb = offs_b // 16
+
+        x_base = X_ptr + g_idx * (N_BLOCKS_K * 32)
+        row_idx = g_idx * N_OUT + offs_n
+        w_base = W_u8_ptr + row_idx[:, None] * (N_BLOCKS_K * 16)
+        s_base = S_bf16_ptr + row_idx[:, None] * N_BLOCKS_K
+
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        for sb_start in range(0, N_BLOCKS_K, sub_blocks_k):
+            b_idx = sb_start * 16 + offs_b
+            sb_idx = sb_start + offs_sb
+            x_even = tl.load(x_base + b_idx * 2).to(tl.float32)
+            x_odd = tl.load(x_base + b_idx * 2 + 1).to(tl.float32)
+            w_b = tl.load(w_base + b_idx[None, :])
+            s_f = tl.load(s_base + sb_idx[None, :]).to(tl.float32)
+            v = (_decode_e2m1_x4(w_b & 0x0F) * x_even[None, :] + _decode_e2m1_x4(w_b >> 4) * x_odd[None, :]) * s_f
+            acc += tl.sum(v, axis=1)
+
+        tl.store(Z_out_ptr + row_idx, acc.to(tl.bfloat16))
+
+    @triton.jit
+    def _triton_gemv_fp4_m1_kernel(
+        X_ptr,
+        W_u8_ptr,
+        S_bf16_ptr,
+        Y_out_ptr,
+        N_OUT: tl.constexpr,
+        N_BLOCKS_K: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        sub_blocks_k: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N_OUT
+
+        BYTES_PER_ITER: tl.constexpr = sub_blocks_k * 16
+        offs_b = tl.arange(0, BYTES_PER_ITER)
+        offs_sb = offs_b // 16
+
+        w_base = W_u8_ptr + offs_n[:, None] * (N_BLOCKS_K * 16)
+        s_base = S_bf16_ptr + offs_n[:, None] * N_BLOCKS_K
+
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        for sb_start in range(0, N_BLOCKS_K, sub_blocks_k):
+            b_idx = sb_start * 16 + offs_b
+            sb_idx = sb_start + offs_sb
+            x_even = tl.load(X_ptr + b_idx * 2).to(tl.float32)
+            x_odd = tl.load(X_ptr + b_idx * 2 + 1).to(tl.float32)
+            w_b = tl.load(w_base + b_idx[None, :], mask=mask_n[:, None], other=0)
+            s_f = tl.load(s_base + sb_idx[None, :], mask=mask_n[:, None], other=0.0).to(tl.float32)
+            v = (_decode_e2m1_x4(w_b & 0x0F) * x_even[None, :] + _decode_e2m1_x4(w_b >> 4) * x_odd[None, :]) * s_f
+            acc += tl.sum(v, axis=1)
+
+        tl.store(Y_out_ptr + offs_n, acc.to(tl.bfloat16), mask=mask_n)
+
+    @triton.jit
+    def _triton_quantize_int4_32_kernel(
+        W_ptr,
+        Out_u8_ptr,
+        Out_s_bf16_ptr,
+        N_BLOCKS_C: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        blk = tl.program_id(1)
+        base = row * (N_BLOCKS_C * 32) + blk * 32
+        offs16 = tl.arange(0, 16)
+        w_even = tl.load(W_ptr + base + offs16 * 2).to(tl.float32)
+        w_odd = tl.load(W_ptr + base + offs16 * 2 + 1).to(tl.float32)
+
+        amax = tl.maximum(tl.max(tl.abs(w_even), axis=0), tl.max(tl.abs(w_odd), axis=0))
+        best_s = tl.maximum(amax / 7.5, 1e-12)
+        best_err = 1e30
+
+        for m_step in tl.static_range(9):
+            mul = 0.80 + m_step * 0.025
+            s_cand = tl.maximum((amax * mul) / 7.5, 1e-12).to(tl.bfloat16).to(tl.float32)
+            inv_s = 1.0 / s_cand
+            c_e = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(w_even * inv_s + 7.5), 0.0), 15.0)
+            c_o = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(w_odd * inv_s + 7.5), 0.0), 15.0)
+            d_e = (c_e - 7.5) * s_cand - w_even
+            d_o = (c_o - 7.5) * s_cand - w_odd
+            err = tl.sum(d_e * d_e + d_o * d_o, axis=0)
+            if err < best_err:
+                best_err = err
+                best_s = s_cand
+
+        inv_best = 1.0 / best_s
+        q_e = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(w_even * inv_best + 7.5), 0.0), 15.0).to(tl.uint8)
+        q_o = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(w_odd * inv_best + 7.5), 0.0), 15.0).to(tl.uint8)
+        tl.store(Out_s_bf16_ptr + row * N_BLOCKS_C + blk, best_s.to(tl.bfloat16))
+        tl.store(Out_u8_ptr + row * (N_BLOCKS_C * 16) + blk * 16 + offs16, q_e | (q_o << 4))
+
+    @triton.jit
+    def _triton_bmm_int4_m1_kernel(
+        X_ptr,
+        W_u8_ptr,
+        S_bf16_ptr,
+        Z_out_ptr,
+        N_OUT: tl.constexpr,
+        N_BLOCKS_K: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        sub_blocks_k: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        g_idx = tl.program_id(1)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        BYTES_PER_ITER: tl.constexpr = sub_blocks_k * 16
+        offs_b = tl.arange(0, BYTES_PER_ITER)
+        offs_sb = offs_b // 16
+
+        x_base = X_ptr + g_idx * (N_BLOCKS_K * 32)
+        row_idx = g_idx * N_OUT + offs_n
+        w_base = W_u8_ptr + row_idx[:, None] * (N_BLOCKS_K * 16)
+        s_base = S_bf16_ptr + row_idx[:, None] * N_BLOCKS_K
+
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        for sb_start in range(0, N_BLOCKS_K, sub_blocks_k):
+            b_idx = sb_start * 16 + offs_b
+            sb_idx = sb_start + offs_sb
+            x_even = tl.load(x_base + b_idx * 2).to(tl.float32)
+            x_odd = tl.load(x_base + b_idx * 2 + 1).to(tl.float32)
+            x_sum = (x_even + x_odd) * 7.5
+            w_b = tl.load(w_base + b_idx[None, :])
+            s_f = tl.load(s_base + sb_idx[None, :]).to(tl.float32)
+            v = ((w_b & 0x0F).to(tl.float32) * x_even[None, :] + (w_b >> 4).to(tl.float32) * x_odd[None, :] - x_sum[None, :]) * s_f
+            acc += tl.sum(v, axis=1)
+
+        tl.store(Z_out_ptr + row_idx, acc.to(tl.bfloat16))
+
+    @triton.jit
+    def _triton_gemv_int4_m1_kernel(
+        X_ptr,
+        W_u8_ptr,
+        S_bf16_ptr,
+        Y_out_ptr,
+        N_OUT: tl.constexpr,
+        N_BLOCKS_K: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        sub_blocks_k: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N_OUT
+
+        BYTES_PER_ITER: tl.constexpr = sub_blocks_k * 16
+        offs_b = tl.arange(0, BYTES_PER_ITER)
+        offs_sb = offs_b // 16
+
+        w_base = W_u8_ptr + offs_n[:, None] * (N_BLOCKS_K * 16)
+        s_base = S_bf16_ptr + offs_n[:, None] * N_BLOCKS_K
+
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        for sb_start in range(0, N_BLOCKS_K, sub_blocks_k):
+            b_idx = sb_start * 16 + offs_b
+            sb_idx = sb_start + offs_sb
+            x_even = tl.load(X_ptr + b_idx * 2).to(tl.float32)
+            x_odd = tl.load(X_ptr + b_idx * 2 + 1).to(tl.float32)
+            x_sum = (x_even + x_odd) * 7.5
+            w_b = tl.load(w_base + b_idx[None, :], mask=mask_n[:, None], other=0)
+            s_f = tl.load(s_base + sb_idx[None, :], mask=mask_n[:, None], other=0.0).to(tl.float32)
+            v = ((w_b & 0x0F).to(tl.float32) * x_even[None, :] + (w_b >> 4).to(tl.float32) * x_odd[None, :] - x_sum[None, :]) * s_f
+            acc += tl.sum(v, axis=1)
+
+        tl.store(Y_out_ptr + offs_n, acc.to(tl.bfloat16), mask=mask_n)
+
+    @triton.jit
+    def _triton_gemv_mxfp8_m1_kernel(
+        X_ptr,
+        W_fp8_ptr,
+        S_u8_ptr,
+        Y_out_ptr,
+        N_OUT: tl.constexpr,
+        N_BLOCKS_K: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        sub_blocks_k: tl.constexpr,
+        SCALE_ROW_DIV: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N_OUT
+
+        ELEMS_PER_ITER: tl.constexpr = sub_blocks_k * 32
+        offs_k = tl.arange(0, ELEMS_PER_ITER)
+        offs_sb = offs_k // 32
+
+        w_base = W_fp8_ptr + offs_n[:, None] * (N_BLOCKS_K * 32)
+        s_row = offs_n // SCALE_ROW_DIV
+        s_base = S_u8_ptr + s_row[:, None] * N_BLOCKS_K
+
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        for sb_start in range(0, N_BLOCKS_K, sub_blocks_k):
+            k_idx = sb_start * 32 + offs_k
+            sb_idx = sb_start + offs_sb
+            x_val = tl.load(X_ptr + k_idx).to(tl.float32)
+            w_val = tl.load(w_base + k_idx[None, :], mask=mask_n[:, None], other=0.0).to(tl.float32)
+            s_u8 = tl.load(s_base + sb_idx[None, :], mask=mask_n[:, None], other=127).to(tl.int32)
+            s_f = (s_u8 << 23).to(tl.float32, bitcast=True)
+            acc += tl.sum((w_val * x_val[None, :]) * s_f, axis=1)
+
+        tl.store(Y_out_ptr + offs_n, acc.to(tl.bfloat16), mask=mask_n)
+
 except Exception:
     _HAS_TRITON = False
 
 from chronos_1t.models.chronos_moe_block import (
     NVFP4_LUT,
+    _EXPERT_KEY_CACHE,
     _get_nvfp4_byte_lut,
     build_hadamard_128,
     generate_expert_1d_keys,
@@ -698,9 +1445,9 @@ def _copy_via_pinned_dma(cpu_tensor: torch.Tensor, device: torch.device, key_id:
             buf = torch.empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, device="cpu", pin_memory=True)
             _PINNED_DMA_BUFS[shape_key] = buf
         except Exception:
-            return cpu_tensor.to(device, non_blocking=True)
+            return cpu_tensor.to(device, non_blocking=False)
     buf.copy_(cpu_tensor, non_blocking=False)
-    return buf.to(device, non_blocking=True)
+    return buf.to(device, non_blocking=False)
 
 
 def ue8m0_to_float32(scale_e8m0: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -969,6 +1716,9 @@ class ChronosDsv41HolographicExpertGroup(nn.Module):
         slot_dn: torch.Tensor,
         s_gu_cached: torch.Tensor | None = None,
         s_dn_cached: torch.Tensor | None = None,
+        include_tail: bool = True,
+        healer_slices: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        tail_slices: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         """Zero-temp-allocation in-place slot reconstruction (`v7.5`) with post-quantization refusal projection."""
         if s_gu_cached is None or s_dn_cached is None:
@@ -976,29 +1726,94 @@ class ChronosDsv41HolographicExpertGroup(nn.Module):
         else:
             s_gu, s_dn = s_gu_cached, s_dn_cached
 
-        u_gu_r, v_gu_r, u_dn_r, v_dn_r = self._fetch_healer_slices(local_m)
-        gu_p_m, gu_s_m, dn_p_m, dn_s_m = self._fetch_tail_slices(local_m)
+        u_gu_r, v_gu_r, u_dn_r, v_dn_r = (
+            healer_slices if healer_slices is not None else self._fetch_healer_slices(local_m)
+        )
         r_s1, _, r_inv, r_s2, c_s1, _, c_inv, c_s2 = generate_expert_1d_keys(
             4608, 5120, local_m, seed_base=101 + self.group_idx * 8, device=self.device
         )
-        h_gu = unbind_2d_permuted_hadamard(s_gu, r_s1, r_inv, r_s2, c_s1, c_inv, c_s2, self.h128)
-        if self.gu_tail_bits == 2:
-            slot_gu.copy_(unpack_2bit_lloyd_max(gu_p_m, gu_s_m, dtype=torch.bfloat16))
-        else:
-            slot_gu.copy_(unpack_1bit_rademacher(gu_p_m, gu_s_m, dtype=torch.bfloat16))
-        slot_gu.add_(h_gu * self.beta_gu[local_m])
-        slot_gu.addmm_(u_gu_r.to(torch.bfloat16), v_gu_r.to(torch.bfloat16))
-
         dr_s1, _, dr_inv, dr_s2, dc_s1, _, dc_inv, dc_s2 = generate_expert_1d_keys(
             5120, 2304, local_m, seed_base=303 + self.group_idx * 8, device=self.device
         )
-        h_dn = unbind_2d_permuted_hadamard(s_dn, dr_s1, dr_inv, dr_s2, dc_s1, dc_inv, dc_s2, self.h128)
-        if self.down_tail_bits == 2:
-            slot_dn.copy_(unpack_2bit_lloyd_max(dn_p_m, dn_s_m, dtype=torch.bfloat16))
+
+        if _HAS_TRITON and self.device.type == "cuda":
+            h = self.h128.to(torch.bfloat16)
+            if include_tail:
+                gu_p_m, gu_s_m, dn_p_m, dn_s_m = (
+                    tail_slices if tail_slices is not None else self._fetch_tail_slices(local_m)
+                )
+            else:
+                gu_p_m = gu_s_m = slot_gu
+                dn_p_m = dn_s_m = slot_dn
+
+            x1_gu = torch.matmul(h, (s_gu * r_s2.to(torch.bfloat16).unsqueeze(1)).view(36, 128, 5120)).view(4608, 5120)
+            _triton_row_perm_scale_kernel[(4608, 5120 // 256)](
+                x1_gu, slot_gu, r_inv, r_s1, c_s2, COLS=5120, BLOCK_C=256, num_warps=4
+            )
+            x2_gu = torch.matmul(slot_gu.view(4608, 40, 128), h).view(4608, 5120)
+            _triton_col_perm_add_tail_kernel[(4608, 5120 // 256)](
+                x2_gu,
+                gu_p_m,
+                gu_s_m,
+                slot_gu,
+                c_inv,
+                c_s1,
+                self.beta_gu[local_m : local_m + 1],
+                COLS=5120,
+                TAIL_BITS=self.gu_tail_bits,
+                HAS_TAIL=include_tail,
+                BLOCK_C=256,
+                num_warps=4,
+            )
+            del x1_gu, x2_gu
+            slot_gu.addmm_(u_gu_r.to(torch.bfloat16), v_gu_r.to(torch.bfloat16))
+
+            x1_dn = torch.matmul(h, (s_dn * dr_s2.to(torch.bfloat16).unsqueeze(1)).view(40, 128, 2304)).view(5120, 2304)
+            _triton_row_perm_scale_kernel[(5120, 2304 // 256)](
+                x1_dn, slot_dn, dr_inv, dr_s1, dc_s2, COLS=2304, BLOCK_C=256, num_warps=4
+            )
+            x2_dn = torch.matmul(slot_dn.view(5120, 18, 128), h).view(5120, 2304)
+            _triton_col_perm_add_tail_kernel[(5120, 2304 // 256)](
+                x2_dn,
+                dn_p_m,
+                dn_s_m,
+                slot_dn,
+                dc_inv,
+                dc_s1,
+                self.beta_down[local_m : local_m + 1],
+                COLS=2304,
+                TAIL_BITS=self.down_tail_bits,
+                HAS_TAIL=include_tail,
+                BLOCK_C=256,
+                num_warps=4,
+            )
+            del x1_dn, x2_dn
+            slot_dn.addmm_(u_dn_r.to(torch.bfloat16), v_dn_r.to(torch.bfloat16))
         else:
-            slot_dn.copy_(unpack_1bit_rademacher(dn_p_m, dn_s_m, dtype=torch.bfloat16))
-        slot_dn.add_(h_dn * self.beta_down[local_m])
-        slot_dn.addmm_(u_dn_r.to(torch.bfloat16), v_dn_r.to(torch.bfloat16))
+            h_gu = unbind_2d_permuted_hadamard(s_gu, r_s1, r_inv, r_s2, c_s1, c_inv, c_s2, self.h128)
+            if include_tail:
+                gu_p_m, gu_s_m, dn_p_m, dn_s_m = (
+                    tail_slices if tail_slices is not None else self._fetch_tail_slices(local_m)
+                )
+                if self.gu_tail_bits == 2:
+                    slot_gu.copy_(unpack_2bit_lloyd_max(gu_p_m, gu_s_m, dtype=torch.bfloat16))
+                else:
+                    slot_gu.copy_(unpack_1bit_rademacher(gu_p_m, gu_s_m, dtype=torch.bfloat16))
+                slot_gu.add_(h_gu * self.beta_gu[local_m])
+            else:
+                slot_gu.copy_(h_gu * self.beta_gu[local_m])
+            slot_gu.addmm_(u_gu_r.to(torch.bfloat16), v_gu_r.to(torch.bfloat16))
+
+            h_dn = unbind_2d_permuted_hadamard(s_dn, dr_s1, dr_inv, dr_s2, dc_s1, dc_inv, dc_s2, self.h128)
+            if include_tail:
+                if self.down_tail_bits == 2:
+                    slot_dn.copy_(unpack_2bit_lloyd_max(dn_p_m, dn_s_m, dtype=torch.bfloat16))
+                else:
+                    slot_dn.copy_(unpack_1bit_rademacher(dn_p_m, dn_s_m, dtype=torch.bfloat16))
+                slot_dn.add_(h_dn * self.beta_down[local_m])
+            else:
+                slot_dn.copy_(h_dn * self.beta_down[local_m])
+            slot_dn.addmm_(u_dn_r.to(torch.bfloat16), v_dn_r.to(torch.bfloat16))
 
         if self.r_basis is not None:
             rb = self.r_basis.to(torch.bfloat16)
@@ -1167,10 +1982,12 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         self.experts = _ChronosDummyExperts()
 
         tp = f"layers.{layer_idx}.ffn"
-        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_RANDOM"):
+        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_SEQUENTIAL"):
             try:
                 _fd_r = os.open(self.shard_path_str, os.O_RDONLY)
-                os.posix_fadvise(_fd_r, 0, 0, os.POSIX_FADV_RANDOM)
+                os.posix_fadvise(_fd_r, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+                if hasattr(os, "POSIX_FADV_WILLNEED"):
+                    os.posix_fadvise(_fd_r, 0, 0, os.POSIX_FADV_WILLNEED)
                 os.close(_fd_r)
             except OSError:
                 pass
@@ -1211,78 +2028,96 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self.r_basis = self._mmap_handle.get_tensor(f"{tp}.abliteration.r_basis").to(device=device, dtype=torch.bfloat16).contiguous()
             self.r_basis_f32 = self.r_basis.float().contiguous()
 
+        if self.r_basis is not None:
+            rb = self.r_basis.to(torch.bfloat16)
+            sh_down_tmp.addmm_(rb.T, torch.matmul(rb, sh_down_tmp), beta=1.0, alpha=-1.0)
+
         shared_h128 = build_hadamard_128(device, dtype=torch.bfloat16)
         self.groups = nn.ModuleList()
 
+        # Upgrade 2: Hybrid Direct Unshared MXFP4 Hot Experts + Chronos v7.5 Holographic Cold Experts
+        self.hot_expert_to_idx: list[int] = [-1] * 384
+        self.hot_expert_ids_list: list[int] = []
+        self.num_hot_mxfp4_experts = 0
+        self._hot_tensors: dict[str, torch.Tensor] | None = None
+        self._hot_handle: Any = None
+        self._hot_tp = f"{tp}.hot_experts."
+        self._hot_shard_cand = (
+            Path(hot_shard_path)
+            if hot_shard_path is not None
+            else Path(self.shard_path_str).with_name(
+                f"chronos-dsv41-upgrade2-hot96-layer-{layer_idx:05d}-of-00040.safetensors"
+            )
+        )
+        self._try_attach_hot_shard()
+
+        default_dec_k = str(self.top_k)
+        self.decode_top_k = max(1, min(self.top_k, int(os.environ.get("CHRONOS_DECODE_TOP_K", default_dec_k))))
+        self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "32"))
+        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "64"))
+        default_n1 = max(0, 384 - self.n4_slots - self.n2_slots)
+        self.n1_slots = int(os.environ.get("CHRONOS_TIER3_1BIT_SLOTS", str(default_n1)))
+
         if self.use_fp4_slot_cache:
-            self._keys_384 = _get_shared_384_keys(device)
-            self.group_gu_u8 = torch.empty((48, 4608, 2560), dtype=torch.uint8, device=device)
-            self.group_gu_s_fp8 = torch.empty((48, 4608, 320), dtype=torch.float8_e4m3fn, device=device)
-            self.group_d_u8 = torch.empty((48, 5120, 1152), dtype=torch.uint8, device=device)
-            self.group_d_s_fp8 = torch.empty((48, 5120, 144), dtype=torch.float8_e4m3fn, device=device)
-            self.healer_u_gu = torch.empty((384, 4608, 64), dtype=torch.float8_e4m3fn, device=device)
-            self.healer_v_gu = torch.empty((384, 64, 5120), dtype=torch.float8_e4m3fn, device=device)
-            self.healer_u_d = torch.empty((384, 5120, 64), dtype=torch.float8_e4m3fn, device=device)
-            self.healer_v_d = torch.empty((384, 64, 2304), dtype=torch.float8_e4m3fn, device=device)
-            self.cold_scale_gu_f32 = torch.empty((384,), dtype=torch.float32, device=device)
-            self.cold_scale_d_f32 = torch.empty((384,), dtype=torch.float32, device=device)
+            self._keys_384 = None
+            self.group_gu_u8 = None
+            self.group_gu_s_fp8 = None
+            self.group_d_u8 = None
+            self.group_d_s_fp8 = None
+            self.healer_u_gu = None
+            self.healer_v_gu = None
+            self.healer_u_d = None
+            self.healer_v_d = None
+            self.cold_scale_gu_f32 = None
+            self.cold_scale_d_f32 = None
 
-            for g_idx in range(48):
-                gp = f"{tp}.chronos_groups.{g_idx}."
-                if f"{gp}s_gu.weight" not in all_keys:
-                    gp = f"{tp}.chronos_groups.0."
-                e_s, e_e = g_idx * 8, (g_idx + 1) * 8
-                self.group_gu_u8[g_idx].copy_(self._mmap_handle.get_tensor(f"{gp}s_gu.weight"), non_blocking=True)
-                self.group_gu_s_fp8[g_idx].copy_(self._mmap_handle.get_tensor(f"{gp}s_gu.weight_scale"), non_blocking=True)
-                self.group_d_u8[g_idx].copy_(self._mmap_handle.get_tensor(f"{gp}s_down.weight"), non_blocking=True)
-                self.group_d_s_fp8[g_idx].copy_(self._mmap_handle.get_tensor(f"{gp}s_down.weight_scale"), non_blocking=True)
-                self.healer_u_gu[e_s:e_e].copy_(self._mmap_handle.get_tensor(f"{gp}healer.u_gu"), non_blocking=True)
-                self.healer_v_gu[e_s:e_e].copy_(self._mmap_handle.get_tensor(f"{gp}healer.v_gu"), non_blocking=True)
-                self.healer_u_d[e_s:e_e].copy_(self._mmap_handle.get_tensor(f"{gp}healer.u_down"), non_blocking=True)
-                self.healer_v_d[e_s:e_e].copy_(self._mmap_handle.get_tensor(f"{gp}healer.v_down"), non_blocking=True)
+            self.shared_slot = self.n4_slots
+            self.sh_gu_fp8 = None
+            self.sh_gu_s = None
+            self.sh_d_fp8 = None
+            self.sh_d_s = None
+            self.sh_gu = None
+            self.sh_down = None
+            self.cache_gu_buf = None
+            self.cache_d_buf = None
+            self.slot_gu = []
+            self.slot_d = []
 
-                s_gu_s2 = self._mmap_handle.get_tensor(f"{gp}s_gu.weight_scale_2")
-                b_gu = self._mmap_handle.get_tensor(f"{gp}s_gu.beta")
-                s_dn_s2 = self._mmap_handle.get_tensor(f"{gp}s_down.weight_scale_2")
-                b_dn = self._mmap_handle.get_tensor(f"{gp}s_down.beta")
-                self.cold_scale_gu_f32[e_s:e_e].copy_(
-                    (0.25 * s_gu_s2.float() * b_gu.float()).to(device, non_blocking=True)
-                )
-                self.cold_scale_d_f32[e_s:e_e].copy_(
-                    (0.25 * s_dn_s2.float() * b_dn.float()).to(device, non_blocking=True)
-                )
+            self.w4_gu_u8 = torch.empty((self.n4_slots + 1, 4608, 2560), dtype=torch.uint8, device=device)
+            self.s4_gu_bf16 = torch.empty((self.n4_slots + 1, 4608, 160), dtype=torch.bfloat16, device=device)
+            self.w4_d_u8 = torch.empty((self.n4_slots + 1, 5120, 1152), dtype=torch.uint8, device=device)
+            self.s4_d_bf16 = torch.empty((self.n4_slots + 1, 5120, 72), dtype=torch.bfloat16, device=device)
+            self.cache_gu_u8 = self.w4_gu_u8
+            self.cache_gu_s_bf16 = self.s4_gu_bf16
+            self.cache_d_u8 = self.w4_d_u8
+            self.cache_d_s_bf16 = self.s4_d_bf16
 
-                sub_t = {
-                    "s_gu.weight_scale_2": s_gu_s2,
-                    "s_gu.beta": b_gu,
-                    "s_down.weight_scale_2": s_dn_s2,
-                    "s_down.beta": b_dn,
-                    "tail.gu_bits": self._mmap_handle.get_tensor(f"{gp}tail.gu_bits") if f"{gp}tail.gu_bits" in all_keys else torch.tensor(1),
-                    "tail.down_bits": self._mmap_handle.get_tensor(f"{gp}tail.down_bits") if f"{gp}tail.down_bits" in all_keys else torch.tensor(1),
-                }
-                grp = ChronosDsv41HolographicExpertGroup(
-                    group_idx=g_idx,
-                    tensors=sub_t,
-                    device=device,
-                    offload_tail_to_cpu=offload_tail_to_cpu,
-                    mmap_zero_ram=True,
-                    mmap_handle=self._mmap_handle,
-                    mmap_prefix=gp,
-                    h128=shared_h128,
-                    r_basis=self.r_basis,
-                    swiglu_limit=swiglu_limit,
-                )
-                grp.s_gu_packed = self.group_gu_u8[g_idx]
-                grp.s_gu_scale = self.group_gu_s_fp8[g_idx]
-                grp.s_down_packed = self.group_d_u8[g_idx]
-                grp.s_down_scale = self.group_d_s_fp8[g_idx]
-                grp.u_gu = self.healer_u_gu[e_s:e_e]
-                grp.v_gu = self.healer_v_gu[e_s:e_e]
-                grp.u_down = self.healer_u_d[e_s:e_e]
-                grp.v_down = self.healer_v_d[e_s:e_e]
-                grp.mmap_zero_ram = False
-                grp.mmap_handle = None
-                self.groups.append(grp)
+            self.w2_gu_u8 = torch.empty((self.n2_slots, 4608, 1280), dtype=torch.uint8, device=device)
+            self.s2_gu_fp8 = torch.empty((self.n2_slots, 4608, 80), dtype=torch.float8_e4m3fn, device=device)
+            self.w2_d_u8 = torch.empty((self.n2_slots, 5120, 576), dtype=torch.uint8, device=device)
+            self.s2_d_fp8 = torch.empty((self.n2_slots, 5120, 36), dtype=torch.float8_e4m3fn, device=device)
+
+            self.w1_gu_u8 = torch.empty((self.n1_slots, 4608, 640), dtype=torch.uint8, device=device)
+            self.s1_gu_fp8 = torch.empty((self.n1_slots, 4608, 80), dtype=torch.float8_e4m3fn, device=device)
+            self.w1_d_u8 = torch.empty((self.n1_slots, 5120, 288), dtype=torch.uint8, device=device)
+            self.s1_d_fp8 = torch.empty((self.n1_slots, 5120, 36), dtype=torch.float8_e4m3fn, device=device)
+            self.tier_slot_map_gpu = torch.full((384,), -1, dtype=torch.int32, device=device)
+
+            _triton_quantize_mse_fp4_32_kernel[(4608, 160)](
+                sh_gu_tmp,
+                self.w4_gu_u8[self.shared_slot],
+                self.s4_gu_bf16[self.shared_slot],
+                N_BLOCKS_C=160,
+                num_warps=1,
+            )
+            _triton_quantize_mse_fp4_32_kernel[(5120, 72)](
+                sh_down_tmp,
+                self.w4_d_u8[self.shared_slot],
+                self.s4_d_bf16[self.shared_slot],
+                N_BLOCKS_C=72,
+                num_warps=1,
+            )
+            del sh_gu_tmp, sh_down_tmp, sh_w1, sh_w3
         else:
             self._keys_384 = None
             self.group_gu_u8 = None
@@ -1295,6 +2130,19 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self.healer_v_d = None
             self.cold_scale_gu_f32 = None
             self.cold_scale_d_f32 = None
+            self.w4_gu_u8 = None
+            self.s4_gu_bf16 = None
+            self.w4_d_u8 = None
+            self.s4_d_bf16 = None
+            self.w2_gu_u8 = None
+            self.s2_gu_fp8 = None
+            self.w2_d_u8 = None
+            self.s2_d_fp8 = None
+            self.w1_gu_u8 = None
+            self.s1_gu_fp8 = None
+            self.w1_d_u8 = None
+            self.s1_d_fp8 = None
+            self.tier_slot_map_gpu = None
             eager_keys = (
                 ("s_gu.weight_scale_2", "s_gu.beta", "s_down.weight_scale_2", "s_down.beta", "tail.gu_bits", "tail.down_bits")
                 if mmap_zero_ram
@@ -1332,40 +2180,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             if not mmap_zero_ram:
                 self._mmap_handle = None
 
-        self.shared_slot = self.hot_cache_size
-        default_dec_k = "4" if layer_idx in (2, 3, 38, 39) else "3"
-        self.decode_top_k = max(1, min(self.top_k, int(os.environ.get("CHRONOS_DECODE_TOP_K", default_dec_k))))
-        if self.use_fp4_slot_cache:
-            self.sh_gu_fp8 = None
-            self.sh_gu_s = None
-            self.sh_d_fp8 = None
-            self.sh_d_s = None
-            self.sh_gu = None
-            self.sh_down = None
-            self.cache_gu_buf = None
-            self.cache_d_buf = None
-            self.slot_gu = []
-            self.slot_d = []
-            self.cache_gu_u8 = torch.empty((self.hot_cache_size + 1, 4608, 2560), dtype=torch.uint8, device=device)
-            self.cache_gu_s_bf16 = torch.empty((self.hot_cache_size + 1, 4608, 160), dtype=torch.bfloat16, device=device)
-            self.cache_d_u8 = torch.empty((self.hot_cache_size + 1, 5120, 1152), dtype=torch.uint8, device=device)
-            self.cache_d_s_bf16 = torch.empty((self.hot_cache_size + 1, 5120, 72), dtype=torch.bfloat16, device=device)
-            _triton_quantize_mse_fp4_32_kernel[(4608, 160)](
-                sh_gu_tmp,
-                self.cache_gu_u8[self.shared_slot],
-                self.cache_gu_s_bf16[self.shared_slot],
-                N_BLOCKS_C=160,
-                num_warps=1,
-            )
-            _triton_quantize_mse_fp4_32_kernel[(5120, 72)](
-                sh_down_tmp,
-                self.cache_d_u8[self.shared_slot],
-                self.cache_d_s_bf16[self.shared_slot],
-                N_BLOCKS_C=72,
-                num_warps=1,
-            )
-            del sh_gu_tmp, sh_down_tmp, sh_w1, sh_w3
-        else:
+            self.shared_slot = self.hot_cache_size
             self.sh_gu_fp8 = None
             self.sh_gu_s = None
             self.sh_d_fp8 = None
@@ -1386,7 +2201,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
 
         self.expert_to_slot: list[int] = [-1] * 384
         self.expert_to_slot_gpu = torch.full((384,), -1, dtype=torch.int32, device=device)
-        self.slot_to_expert: list[int] = [-1] * self.hot_cache_size
+        self.slot_to_expert: list[int] = [-1] * (self.n4_slots if self.use_fp4_slot_cache else self.hot_cache_size)
         self.ring_cursor = 0
         self.cache_hits = 0
         self.cache_misses = 0
@@ -1398,95 +2213,281 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         self._act_inter_buf = torch.empty((self.top_k + 1, 2304), dtype=torch.bfloat16, device=device)
         self._y_partial_buf = torch.empty((self.top_k + 1, 5120), dtype=torch.float32, device=device)
         if self.use_fp4_slot_cache:
-            self._x_hrr_buf = torch.empty((self.top_k, 5120), dtype=torch.bfloat16, device=device)
-            self._h_gu_mid_buf = torch.empty((self.top_k, 64), dtype=torch.float32, device=device)
-            self._z_hrr_buf = torch.empty((self.top_k, 4608), dtype=torch.bfloat16, device=device)
-            self._z_gu_hlr_buf = torch.empty((self.top_k, 4608), dtype=torch.bfloat16, device=device)
-            self._act_hrr_buf = torch.empty((self.top_k, 2304), dtype=torch.bfloat16, device=device)
-            self._h_d_mid_buf = torch.empty((self.top_k, 64), dtype=torch.float32, device=device)
-            self._y_hrr_buf = torch.empty((self.top_k, 5120), dtype=torch.bfloat16, device=device)
-            self._y_routed_buf = torch.empty((1, 5120), dtype=torch.float32, device=device)
             self._y_final_buf = torch.empty((1, 5120), dtype=torch.bfloat16, device=device)
-
-        # Upgrade 2: Hybrid Direct Unshared MXFP4 Hot Experts + Chronos v7.5 Holographic Cold Experts
-        self.hot_expert_to_idx: list[int] = [-1] * 384
-        self.hot_expert_ids_list: list[int] = []
-        self.num_hot_mxfp4_experts = 0
-        self._hot_tensors: dict[str, torch.Tensor] | None = None
-        self._hot_handle: Any = None
-        self._hot_tp = f"{tp}.hot_experts."
-        self._hot_shard_cand = (
-            Path(hot_shard_path)
-            if hot_shard_path is not None
-            else Path(self.shard_path_str).with_name(
-                f"chronos-dsv41-upgrade2-hot96-layer-{layer_idx:05d}-of-00040.safetensors"
-            )
-        )
-        self._try_attach_hot_shard()
 
         self.pinned_slots = 0
         with torch.no_grad():
-            if self.use_fp4_slot_cache and self.num_hot_mxfp4_experts > 0:
-                n_pin = min(self.hot_cache_size, self.num_hot_mxfp4_experts)
-                if self._hot_handle is not None:
-                    w1_w_b = self._hot_handle.get_slice(f"{self._hot_tp}w1.weight")[:n_pin].to(self.device, non_blocking=True)
-                    w1_s_b = self._hot_handle.get_slice(f"{self._hot_tp}w1.scale")[:n_pin].to(self.device, non_blocking=True)
-                    w3_w_b = self._hot_handle.get_slice(f"{self._hot_tp}w3.weight")[:n_pin].to(self.device, non_blocking=True)
-                    w3_s_b = self._hot_handle.get_slice(f"{self._hot_tp}w3.scale")[:n_pin].to(self.device, non_blocking=True)
-                    w2_w_b = self._hot_handle.get_slice(f"{self._hot_tp}w2.weight")[:n_pin].to(self.device, non_blocking=True)
-                    w2_s_b = self._hot_handle.get_slice(f"{self._hot_tp}w2.scale")[:n_pin].to(self.device, non_blocking=True)
-                    self.cache_gu_u8[:n_pin, :2304].copy_(w1_w_b.view(torch.uint8))
-                    self.cache_gu_u8[:n_pin, 2304:].copy_(w3_w_b.view(torch.uint8))
-                    self.cache_d_u8[:n_pin].copy_(w2_w_b.view(torch.uint8))
-                    self.cache_gu_s_bf16[:n_pin, :2304].copy_(
+            if self.use_fp4_slot_cache:
+                gen_mc = torch.Generator(device=device).manual_seed(42 + layer_idx)
+                x_mc = F.normalize(
+                    torch.randn((2048, 5120), generator=gen_mc, device=device, dtype=torch.bfloat16), dim=-1
+                )
+                logits_mc = F.linear(x_mc, self.router_w).float()
+                scores_mc = F.softplus(logits_mc).sqrt() + self.e_score_bias.unsqueeze(0)
+                _, top6_mc = torch.topk(scores_mc, k=6, dim=-1)
+                freq_mc = torch.bincount(top6_mc.view(-1), minlength=384).float()
+                prior_mc = (freq_mc + scores_mc.mean(dim=0)).cpu().tolist()
+                del x_mc, logits_mc, scores_mc, top6_mc, freq_mc
+
+                hot_set = set(self.hot_expert_ids_list)
+                cold_by_grp: dict[int, list[int]] = {}
+                for eid in range(384):
+                    if eid not in hot_set:
+                        cold_by_grp.setdefault(eid // 8, []).append(eid)
+                for g_eids in cold_by_grp.values():
+                    g_eids.sort(key=lambda e: prior_mc[e], reverse=True)
+                ranked_grps = sorted(
+                    cold_by_grp.keys(),
+                    key=lambda g: max(prior_mc[e] for e in cold_by_grp[g]),
+                    reverse=True,
+                )
+                cold_ranked = [e for g in ranked_grps for e in cold_by_grp[g]]
+                ranked_eids = list(self.hot_expert_ids_list) + cold_ranked
+                tier1_eids = ranked_eids[: self.n4_slots]
+                tier2_eids = ranked_eids[self.n4_slots : self.n4_slots + self.n2_slots]
+                tier3_eids = ranked_eids[
+                    self.n4_slots + self.n2_slots : self.n4_slots + self.n2_slots + self.n1_slots
+                ]
+
+                needed_grps = {eid // 8 for eid in tier1_eids if self.hot_expert_to_idx[eid] < 0}
+                for eid in tier2_eids:
+                    if self.hot_expert_to_idx[eid] < 0:
+                        needed_grps.add(eid // 8)
+                for eid in tier3_eids:
+                    if self.hot_expert_to_idx[eid] < 0:
+                        needed_grps.add(eid // 8)
+                grp_map: dict[int, ChronosDsv41HolographicExpertGroup] = {}
+                for g_idx in sorted(needed_grps):
+                    gp = f"{tp}.chronos_groups.{g_idx}."
+                    if f"{gp}s_gu.weight" not in all_keys:
+                        gp = f"{tp}.chronos_groups.0."
+                    sub_t = {
+                        "s_gu.weight_scale_2": self._mmap_handle.get_tensor(f"{gp}s_gu.weight_scale_2"),
+                        "s_gu.beta": self._mmap_handle.get_tensor(f"{gp}s_gu.beta"),
+                        "s_down.weight_scale_2": self._mmap_handle.get_tensor(f"{gp}s_down.weight_scale_2"),
+                        "s_down.beta": self._mmap_handle.get_tensor(f"{gp}s_down.beta"),
+                        "tail.gu_bits": self._mmap_handle.get_tensor(f"{gp}tail.gu_bits") if f"{gp}tail.gu_bits" in all_keys else torch.tensor(1),
+                        "tail.down_bits": self._mmap_handle.get_tensor(f"{gp}tail.down_bits") if f"{gp}tail.down_bits" in all_keys else torch.tensor(1),
+                    }
+                    grp_map[g_idx] = ChronosDsv41HolographicExpertGroup(
+                        group_idx=g_idx,
+                        tensors=sub_t,
+                        device=device,
+                        offload_tail_to_cpu=True,
+                        mmap_zero_ram=True,
+                        mmap_handle=self._mmap_handle,
+                        mmap_prefix=gp,
+                        h128=shared_h128,
+                        r_basis=self.r_basis,
+                        swiglu_limit=swiglu_limit,
+                    )
+
+                tier_map_cpu = [-1] * 384
+                for s4, eid in enumerate(tier1_eids):
+                    tier_map_cpu[eid] = s4
+                    self.expert_to_slot[eid] = s4
+                    self.slot_to_expert[s4] = eid
+                for s2, eid in enumerate(tier2_eids):
+                    tier_map_cpu[eid] = 1024 + s2
+                for s1, eid in enumerate(tier3_eids):
+                    tier_map_cpu[eid] = 2048 + s1
+                self.tier_slot_map_gpu.copy_(torch.tensor(tier_map_cpu, dtype=torch.int32, device=device))
+                self.expert_to_slot_gpu.copy_(self.tier_slot_map_gpu)
+
+                n_hot_t1 = min(len(tier1_eids), self.num_hot_mxfp4_experts)
+                if n_hot_t1 > 0 and self._hot_handle is not None:
+                    self.w4_gu_u8[:n_hot_t1, :2304].copy_(
+                        _copy_via_pinned_dma(
+                            self._hot_handle.get_slice(f"{self._hot_tp}w1.weight")[:n_hot_t1].view(torch.uint8),
+                            device,
+                            101,
+                        ),
+                        non_blocking=True,
+                    )
+                    self.w4_gu_u8[:n_hot_t1, 2304:].copy_(
+                        _copy_via_pinned_dma(
+                            self._hot_handle.get_slice(f"{self._hot_tp}w3.weight")[:n_hot_t1].view(torch.uint8),
+                            device,
+                            102,
+                        ),
+                        non_blocking=True,
+                    )
+                    self.w4_d_u8[:n_hot_t1].copy_(
+                        _copy_via_pinned_dma(
+                            self._hot_handle.get_slice(f"{self._hot_tp}w2.weight")[:n_hot_t1].view(torch.uint8),
+                            device,
+                            103,
+                        ),
+                        non_blocking=True,
+                    )
+                    w1_s_b = _copy_via_pinned_dma(
+                        self._hot_handle.get_slice(f"{self._hot_tp}w1.scale")[:n_hot_t1], device, 104
+                    )
+                    w3_s_b = _copy_via_pinned_dma(
+                        self._hot_handle.get_slice(f"{self._hot_tp}w3.scale")[:n_hot_t1], device, 105
+                    )
+                    w2_s_b = _copy_via_pinned_dma(
+                        self._hot_handle.get_slice(f"{self._hot_tp}w2.scale")[:n_hot_t1], device, 106
+                    )
+                    self.s4_gu_bf16[:n_hot_t1, :2304].copy_(
                         ((w1_s_b.view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
                     )
-                    self.cache_gu_s_bf16[:n_pin, 2304:].copy_(
+                    self.s4_gu_bf16[:n_hot_t1, 2304:].copy_(
                         ((w3_s_b.view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
                     )
-                    self.cache_d_s_bf16[:n_pin].copy_(
+                    self.s4_d_bf16[:n_hot_t1].copy_(
                         ((w2_s_b.view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
                     )
-                    del w1_w_b, w1_s_b, w3_w_b, w3_s_b, w2_w_b, w2_s_b
-                    for slot_i in range(n_pin):
-                        eid = int(self.hot_expert_ids_list[slot_i])
-                        self.expert_to_slot[eid] = slot_i
-                        self.expert_to_slot_gpu[eid] = slot_i
-                        self.slot_to_expert[slot_i] = eid
-                else:
-                    for slot_i in range(n_pin):
-                        eid = int(self.hot_expert_ids_list[slot_i])
-                        h_idx = self.hot_expert_to_idx[eid]
-                        self._load_hot_mxfp4_into_fp4_slot(h_idx, slot_i)
-                        self.expert_to_slot[eid] = slot_i
-                        self.expert_to_slot_gpu[eid] = slot_i
-                        self.slot_to_expert[slot_i] = eid
-                self.pinned_slots = n_pin
-                self.ring_cursor = 0
-            else:
-                rw_f = self.router_w.float()
-                _, _, vh_rt = torch.linalg.svd(rw_f, full_matrices=False)
-                u_ctx = vh_rt[:32, :].T
-                prior_scores = torch.linalg.norm(rw_f @ u_ctx, dim=-1) + self.e_score_bias
-                n_pin = self.hot_cache_size if self.use_fp4_slot_cache else min(8, max(0, self.hot_cache_size - self.top_k))
-                _, top_hub_ids = torch.topk(prior_scores, k=n_pin)
-                for slot_i, eid in enumerate(top_hub_ids.tolist()):
-                    if self.use_fp4_slot_cache:
-                        g_idx = int(eid) // 8
-                        local_m = int(eid) % 8
-                        self.groups[g_idx].mmap_zero_ram = True
-                        self.groups[g_idx].mmap_handle = self._mmap_handle
-                    self._ensure_expert_slot(int(eid))
-                    if self.use_fp4_slot_cache:
-                        self.groups[g_idx].mmap_zero_ram = False
-                        self.groups[g_idx].mmap_handle = None
-                self.pinned_slots = n_pin
-                if self.ring_cursor < self.pinned_slots:
-                    self.ring_cursor = self.pinned_slots % self.hot_cache_size
+                    del w1_s_b, w3_s_b, w2_s_b
 
-            if self.use_fp4_slot_cache:
+                hot_sub_entries = [
+                    (2, s2, eid) for s2, eid in enumerate(tier2_eids) if self.hot_expert_to_idx[eid] >= 0
+                ] + [
+                    (3, s1, eid) for s1, eid in enumerate(tier3_eids) if self.hot_expert_to_idx[eid] >= 0
+                ]
+                cold_all_by_group: dict[int, list[tuple[int, int, int]]] = {}
+                for s4 in range(n_hot_t1, len(tier1_eids)):
+                    eid = tier1_eids[s4]
+                    cold_all_by_group.setdefault(eid // 8, []).append((1, s4, eid))
+                for s2, eid in enumerate(tier2_eids):
+                    if self.hot_expert_to_idx[eid] < 0:
+                        cold_all_by_group.setdefault(eid // 8, []).append((2, s2, eid))
+                for s1, eid in enumerate(tier3_eids):
+                    if self.hot_expert_to_idx[eid] < 0:
+                        cold_all_by_group.setdefault(eid // 8, []).append((3, s1, eid))
+
+                if hot_sub_entries or cold_all_by_group:
+                    scr_gu, scr_d = _get_shared_bf16_scratch(device)
+                else:
+                    scr_gu, scr_d = None, None
+
+                if hot_sub_entries and self._hot_handle is not None:
+                    h_start = self.hot_expert_to_idx[hot_sub_entries[0][2]]
+                    h_end = self.hot_expert_to_idx[hot_sub_entries[-1][2]] + 1
+                    w1_w_h2_cpu = self._hot_handle.get_slice(f"{self._hot_tp}w1.weight")[h_start:h_end]
+                    w3_w_h2_cpu = self._hot_handle.get_slice(f"{self._hot_tp}w3.weight")[h_start:h_end]
+                    w2_w_h2_cpu = self._hot_handle.get_slice(f"{self._hot_tp}w2.weight")[h_start:h_end]
+                    w1_s_h2 = _copy_via_pinned_dma(
+                        self._hot_handle.get_slice(f"{self._hot_tp}w1.scale")[h_start:h_end], device, 107
+                    )
+                    w3_s_h2 = _copy_via_pinned_dma(
+                        self._hot_handle.get_slice(f"{self._hot_tp}w3.scale")[h_start:h_end], device, 108
+                    )
+                    w2_s_h2 = _copy_via_pinned_dma(
+                        self._hot_handle.get_slice(f"{self._hot_tp}w2.scale")[h_start:h_end], device, 109
+                    )
+                    tmp_u8_gu = torch.empty((4608, 2560), dtype=torch.uint8, device=device)
+                    tmp_s_gu = torch.empty((4608, 160), dtype=torch.bfloat16, device=device)
+                    tmp_u8_d = torch.empty((5120, 1152), dtype=torch.uint8, device=device)
+                    tmp_s_d = torch.empty((5120, 72), dtype=torch.bfloat16, device=device)
+                    for tier_id, slot_i, eid in hot_sub_entries:
+                        rel_h = self.hot_expert_to_idx[eid] - h_start
+                        tmp_u8_gu[:2304].copy_(
+                            _copy_via_pinned_dma(w1_w_h2_cpu[rel_h].view(torch.uint8), device, 110),
+                            non_blocking=True,
+                        )
+                        tmp_u8_gu[2304:].copy_(
+                            _copy_via_pinned_dma(w3_w_h2_cpu[rel_h].view(torch.uint8), device, 111),
+                            non_blocking=True,
+                        )
+                        tmp_u8_d.copy_(
+                            _copy_via_pinned_dma(w2_w_h2_cpu[rel_h].view(torch.uint8), device, 112),
+                            non_blocking=True,
+                        )
+                        tmp_s_gu[:2304].copy_(
+                            ((w1_s_h2[rel_h].view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
+                        )
+                        tmp_s_gu[2304:].copy_(
+                            ((w3_s_h2[rel_h].view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
+                        )
+                        tmp_s_d.copy_(
+                            ((w2_s_h2[rel_h].view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
+                        )
+                        _dequantize_fp4_bf16scale_into(tmp_u8_gu, tmp_s_gu, scr_gu)
+                        _dequantize_fp4_bf16scale_into(tmp_u8_d, tmp_s_d, scr_d)
+                        if tier_id == 2:
+                            _triton_quantize_2bit_g64_kernel[(4608, 80)](
+                                scr_gu, self.w2_gu_u8[slot_i], self.s2_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
+                            )
+                            _triton_quantize_2bit_g64_kernel[(5120, 36)](
+                                scr_d, self.w2_d_u8[slot_i], self.s2_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
+                            )
+                        else:
+                            _triton_quantize_1bit_g64_kernel[(4608, 80)](
+                                scr_gu, self.w1_gu_u8[slot_i], self.s1_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
+                            )
+                            _triton_quantize_1bit_g64_kernel[(5120, 36)](
+                                scr_d, self.w1_d_u8[slot_i], self.s1_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
+                            )
+                    del w1_w_h2_cpu, w3_w_h2_cpu, w2_w_h2_cpu, w1_s_h2, w3_s_h2, w2_s_h2, tmp_u8_gu, tmp_s_gu, tmp_u8_d, tmp_s_d
+
+                for g_idx, entries in sorted(cold_all_by_group.items()):
+                    grp = grp_map[g_idx]
+                    gp = grp.mmap_prefix
+                    s_gu_p = _copy_via_pinned_dma(self._mmap_handle.get_tensor(f"{gp}s_gu.weight"), device, 201)
+                    s_gu_s = _copy_via_pinned_dma(self._mmap_handle.get_tensor(f"{gp}s_gu.weight_scale"), device, 202)
+                    s_dn_p = _copy_via_pinned_dma(self._mmap_handle.get_tensor(f"{gp}s_down.weight"), device, 203)
+                    s_dn_s = _copy_via_pinned_dma(self._mmap_handle.get_tensor(f"{gp}s_down.weight_scale"), device, 204)
+                    u_gu_g = _copy_via_pinned_dma(self._mmap_handle.get_tensor(f"{gp}healer.u_gu"), device, 205)
+                    v_gu_g = _copy_via_pinned_dma(self._mmap_handle.get_tensor(f"{gp}healer.v_gu"), device, 206)
+                    u_dn_g = _copy_via_pinned_dma(self._mmap_handle.get_tensor(f"{gp}healer.u_down"), device, 207)
+                    v_dn_g = _copy_via_pinned_dma(self._mmap_handle.get_tensor(f"{gp}healer.v_down"), device, 208)
+                    gu_p_g = _copy_via_pinned_dma(self._mmap_handle.get_tensor(f"{gp}tail.gu_packed"), device, 209)
+                    gu_s_g = _copy_via_pinned_dma(self._mmap_handle.get_tensor(f"{gp}tail.gu_scale"), device, 210)
+                    dn_p_g = _copy_via_pinned_dma(self._mmap_handle.get_tensor(f"{gp}tail.down_packed"), device, 211)
+                    dn_s_g = _copy_via_pinned_dma(self._mmap_handle.get_tensor(f"{gp}tail.down_scale"), device, 212)
+                    s_gu_c = unpack_nvfp4(s_gu_p, s_gu_s, grp.s_gu_scale2, dtype=torch.bfloat16)
+                    s_dn_c = unpack_nvfp4(s_dn_p, s_dn_s, grp.s_down_scale2, dtype=torch.bfloat16)
+                    del s_gu_p, s_gu_s, s_dn_p, s_dn_s
+                    for tier_id, slot_i, eid in entries:
+                        m_loc = eid % 8
+                        grp.reconstruct_expert_into_slot(
+                            m_loc,
+                            scr_gu,
+                            scr_d,
+                            s_gu_cached=s_gu_c,
+                            s_dn_cached=s_dn_c,
+                            include_tail=True,
+                            healer_slices=(u_gu_g[m_loc], v_gu_g[m_loc], u_dn_g[m_loc], v_dn_g[m_loc]),
+                            tail_slices=(gu_p_g[m_loc], gu_s_g[m_loc], dn_p_g[m_loc], dn_s_g[m_loc]),
+                        )
+                        if tier_id == 1:
+                            _triton_quantize_mse_fp4_32_kernel[(4608, 160)](
+                                scr_gu, self.w4_gu_u8[slot_i], self.s4_gu_bf16[slot_i], N_BLOCKS_C=160, num_warps=1
+                            )
+                            _triton_quantize_mse_fp4_32_kernel[(5120, 72)](
+                                scr_d, self.w4_d_u8[slot_i], self.s4_d_bf16[slot_i], N_BLOCKS_C=72, num_warps=1
+                            )
+                        elif tier_id == 2:
+                            _triton_quantize_2bit_g64_kernel[(4608, 80)](
+                                scr_gu, self.w2_gu_u8[slot_i], self.s2_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
+                            )
+                            _triton_quantize_2bit_g64_kernel[(5120, 36)](
+                                scr_d, self.w2_d_u8[slot_i], self.s2_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
+                            )
+                        else:
+                            _triton_quantize_1bit_g64_kernel[(4608, 80)](
+                                scr_gu, self.w1_gu_u8[slot_i], self.s1_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
+                            )
+                            _triton_quantize_1bit_g64_kernel[(5120, 36)](
+                                scr_d, self.w1_d_u8[slot_i], self.s1_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
+                            )
+                    del s_gu_c, s_dn_c, u_gu_g, v_gu_g, u_dn_g, v_dn_g, gu_p_g, gu_s_g, dn_p_g, dn_s_g
+
+                del grp_map
+                self.pinned_slots = self.n4_slots
+                self.groups = nn.ModuleList()
                 self._mmap_handle = None
                 self._hot_handle = None
+                self._hot_tensors = None
+                if layer_idx == 39:
+                    _EXPERT_KEY_CACHE.clear()
+                    _PINNED_DMA_BUFS.clear()
+                    _SHARED_SCRATCH_GU_BF16.clear()
+                    _SHARED_SCRATCH_D_BF16.clear()
+                gc.collect()
+                if layer_idx % 2 == 1 or layer_idx == 39:
+                    torch.cuda.empty_cache()
                 if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
                     for fpath in (self.shard_path_str, str(self._hot_shard_cand)):
                         try:
@@ -1496,6 +2497,18 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                                 os.close(fd)
                         except OSError:
                             pass
+            else:
+                rw_f = self.router_w.float()
+                _, _, vh_rt = torch.linalg.svd(rw_f, full_matrices=False)
+                u_ctx = vh_rt[:32, :].T
+                prior_scores = torch.linalg.norm(rw_f @ u_ctx, dim=-1) + self.e_score_bias
+                n_pin = min(8, max(0, self.hot_cache_size - self.top_k))
+                _, top_hub_ids = torch.topk(prior_scores, k=n_pin)
+                for slot_i, eid in enumerate(top_hub_ids.tolist()):
+                    self._ensure_expert_slot(int(eid))
+                self.pinned_slots = n_pin
+                if self.ring_cursor < self.pinned_slots:
+                    self.ring_cursor = self.pinned_slots % self.hot_cache_size
 
             if layer_idx == 2 and self.use_fp4_slot_cache and _HAS_TRITON and self.device.type == "cuda":
                 _ = self.forward(torch.zeros((1, 5120), dtype=torch.bfloat16, device=self.device))
@@ -1516,10 +2529,12 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         if not self._hot_shard_cand.exists():
             return False
         try:
-            if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_RANDOM"):
+            if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_SEQUENTIAL"):
                 try:
                     fd_h = os.open(str(self._hot_shard_cand), os.O_RDONLY)
-                    os.posix_fadvise(fd_h, 0, 0, os.POSIX_FADV_RANDOM)
+                    os.posix_fadvise(fd_h, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+                    if hasattr(os, "POSIX_FADV_WILLNEED"):
+                        os.posix_fadvise(fd_h, 0, 0, os.POSIX_FADV_WILLNEED)
                     os.close(fd_h)
                 except OSError:
                     pass
@@ -1704,150 +2719,156 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         if n_toks == 0:
             return hidden_states
 
-        # Zero-sync 100% GPU-Resident Fused Triton Decode Path for n_toks == 1
-        if n_toks == 1 and self.use_fp4_slot_cache and _HAS_TRITON and x.is_cuda:
+        # Zero-sync 100% GPU-Resident Fused Tiered (4-bit MXFP4 + 2-bit Group-64 + 1-bit Group-64) Triton Path
+        if self.use_fp4_slot_cache and _HAS_TRITON and x.is_cuda:
+            if image_mask is None and input_ids is not None:
+                if input_ids.dtype == torch.bool:
+                    image_mask = input_ids
+                elif self.bias_vl is not None:
+                    image_mask = (input_ids >= 129264) & (input_ids < 129269)
+
             raw_logits = F.linear(x, self.router_w)
-            bias_vec = self.e_score_bias
-            if image_mask is not None and self.bias_vl is not None and image_mask.numel() == 1:
-                bias_vec = torch.where(image_mask.view(1), self.bias_vl, self.e_score_bias)
+            has_t2 = self.n2_slots > 0
+            has_t3 = self.n1_slots > 0
+            out_y = torch.empty_like(x)
+            if n_toks == 1:
+                bias_vec = self.e_score_bias
+                if image_mask is not None and self.bias_vl is not None and image_mask.numel() == 1:
+                    bias_vec = torch.where(image_mask.view(1), self.bias_vl, self.e_score_bias)
+                k_act = self.decode_top_k
+                n_active = k_act + 1
+                _triton_dsv41_tiered_router_kernel[(1,)](
+                    raw_logits,
+                    bias_vec,
+                    self.tier_slot_map_gpu,
+                    self._active_slots_buf,
+                    self._active_gates_buf,
+                    float(self.routed_scaling_factor),
+                    SHARED_SLOT=self.shared_slot,
+                    K_ACT=k_act,
+                    num_warps=4,
+                )
+                _triton_dsv41_tiered_gu_swiglu_kernel[(2304 // 8, n_active)](
+                    x,
+                    self.w4_gu_u8,
+                    self.s4_gu_bf16,
+                    self.w2_gu_u8,
+                    self.s2_gu_fp8,
+                    self.w1_gu_u8,
+                    self.s1_gu_fp8,
+                    self._active_slots_buf,
+                    self._active_gates_buf,
+                    self._act_inter_buf,
+                    float(self.swiglu_limit),
+                    N_INTER=2304,
+                    N_BLOCKS_K4=160,
+                    N_GROUPS_K2=80,
+                    BLOCK_N=8,
+                    sub_blocks_k4=32,
+                    sub_groups_k2=16,
+                    HAS_TIER2=has_t2,
+                    HAS_TIER3=has_t3,
+                    num_warps=8,
+                )
+                _triton_dsv41_tiered_down_kernel[(5120 // 8, n_active)](
+                    self._act_inter_buf,
+                    self.w4_d_u8,
+                    self.s4_d_bf16,
+                    self.w2_d_u8,
+                    self.s2_d_fp8,
+                    self.w1_d_u8,
+                    self.s1_d_fp8,
+                    self._active_slots_buf,
+                    self._y_partial_buf,
+                    D_OUT=5120,
+                    N_BLOCKS_K4=72,
+                    N_GROUPS_K2=36,
+                    BLOCK_D=8,
+                    sub_blocks_k4=8,
+                    sub_groups_k2=4,
+                    HAS_TIER2=has_t2,
+                    HAS_TIER3=has_t3,
+                    num_warps=8,
+                )
+                _triton_dsv41_reduce_sum_bf16_kernel[(40,)](
+                    self._y_partial_buf,
+                    out_y[0],
+                    N_ACT=n_active,
+                    D_OUT=5120,
+                    num_warps=2,
+                )
+                out_y_v = out_y.view(orig_shape)
+                return out_y_v if orig_dtype == torch.bfloat16 else out_y_v.to(orig_dtype)
 
-            k_act = self.decode_top_k
-            _triton_dsv41_router_top6_kernel[(1,)](
-                raw_logits,
-                bias_vec,
-                self._top_ids_buf,
-                self._active_gates_buf,
-                float(self.routed_scaling_factor),
-                K_ACT=k_act,
-                num_warps=4,
-            )
-
-            keys = self._keys_384
-            assert keys is not None
+            k_act = self.decode_top_k if n_toks <= 4 else self.top_k
             n_active = k_act + 1
-
-            _triton_dsv41_fused_pre_unbind_healer_v_kernel[(44, k_act)](
-                x,
-                self.healer_v_gu,
-                self._top_ids_buf,
-                self.expert_to_slot_gpu,
-                keys["gu_c_perm"],
-                keys["gu_c_s1_perm"],
-                keys["gu_c_s2"],
-                self._x_hrr_buf,
-                self._h_gu_mid_buf,
-                D_IN=5120,
-                N_UNBIND_BLKS=40,
-                X_STRIDE_E=0,
-                BLOCK_K=256,
-                num_warps=4,
-            )
-            _triton_dsv41_resident_gu_kernel[(2304 // 8, n_active)](
-                x,
-                self._x_hrr_buf,
-                self.cache_gu_u8,
-                self.cache_gu_s_bf16,
-                self.group_gu_u8,
-                self.group_gu_s_fp8,
-                self.cold_scale_gu_f32,
-                keys["gu_r_s2"],
-                self.healer_u_gu,
-                self._h_gu_mid_buf,
-                self._top_ids_buf,
-                self.expert_to_slot_gpu,
-                self._active_gates_buf,
-                self._z_hrr_buf,
-                self._z_gu_hlr_buf,
-                self._act_inter_buf,
-                float(self.swiglu_limit),
-                TOP_K=k_act,
-                SHARED_SLOT=self.shared_slot,
-                N_INTER=2304,
-                N_BLOCKS_K=160,
-                BLOCK_N=8,
-                sub_blocks_k=32,
-                num_warps=8,
-            )
-            _triton_dsv41_fwht_post_kernel[(36, k_act)](
-                self._z_hrr_buf,
-                self._top_ids_buf,
-                self.expert_to_slot_gpu,
-                D_OUT=4608,
-                num_warps=2,
-            )
-            _triton_dsv41_cold_swiglu_kernel[(18, k_act)](
-                self._z_hrr_buf,
-                self._z_gu_hlr_buf,
-                self._top_ids_buf,
-                self.expert_to_slot_gpu,
-                self._active_gates_buf,
-                keys["gu_r_inv"],
-                keys["gu_r_s1"],
-                self._act_inter_buf,
-                float(self.swiglu_limit),
-                N_INTER=2304,
-                num_warps=2,
-            )
-            _triton_dsv41_fused_pre_unbind_healer_v_kernel[(22, k_act)](
-                self._act_inter_buf,
-                self.healer_v_d,
-                self._top_ids_buf,
-                self.expert_to_slot_gpu,
-                keys["dn_c_perm"],
-                keys["dn_c_s1_perm"],
-                keys["dn_c_s2"],
-                self._act_hrr_buf,
-                self._h_d_mid_buf,
-                D_IN=2304,
-                N_UNBIND_BLKS=18,
-                X_STRIDE_E=2304,
-                BLOCK_K=256,
-                num_warps=4,
-            )
-            _triton_dsv41_resident_down_kernel[(5120 // 8, n_active)](
-                self._act_inter_buf,
-                self._act_hrr_buf,
-                self.cache_d_u8,
-                self.cache_d_s_bf16,
-                self.group_d_u8,
-                self.group_d_s_fp8,
-                self.cold_scale_d_f32,
-                keys["dn_r_s2"],
-                self.healer_u_d,
-                self._h_d_mid_buf,
-                self._top_ids_buf,
-                self.expert_to_slot_gpu,
-                self._y_hrr_buf,
-                self._y_partial_buf,
-                TOP_K=k_act,
-                SHARED_SLOT=self.shared_slot,
-                D_OUT=5120,
-                N_BLOCKS_K=72,
-                BLOCK_D=8,
-                sub_blocks_k=8,
-                num_warps=8,
-            )
-            _triton_dsv41_fwht_post_kernel[(40, k_act)](
-                self._y_hrr_buf,
-                self._top_ids_buf,
-                self.expert_to_slot_gpu,
-                D_OUT=5120,
-                num_warps=2,
-            )
-            _triton_dsv41_reduce_down_kernel[(40,)](
-                self._y_hrr_buf,
-                self._y_partial_buf,
-                self._top_ids_buf,
-                self.expert_to_slot_gpu,
-                keys["dn_r_inv"],
-                keys["dn_r_s1"],
-                self._y_final_buf,
-                TOP_K=k_act,
-                D_OUT=5120,
-                num_warps=2,
-            )
-            out_y = self._y_final_buf.view(orig_shape)
-            return out_y if orig_dtype == torch.bfloat16 else out_y.to(orig_dtype)
+            im_flat = image_mask.view(-1) if (image_mask is not None and image_mask.numel() == n_toks) else None
+            for t_i in range(n_toks):
+                bias_vec = self.e_score_bias
+                if im_flat is not None and self.bias_vl is not None:
+                    bias_vec = torch.where(im_flat[t_i : t_i + 1], self.bias_vl, self.e_score_bias)
+                _triton_dsv41_tiered_router_kernel[(1,)](
+                    raw_logits[t_i : t_i + 1],
+                    bias_vec,
+                    self.tier_slot_map_gpu,
+                    self._active_slots_buf,
+                    self._active_gates_buf,
+                    float(self.routed_scaling_factor),
+                    SHARED_SLOT=self.shared_slot,
+                    K_ACT=k_act,
+                    num_warps=4,
+                )
+                _triton_dsv41_tiered_gu_swiglu_kernel[(2304 // 8, n_active)](
+                    x[t_i : t_i + 1],
+                    self.w4_gu_u8,
+                    self.s4_gu_bf16,
+                    self.w2_gu_u8,
+                    self.s2_gu_fp8,
+                    self.w1_gu_u8,
+                    self.s1_gu_fp8,
+                    self._active_slots_buf,
+                    self._active_gates_buf,
+                    self._act_inter_buf,
+                    float(self.swiglu_limit),
+                    N_INTER=2304,
+                    N_BLOCKS_K4=160,
+                    N_GROUPS_K2=80,
+                    BLOCK_N=8,
+                    sub_blocks_k4=32,
+                    sub_groups_k2=16,
+                    HAS_TIER2=has_t2,
+                    HAS_TIER3=has_t3,
+                    num_warps=8,
+                )
+                _triton_dsv41_tiered_down_kernel[(5120 // 8, n_active)](
+                    self._act_inter_buf,
+                    self.w4_d_u8,
+                    self.s4_d_bf16,
+                    self.w2_d_u8,
+                    self.s2_d_fp8,
+                    self.w1_d_u8,
+                    self.s1_d_fp8,
+                    self._active_slots_buf,
+                    self._y_partial_buf,
+                    D_OUT=5120,
+                    N_BLOCKS_K4=72,
+                    N_GROUPS_K2=36,
+                    BLOCK_D=8,
+                    sub_blocks_k4=8,
+                    sub_groups_k2=4,
+                    HAS_TIER2=has_t2,
+                    HAS_TIER3=has_t3,
+                    num_warps=8,
+                )
+                _triton_dsv41_reduce_sum_bf16_kernel[(40,)](
+                    self._y_partial_buf,
+                    out_y[t_i],
+                    N_ACT=n_active,
+                    D_OUT=5120,
+                    num_warps=2,
+                )
+            out_y_v = out_y.view(orig_shape)
+            return out_y_v if orig_dtype == torch.bfloat16 else out_y_v.to(orig_dtype)
 
         if image_mask is None and input_ids is not None:
             if input_ids.dtype == torch.bool:

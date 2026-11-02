@@ -23,6 +23,7 @@ from __future__ import annotations
 import gc
 import os
 import re
+import types
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -30,7 +31,18 @@ import torch
 from torch import nn
 from safetensors import safe_open
 
-from chronos_1t.models.dsv41_chronos_moe import ChronosDsv41SparseMoeBlock
+from chronos_1t.models.dsv41_chronos_moe import (
+    ChronosDsv41SparseMoeBlock,
+    _HAS_TRITON,
+    _triton_bmm_fp4_m1_kernel,
+    _triton_bmm_int4_m1_kernel,
+    _triton_gemv_fp4_m1_kernel,
+    _triton_gemv_int4_m1_kernel,
+    _triton_gemv_mxfp8_m1_kernel,
+    _triton_inv_rope_m1_kernel,
+    _triton_quantize_int4_32_kernel,
+    _triton_quantize_mse_fp4_32_kernel,
+)
 
 
 def _evict_page_cache(file_path: str) -> None:
@@ -46,9 +58,310 @@ def _evict_page_cache(file_path: str) -> None:
             pass
 
 
+@torch.no_grad()
+def _dequant_mxfp8_to_bf16(w_fp8: torch.Tensor, s_u8: torch.Tensor) -> torch.Tensor:
+    n_rows, k_cols = w_fp8.shape
+    s_f32 = (s_u8.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
+    if s_f32.shape[0] < n_rows:
+        s_f32 = s_f32.repeat_interleave(n_rows // s_f32.shape[0], dim=0)[:n_rows]
+    else:
+        s_f32 = s_f32[:n_rows]
+    s_f32 = s_f32[:, : k_cols // 32]
+    w_f32 = w_fp8.view(torch.float8_e4m3fn).float().view(n_rows, k_cols // 32, 32)
+    return (w_f32 * s_f32.unsqueeze(-1)).to(torch.bfloat16).view(n_rows, k_cols).contiguous()
+
+
+def _chronos_fast_fused_wqa_wkv_gemm(
+    self_a: Any, hidden_states: torch.Tensor, *args: Any, **kwargs: Any
+) -> torch.Tensor:
+    if hidden_states.shape[0] == 1 and hidden_states.is_cuda:
+        out_buf = torch.empty((1, 1792), dtype=torch.bfloat16, device=hidden_states.device)
+        _triton_gemv_mxfp8_m1_kernel[(1792 // 16,)](
+            hidden_states,
+            self_a._f_wqa_wkv_w_fp8,
+            self_a._f_wqa_wkv_s_u8,
+            out_buf[0],
+            N_OUT=1792,
+            N_BLOCKS_K=160,
+            BLOCK_N=16,
+            sub_blocks_k=32,
+            SCALE_ROW_DIV=self_a._f_wqa_wkv_scale_row_div,
+            num_warps=4,
+        )
+        return out_buf
+    res = self_a.fused_wqa_wkv(hidden_states)
+    return res[0] if isinstance(res, tuple) else res
+
+
+def _chronos_fast_wq_b_proj(
+    self_a: Any, qr: torch.Tensor, qr_scale: torch.Tensor | None = None
+) -> torch.Tensor:
+    m_tok = qr.shape[0]
+    if m_tok == 0:
+        return torch.empty((0, 32768), dtype=qr.dtype, device=qr.device)
+    out_buf = torch.empty((m_tok, 32768), dtype=torch.bfloat16, device=qr.device)
+    for t_i in range(m_tok):
+        _triton_gemv_int4_m1_kernel[(32768 // 16,)](
+            qr[t_i : t_i + 1],
+            self_a._wq_b_w4_u8,
+            self_a._wq_b_s4_bf16,
+            out_buf[t_i],
+            N_OUT=32768,
+            N_BLOCKS_K=40,
+            BLOCK_N=16,
+            sub_blocks_k=8,
+            num_warps=4,
+        )
+    return out_buf if qr.dtype == torch.bfloat16 else out_buf.to(qr.dtype)
+
+
+def _chronos_fast_o_proj(
+    self_a: Any, attn_out: torch.Tensor, positions: torch.Tensor
+) -> torch.Tensor:
+    o = attn_out[:, : self_a.n_local_heads, :]
+    m_tok = o.shape[0]
+    if m_tok == 0:
+        return torch.empty((0, 5120), dtype=o.dtype, device=o.device)
+    cos_sin_cache = self_a.rotary_emb.cos_sin_cache
+    out_buf = torch.empty((m_tok, 5120), dtype=torch.bfloat16, device=o.device)
+    x_inv_buf = self_a._o_proj_x_inv_buf
+    z_inter_buf = self_a._o_proj_z_inter_buf
+    for t_i in range(m_tok):
+        o_t = o[t_i]
+        _triton_inv_rope_m1_kernel[(64,)](
+            o_t,
+            cos_sin_cache,
+            positions[t_i : t_i + 1],
+            x_inv_buf,
+            o_t.stride(0),
+            num_warps=2,
+        )
+        _triton_bmm_int4_m1_kernel[(1024 // 16, 8)](
+            x_inv_buf.view(8, 4096),
+            self_a._wo_a_w4_u8,
+            self_a._wo_a_s4_bf16,
+            z_inter_buf.view(8, 1024),
+            N_OUT=1024,
+            N_BLOCKS_K=128,
+            BLOCK_N=16,
+            sub_blocks_k=32,
+            num_warps=4,
+        )
+        _triton_gemv_int4_m1_kernel[(5120 // 16,)](
+            z_inter_buf,
+            self_a._wo_b_w4_u8,
+            self_a._wo_b_s4_bf16,
+            out_buf[t_i],
+            N_OUT=5120,
+            N_BLOCKS_K=256,
+            BLOCK_N=16,
+            sub_blocks_k=32,
+            num_warps=4,
+        )
+    return out_buf if o.dtype == torch.bfloat16 else out_buf.to(o.dtype)
+
+
+def _chronos_fast_apply_head(
+    self_lp: Any,
+    lm_head: Any,
+    hidden_states: torch.Tensor,
+    embedding_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if hasattr(lm_head, "_chronos_w_fp8"):
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1]).to(torch.bfloat16)
+        m_tok = flat.shape[0]
+        n_vocab = lm_head._chronos_w_fp8.shape[0]
+        out_buf = torch.empty((m_tok, n_vocab), dtype=torch.bfloat16, device=flat.device)
+        for t_i in range(m_tok):
+            _triton_gemv_mxfp8_m1_kernel[(n_vocab // 16,)](
+                flat[t_i : t_i + 1],
+                lm_head._chronos_w_fp8,
+                lm_head._chronos_s_u8,
+                out_buf[t_i],
+                N_OUT=n_vocab,
+                N_BLOCKS_K=160,
+                BLOCK_N=16,
+                sub_blocks_k=32,
+                SCALE_ROW_DIV=1,
+                num_warps=4,
+            )
+        if embedding_bias is not None:
+            out_buf = out_buf + embedding_bias.to(out_buf.dtype)
+        return out_buf.reshape(*hidden_states.shape[:-1], n_vocab)
+    if hasattr(lm_head, "_chronos_w4_u8"):
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1]).to(torch.bfloat16)
+        m_tok = flat.shape[0]
+        n_vocab = lm_head._chronos_w4_u8.shape[0]
+        out_buf = torch.empty((m_tok, n_vocab), dtype=torch.bfloat16, device=flat.device)
+        for t_i in range(m_tok):
+            _triton_gemv_int4_m1_kernel[(n_vocab // 16,)](
+                flat[t_i : t_i + 1],
+                lm_head._chronos_w4_u8,
+                lm_head._chronos_s4_bf16,
+                out_buf[t_i],
+                N_OUT=n_vocab,
+                N_BLOCKS_K=160,
+                BLOCK_N=16,
+                sub_blocks_k=32,
+                num_warps=4,
+            )
+        if embedding_bias is not None:
+            out_buf = out_buf + embedding_bias.to(out_buf.dtype)
+        return out_buf.reshape(*hidden_states.shape[:-1], n_vocab)
+    return self_lp._orig_apply_head_dsv41_fp4(lm_head, hidden_states, embedding_bias)
+
+
+@torch.no_grad()
+def _install_chronos_dsv41_decode_accelerators(model: nn.Module) -> None:
+    if not _HAS_TRITON or not torch.cuda.is_available():
+        return
+    if getattr(model, "_chronos_decode_accels_installed", False):
+        return
+    model._chronos_decode_accels_installed = True
+
+    lm = getattr(model, "language_model", model)
+    inner_model = getattr(lm, "model", lm)
+    layers = getattr(inner_model, "layers", [])
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    fast_wqb = os.environ.get("CHRONOS_FAST_WQB", "0") == "1"
+    lmhead_int4 = os.environ.get("CHRONOS_LMHEAD_INT4", "0") == "1"
+
+    for lyr in layers:
+        if hasattr(lyr, "mhc_stream"):
+            lyr.mhc_stream = None
+        attn = getattr(lyr, "attn", None)
+        if attn is None:
+            continue
+        attn.aux_stream_list = None
+
+        # 1. fused_wqa_wkv (1792 x 5120): keep 8-bit MXFP8 for M>1, add zero-pad Triton GEMV for M=1 (cos = 1.000000)
+        f_wqa = getattr(attn, "fused_wqa_wkv", None)
+        if f_wqa is not None and hasattr(f_wqa, "weight") and hasattr(f_wqa, "_chronos_raw_scale_u8"):
+            attn._f_wqa_wkv_w_fp8 = f_wqa.weight.data.view(torch.float8_e4m3fn).contiguous()
+            attn._f_wqa_wkv_s_u8 = f_wqa._chronos_raw_scale_u8
+            delattr(f_wqa, "_chronos_raw_scale_u8")
+            attn._f_wqa_wkv_scale_row_div = max(1, 1792 // int(attn._f_wqa_wkv_s_u8.shape[0]))
+            attn._fused_wqa_wkv_gemm = types.MethodType(_chronos_fast_fused_wqa_wkv_gemm, attn)
+
+        # 2. wq_b (32768 x 1280): default keep native SM120 8-bit MXFP8 + fused_q_kv_rmsnorm_quant (cos = 1.000000)
+        wq_b = getattr(attn, "wq_b", None)
+        if fast_wqb and wq_b is not None and hasattr(wq_b, "weight") and wq_b.weight.numel() == 32768 * 1280:
+            raw_s_q = getattr(wq_b, "_chronos_raw_scale_u8", getattr(wq_b, "weight_scale", None))
+            if raw_s_q is not None:
+                attn.__dict__["_can_fuse_query_quant"] = False
+                wq_bf16 = _dequant_mxfp8_to_bf16(wq_b.weight.data, raw_s_q)
+                attn._wq_b_w4_u8 = torch.empty((32768, 640), dtype=torch.uint8, device=device)
+                attn._wq_b_s4_bf16 = torch.empty((32768, 40), dtype=torch.bfloat16, device=device)
+                _triton_quantize_int4_32_kernel[(32768, 40)](
+                    wq_bf16, attn._wq_b_w4_u8, attn._wq_b_s4_bf16, N_BLOCKS_C=40, num_warps=1
+                )
+                del wq_bf16
+                wq_b.weight.data = torch.empty((0,), dtype=wq_b.weight.dtype, device=device)
+                if hasattr(wq_b, "weight_scale") and isinstance(wq_b.weight_scale, torch.Tensor):
+                    wq_b.weight_scale.data = torch.empty((0,), dtype=wq_b.weight_scale.dtype, device=device)
+                if hasattr(wq_b, "_chronos_raw_scale_u8"):
+                    delattr(wq_b, "_chronos_raw_scale_u8")
+                attn._wq_b_proj = types.MethodType(_chronos_fast_wq_b_proj, attn)
+        elif wq_b is not None and hasattr(wq_b, "_chronos_raw_scale_u8"):
+            delattr(wq_b, "_chronos_raw_scale_u8")
+
+        # 3. wo_a (8 x 1024 x 4096) & wo_b (5120 x 8192): quantize to 16-level INT4-MSE (cos = 0.9965) & free weights
+        wo_a = getattr(attn, "wo_a", None)
+        wo_b = getattr(attn, "wo_b", None)
+        if (
+            wo_a is not None
+            and wo_b is not None
+            and hasattr(wo_a, "weight")
+            and hasattr(wo_b, "weight")
+            and wo_a.weight.numel() == 8192 * 4096
+            and wo_b.weight.numel() == 5120 * 8192
+        ):
+            raw_s_oa = getattr(wo_a, "_chronos_raw_scale_u8", getattr(wo_a, "weight_scale", None))
+            raw_s_ob = getattr(wo_b, "_chronos_raw_scale_u8", getattr(wo_b, "weight_scale", None))
+            if raw_s_oa is not None and raw_s_ob is not None:
+                oa_bf16 = _dequant_mxfp8_to_bf16(wo_a.weight.data.view(8192, 4096), raw_s_oa)
+                attn._wo_a_w4_u8 = torch.empty((8, 1024, 2048), dtype=torch.uint8, device=device)
+                attn._wo_a_s4_bf16 = torch.empty((8, 1024, 128), dtype=torch.bfloat16, device=device)
+                _triton_quantize_int4_32_kernel[(8192, 128)](
+                    oa_bf16,
+                    attn._wo_a_w4_u8.view(8192, 2048),
+                    attn._wo_a_s4_bf16.view(8192, 128),
+                    N_BLOCKS_C=128,
+                    num_warps=1,
+                )
+                del oa_bf16
+                wo_a.weight.data = torch.empty((0,), dtype=wo_a.weight.dtype, device=device)
+                if hasattr(wo_a, "weight_scale") and isinstance(wo_a.weight_scale, torch.Tensor):
+                    wo_a.weight_scale.data = torch.empty((0,), dtype=wo_a.weight_scale.dtype, device=device)
+                if hasattr(wo_a, "_chronos_raw_scale_u8"):
+                    delattr(wo_a, "_chronos_raw_scale_u8")
+
+                ob_bf16 = _dequant_mxfp8_to_bf16(wo_b.weight.data, raw_s_ob)
+                attn._wo_b_w4_u8 = torch.empty((5120, 4096), dtype=torch.uint8, device=device)
+                attn._wo_b_s4_bf16 = torch.empty((5120, 256), dtype=torch.bfloat16, device=device)
+                _triton_quantize_int4_32_kernel[(5120, 256)](
+                    ob_bf16, attn._wo_b_w4_u8, attn._wo_b_s4_bf16, N_BLOCKS_C=256, num_warps=1
+                )
+                del ob_bf16
+                wo_b.weight.data = torch.empty((0,), dtype=wo_b.weight.dtype, device=device)
+                if hasattr(wo_b, "weight_scale") and isinstance(wo_b.weight_scale, torch.Tensor):
+                    wo_b.weight_scale.data = torch.empty((0,), dtype=wo_b.weight_scale.dtype, device=device)
+                if hasattr(wo_b, "_chronos_raw_scale_u8"):
+                    delattr(wo_b, "_chronos_raw_scale_u8")
+
+                attn._o_proj_x_inv_buf = torch.empty((64, 512), dtype=torch.bfloat16, device=device)
+                attn._o_proj_z_inter_buf = torch.empty((1, 8192), dtype=torch.bfloat16, device=device)
+                attn._o_proj = types.MethodType(_chronos_fast_o_proj, attn)
+
+    for m in model.modules():
+        if hasattr(m, "_chronos_raw_scale_u8"):
+            delattr(m, "_chronos_raw_scale_u8")
+
+    # 4. lm_head (129280 x 5120 BF16): default 8-bit MXFP8 (cos = 0.99995) or INT4-MSE if CHRONOS_LMHEAD_INT4=1
+    lm_head = getattr(lm, "lm_head", getattr(model, "lm_head", None))
+    logits_proc = getattr(lm, "logits_processor", getattr(model, "logits_processor", None))
+    if (
+        lm_head is not None
+        and logits_proc is not None
+        and hasattr(lm_head, "weight")
+        and lm_head.weight.ndim == 2
+        and lm_head.weight.shape[1] == 5120
+    ):
+        n_vocab = lm_head.weight.shape[0]
+        lm_bf16 = lm_head.weight.data.to(device=device, dtype=torch.bfloat16).contiguous()
+        if lmhead_int4:
+            lm_head._chronos_w4_u8 = torch.empty((n_vocab, 2560), dtype=torch.uint8, device=device)
+            lm_head._chronos_s4_bf16 = torch.empty((n_vocab, 160), dtype=torch.bfloat16, device=device)
+            _triton_quantize_int4_32_kernel[(n_vocab, 160)](
+                lm_bf16, lm_head._chronos_w4_u8, lm_head._chronos_s4_bf16, N_BLOCKS_C=160, num_warps=1
+            )
+        else:
+            w_f32 = lm_bf16.float().view(n_vocab, 160, 32)
+            amax = w_f32.abs().amax(dim=-1).clamp(min=1e-12)
+            exp_u8 = (torch.ceil(torch.log2(amax / 256.0)).to(torch.int32) + 127).clamp(1, 254).to(torch.uint8)
+            scale_f32 = (exp_u8.to(torch.int32) << 23).view(torch.float32)
+            lm_head._chronos_w_fp8 = (
+                (w_f32 / scale_f32.unsqueeze(-1))
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .view(n_vocab, 5120)
+                .contiguous()
+            )
+            lm_head._chronos_s_u8 = exp_u8.contiguous()
+            del w_f32, amax, exp_u8, scale_f32
+        del lm_bf16
+        lm_head.weight.data = torch.empty((0,), dtype=lm_head.weight.dtype, device=device)
+        if not hasattr(logits_proc, "_orig_apply_head_dsv41_fp4"):
+            logits_proc._orig_apply_head_dsv41_fp4 = logits_proc._apply_head
+            logits_proc._apply_head = types.MethodType(_chronos_fast_apply_head, logits_proc)
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def enable_chronos_dsv41_vllm_hook(
     default_ckpt_dir: str | Path = "/home/defnotean/pb27/hf/dsv41_chronos_v75_abliterated",
-    hot_cache_size: int = 16,
+    hot_cache_size: int = 96,
     offload_tail_to_cpu: bool = True,
     mmap_zero_ram: bool = True,
 ) -> bool:
@@ -224,6 +537,91 @@ def enable_chronos_dsv41_vllm_hook(
         pass
 
     try:
+        from vllm.model_executor.layers import sparse_attn_indexer as _sai_mod
+        from vllm.utils import deep_gemm as _dg_mod
+
+        if not getattr(_dg_mod, "_chronos_sm120_bkv32_patched", False):
+            _orig_paged_mqa = _dg_mod.fp8_fp4_paged_mqa_logits
+
+            def _chronos_paged_mqa_logits(
+                q: Any,
+                kv_cache: torch.Tensor,
+                weights: torch.Tensor,
+                context_lens: torch.Tensor,
+                block_tables: torch.Tensor,
+                schedule_metadata: torch.Tensor,
+                max_model_len: int,
+                clean_logits: bool = False,
+                indices: torch.Tensor | None = None,
+            ) -> torch.Tensor:
+                eff_max_len = min(int(max_model_len), max(512, int(block_tables.shape[1]) * 64))
+                if kv_cache.ndim == 4 and kv_cache.shape[1] == 32 and q[1] is None:
+                    bsz = block_tables.shape[0]
+                    max_blks = block_tables.shape[1]
+                    n_blk_even = max(2, ((max_blks + 1) // 2) * 2)
+                    if n_blk_even > max_blks:
+                        pad_bt = torch.zeros(
+                            (bsz, n_blk_even), dtype=block_tables.dtype, device=block_tables.device
+                        )
+                        pad_bt[:, :max_blks] = block_tables
+                        bt_src = pad_bt.clamp(min=0, max=max(0, kv_cache.shape[0] - 1))
+                    else:
+                        bt_src = block_tables[:, :n_blk_even].clamp(
+                            min=0, max=max(0, kv_cache.shape[0] - 1)
+                        )
+                    n_blk_64 = n_blk_even // 2
+                    entry_size = kv_cache.shape[-1]
+                    fp8_bytes_32 = 32 * (entry_size - 4)
+                    scale_bytes_32 = 32 * 4
+                    p32_pages = kv_cache[bt_src].reshape(bsz * n_blk_64, 2, 32 * entry_size)
+                    p64_fp8 = p32_pages[:, :, :fp8_bytes_32].reshape(
+                        bsz * n_blk_64, 2 * fp8_bytes_32
+                    )
+                    p64_scales = p32_pages[:, :, fp8_bytes_32:].reshape(
+                        bsz * n_blk_64, 2 * scale_bytes_32
+                    )
+                    kvc_64 = (
+                        torch.cat([p64_fp8, p64_scales], dim=-1)
+                        .view(bsz * n_blk_64, 64, 1, entry_size)
+                        .contiguous()
+                    )
+                    bt_64 = torch.arange(
+                        bsz * n_blk_64, dtype=torch.int32, device=kv_cache.device
+                    ).view(bsz, n_blk_64)
+                    num_sms = schedule_metadata.shape[0] - 1
+                    sched_64 = _dg_mod.get_paged_mqa_logits_metadata(
+                        context_lens, 64, num_sms, indices=indices
+                    )
+                    return _orig_paged_mqa(
+                        q,
+                        kvc_64,
+                        weights,
+                        context_lens,
+                        bt_64,
+                        sched_64,
+                        eff_max_len,
+                        clean_logits=clean_logits,
+                        indices=indices,
+                    )
+                return _orig_paged_mqa(
+                    q,
+                    kv_cache,
+                    weights,
+                    context_lens,
+                    block_tables,
+                    schedule_metadata,
+                    eff_max_len,
+                    clean_logits=clean_logits,
+                    indices=indices,
+                )
+
+            _dg_mod.fp8_fp4_paged_mqa_logits = _chronos_paged_mqa_logits
+            _sai_mod.fp8_fp4_paged_mqa_logits = _chronos_paged_mqa_logits
+            _dg_mod._chronos_sm120_bkv32_patched = True
+    except Exception:
+        pass
+
+    try:
         from vllm.models.deepseek_v41 import sparse_mla as _smla_mod
         from vllm.models.deepseek_v41.nvidia import flashinfer_sparse as _fis_mod
 
@@ -314,6 +712,69 @@ def enable_chronos_dsv41_vllm_hook(
     except Exception:
         pass
 
+    # Prevent EmulationMxfp8LinearKernel from dequantizing wo_a to 2.68 GB of BF16 at load time,
+    # stash raw unswizzled MXFP8 scales on linear layers before swizzling, and install fused
+    # Triton FP4/MXFP8 decode accelerators right after process_weights_after_loading.
+    os.environ.setdefault("VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD", "0")
+    try:
+        from vllm.model_executor.kernels.linear.mxfp8.emulation import EmulationMxfp8LinearKernel
+        from vllm.model_executor.kernels.linear.mxfp8.flashinfer import FlashInferCutlassMxfp8LinearKernel
+
+        if not getattr(EmulationMxfp8LinearKernel, "_chronos_pw_hooked", False):
+            _orig_em_pw = EmulationMxfp8LinearKernel.process_weights_after_loading
+
+            def _chronos_em_pw(self_k: Any, layer: nn.Module) -> None:
+                self_k.dequant_at_load = False
+                if hasattr(layer, "weight_scale") and hasattr(layer, "weight"):
+                    w_flat = layer.weight.data.view(-1, layer.weight.shape[-1])
+                    n_r, k_c = w_flat.shape
+                    layer._chronos_raw_scale_u8 = layer.weight_scale.data[:n_r, : k_c // 32].clone().contiguous()
+                _orig_em_pw(self_k, layer)
+
+            EmulationMxfp8LinearKernel.process_weights_after_loading = _chronos_em_pw
+            EmulationMxfp8LinearKernel._chronos_pw_hooked = True
+
+        if not getattr(FlashInferCutlassMxfp8LinearKernel, "_chronos_pw_hooked", False):
+            _orig_fi_pw = FlashInferCutlassMxfp8LinearKernel.process_weights_after_loading
+
+            def _chronos_fi_pw(self_k: Any, layer: nn.Module) -> None:
+                if hasattr(layer, "weight_scale") and hasattr(layer, "weight"):
+                    n_r, k_c = layer.weight.shape
+                    layer._chronos_raw_scale_u8 = layer.weight_scale.data[:n_r, : k_c // 32].clone().contiguous()
+                _orig_fi_pw(self_k, layer)
+
+            FlashInferCutlassMxfp8LinearKernel.process_weights_after_loading = _chronos_fi_pw
+            FlashInferCutlassMxfp8LinearKernel._chronos_pw_hooked = True
+    except Exception:
+        pass
+
+    try:
+        from vllm.model_executor.model_loader import base_loader as _bl_mod
+
+        if not getattr(_bl_mod.BaseModelLoader, "_chronos_load_model_hooked", False):
+            _orig_load_model = _bl_mod.BaseModelLoader.load_model
+
+            def _chronos_load_model(
+                self_l: Any, vllm_config: Any, model_config: Any, prefix: str = ""
+            ) -> nn.Module:
+                model = _orig_load_model(self_l, vllm_config, model_config, prefix=prefix)
+                if not str(prefix).startswith("mtp.") and not str(prefix).startswith("dspark"):
+                    _install_chronos_dsv41_decode_accelerators(model)
+                return model
+
+            _bl_mod.BaseModelLoader.load_model = _chronos_load_model
+            _bl_mod.BaseModelLoader._chronos_load_model_hooked = True
+    except Exception:
+        pass
+
+    try:
+        from vllm.model_executor.warmup import kernel_warmup as _kw_mod
+
+        if hasattr(_kw_mod, "_flashinfer_autotune_token_counts"):
+            _kw_mod._flashinfer_autotune_token_counts = lambda runner, include_bf16=False: (16,)
+    except Exception:
+        pass
+
     return patched
 
 
@@ -321,7 +782,7 @@ def install_chronos_moe_into_dsv41(
     model: nn.Module,
     ckpt_dir: str | Path = "/home/defnotean/pb27/hf/dsv41_chronos_v75_abliterated",
     layers: Iterable[int] | None = None,
-    hot_cache_size: int = 16,
+    hot_cache_size: int = 96,
     offload_tail_to_cpu: bool = True,
     mmap_zero_ram: bool = False,
     device: torch.device | None = None,
