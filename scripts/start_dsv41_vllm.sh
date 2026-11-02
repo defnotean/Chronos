@@ -27,8 +27,9 @@ for f in dsv41_chronos_moe.py patch_dsv41_vllm.py; do
 done
 rm -rf "$SERVING_DIR/chronos_1t/models/__pycache__" "$SERVING_DIR/pb27_vllm/__pycache__" 2>/dev/null || true
 
-# 2. Stop any existing pb27-vllm container
+# 2. Stop any existing pb27-vllm container and disable swap to prevent GB10 UVM/kswapd0 live-lock
 docker rm -f pb27-vllm >/dev/null 2>&1 || true
+sudo -n swapoff -a >/dev/null 2>&1 || true
 sleep 2
 
 # 3. Launch pb27-vllm container on :$PORT (hard-capped at 108g RAM / 0 swap to protect host sshd/OS)
