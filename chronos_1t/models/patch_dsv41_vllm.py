@@ -487,7 +487,7 @@ def enable_chronos_dsv41_vllm_hook(
                 )
                 for st_file in sorted_files:
                     bname = os.path.basename(st_file)
-                    if "chronos-dsv41-upgrade2-hot96-" in bname or "chronos-dsv41-layer-" in bname:
+                    if "chronos-dsv41-upgrade2-hot96-" in bname:
                         continue
                     try:
                         with safe_open(st_file, framework="pt", device="cpu") as f:
@@ -512,7 +512,6 @@ def enable_chronos_dsv41_vllm_hook(
                             x
                             for x in files
                             if "chronos-dsv41-upgrade2-hot96-" not in os.path.basename(x)
-                            and "chronos-dsv41-layer-" not in os.path.basename(x)
                         ]
                     return files
 
