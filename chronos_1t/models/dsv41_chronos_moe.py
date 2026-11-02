@@ -2897,8 +2897,12 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             raw_logits = F.linear(x, self.router_w)
             has_t2 = self.n2_slots > 0
             has_t3 = self.n1_slots > 0
-            out_y = torch.empty_like(x)
             if n_toks == 1:
+                out_y = getattr(self, "_out_y_buf", None)
+                if out_y is None or out_y.shape != x.shape or out_y.is_inference():
+                    with torch.inference_mode(False):
+                        out_y = torch.empty_like(x)
+                        self._out_y_buf = out_y
                 bias_vec = self.e_score_bias
                 if image_mask is not None and self.bias_vl is not None and image_mask.numel() == 1:
                     bias_vec = torch.where(image_mask.view(1), self.bias_vl, self.e_score_bias)
@@ -2933,11 +2937,11 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     N_BLOCKS_K4=160,
                     N_GROUPS_K2=80,
                     BLOCK_N=8,
-                    sub_blocks_k4=32,
-                    sub_groups_k2=16,
+                    sub_blocks_k4=16,
+                    sub_groups_k2=8,
                     HAS_TIER2=has_t2,
                     HAS_TIER3=has_t3,
-                    num_warps=8,
+                    num_warps=4,
                 )
                 _triton_dsv41_tiered_down_kernel[(5120 // 8, n_active)](
                     self._act_inter_buf,
@@ -2972,6 +2976,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 out_y_v = out_y.view(orig_shape)
                 return out_y_v if orig_dtype == torch.bfloat16 else out_y_v.to(orig_dtype)
 
+            out_y = torch.empty_like(x)
             k_act = self.decode_top_k if n_toks <= 4 else self.top_k
             n_active = k_act + 1
             im_flat = image_mask.view(-1) if (image_mask is not None and image_mask.numel() == n_toks) else None
@@ -3008,11 +3013,11 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     N_BLOCKS_K4=160,
                     N_GROUPS_K2=80,
                     BLOCK_N=8,
-                    sub_blocks_k4=32,
-                    sub_groups_k2=16,
+                    sub_blocks_k4=16,
+                    sub_groups_k2=8,
                     HAS_TIER2=has_t2,
                     HAS_TIER3=has_t3,
-                    num_warps=8,
+                    num_warps=4,
                 )
                 _triton_dsv41_tiered_down_kernel[(5120 // 8, n_active)](
                     self._act_inter_buf,

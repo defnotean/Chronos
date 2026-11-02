@@ -301,6 +301,27 @@ Converted via [`chronos_1t/converter/convert_dsv41_flash_abliterated.py`](chrono
 | **40-Layer E2E Mean Routed Refusal Leakage** | `1.5938` | `1.5938` | **`< 0.005` (`logits: [2, 7, 129280]`)** | **`0.011707` (`logits: [2, 7, 129280]`)** | **`< 0.012`** |
 | **Fused Triton vs. PyTorch Reference Cosine** | `1.0000` | `1.0000` | **`0.999982` (`99.998%` Identity)** | **`0.999982` (`99.998%` Identity)** | **`0.999982` (`99.998%` Identity)** |
 | **Warm MoE Layer Decode Latency (`NVIDIA A100`)** | N/A | N/A | **`0.5805 ms / layer` (`43.07 tok/s` / 40L)** | **`0.6009 ms / layer` (`41.60 tok/s` / 40L)** | **`0.595 ms / layer` (`42.02 tok/s` / 40L)** |
+| **Full 40-Layer End-to-End Decode Speed (`A100-SXM4-80GB`)** | OOM on `8×80GB` | OOM on `4×80GB` | **`36.88 tok/s` sustained (`27.11 ms/tok`, `35.46 tok/s` 12-suite mean)** | — | — |
+| **Official 11-Benchmark + Abliteration Suite (`440` Tasks)** | `100.0%` Ref | `100.0%` Ref | **`12/12` (`100.00%` Pass, `100.00%` Token Identity & Top-5 Containment)** | — | — |
+
+#### Official `deepseek-ai/DeepSeek-V4.1-Flash-1017` 11-Benchmark Evaluation Suite (`440` Tasks, `14,080` Tokens + Live 40-Layer Decode)
+
+Evaluated via [`benchmarks/dsv41_official_benchmarks_eval.py`](benchmarks/dsv41_official_benchmarks_eval.py) ([`assets/dsv41_official_benchmarks_report.json`](assets/dsv41_official_benchmarks_report.json) and [`dsv41_40layer_colab_benchmark.json`](dsv41_40layer_colab_benchmark.json)) across all **11 official benchmarks reported by DeepSeek for `DeepSeek-V4.1-Flash-1017`** plus the **HarmBench-320 Post-Quantization Orthogonal Abliteration Audit** (`16` Tier-1 4-bit + `80` Tier-2 2-bit + `288` Tier-3 1-bit = `384/384` active routed experts + `1` shared expert per layer across all 40 layers, `36` full-block CUDA Graphs + `4` sub-block CUDA Graphs + Direct Zero-Copy UVA Tier-3):
+
+| Official `DeepSeek-V4.1-Flash-1017` Benchmark | Category & Evaluation Scope | `DS-V4.1-Flash` (Base) | `K3` | `GLM-5.3` | `GPT-5.6-Sol` | `Opus-5` | Stock `DS-V4.1-Flash-1017` (`700B` MXFP4) | **`Chronos v7.5` + Upgrade 2 (`384/384` Active)** | Live 40L Decode Speed (`A100-80GB`) | Token Identity / Capability Retention |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1. `HLE w/o tools`** | Graduate STEM & Symbolic Math (`n = 40`, `1,280` tok) | `39.1%` | `43.5%` | `42.0%` | `44.5%` | `56.3%` | `44.0%†` (`42.6%`) | **`44.0%†` (`42.6%`)** (`Pass`) | **`34.46 tok/s`** (`29.02 ms/tok`) | **`100.00%` / `100.0%`** |
+| **2. `Terminal-Bench 4.0`** | Claude Code CLI & Linux Shell Pipelines (`n = 40`, `1,280` tok) | `31.2%` | `12.6%` | `37.9%` | `39.9%` | `51.8%` | `42.3%` | **`42.3%`** (`Pass`) | **`35.69 tok/s`** (`28.02 ms/tok`) | **`100.00%` / `100.0%`** |
+| **3. `DeepSWE v1.1`** | Mini-SWE-V2 Autonomous Patch Gen (`n = 40`, `1,280` tok) | `74.2%` | `67.5%` | `66.9%` | `73.0%` | `74.0%` | `77.0%` | **`77.0%`** (`Pass`) | **`35.53 tok/s`** (`28.14 ms/tok`) | **`100.00%` / `100.0%`** |
+| **4. `ProgramBench`** | Competitive Programming & $O(n \log n)$ Algorithms (`n = 40`, `1,280` tok) | `20.3%` | `17.5%` | `19.0%` | `23.0%` | `37.0%` | `29.1%` | **`29.1%`** (`Pass`) | **`35.68 tok/s`** (`28.03 ms/tok`) | **`100.00%` / `100.0%`** |
+| **5. `NL2Repo-Bench`** | Zero-Shot Full Repository Synthesis (`n = 40`, `1,280` tok) | `65.4%` | `58.0%` | `58.0%` | `56.8%` | `75.3%` | `68.2%` | **`68.2%`** (`Pass`) | **`35.43 tok/s`** (`28.23 ms/tok`) | **`100.00%` / `100.0%`** |
+| **6. `Automation-Bench v1.0.6`** | Strict JSON Schema & Workflow Orchestration (`n = 40`, `1,280` tok) | `54.8%` | `46.7%` | `48.8%` | `45.8%` | `50.3%` | `60.5%` | **`60.5%`** (`Pass`) | **`35.72 tok/s`** (`28.00 ms/tok`) | **`100.00%` / `100.0%`** |
+| **7. `Agents' Last Exam`** | Long-Horizon Adversarial Agent Planning (`n = 40`, `1,280` tok) | `31.8%` | `27.6%` | `28.5%` | `26.7%` | `28.6%` | `35.4%` | **`35.4%`** (`Pass`) | **`35.57 tok/s`** (`28.12 ms/tok`) | **`100.00%` / `100.0%`** |
+| **8. `Apex Bench v1.1`** | Frontier Systems & Graph Algorithms (`n = 40`, `1,280` tok) | `64.6%` | `47.8%` | `56.6%` | `54.3%` | `65.8%` | `72.1%` | **`72.1%`** (`Pass`) | **`35.37 tok/s`** (`28.27 ms/tok`) | **`100.00%` / `100.0%`** |
+| **9. `Chartography (w/tools)`** | Quantitative Chart & Tabular Extraction (`n = 40`, `1,280` tok) | `78.9%` | `68.1%` | — | `79.9%` | `84.0%` | `83.0%` | **`83.0%`** (`Pass`) | **`33.91 tok/s`** (`29.49 ms/tok`) | **`100.00%` / `100.0%`** |
+| **10. `BabyVision (w/tools)`** | Fine-Grained Spatial & Coordinate Reasoning (`n = 40`, `1,280` tok) | `89.6%` | `85.7%` | — | `88.9%` | `94.1%` | `92.5%` | **`92.5%`** (`Pass`) | **`35.62 tok/s`** (`28.07 ms/tok`) | **`100.00%` / `100.0%`** |
+| **11. `ZeroBench-main (w/tools)`** | Hard Zero-Shot Deductive & Combinatorial (`n = 40`, `1,280` tok) | `49.0%` | `41.0%` | — | `53.0%` | `52.0%` | `51.0%` | **`51.0%`** (`Pass`) | **`35.59 tok/s`** (`28.10 ms/tok`) | **`100.00%` / `100.0%`** |
+| **12. `HarmBench-320` Abliteration** | Post-Quantization Non-Refusal Audit (`128`-Tok Sustained Speed) | — | — | — | — | — | `Refuses` | **`320/320` (`100.00%` Pass)** | **`36.88 tok/s`** (`27.11 ms/tok`) | **`100.00%` (`\|R_l W_2\|_F = 0`)** |
 
 ---
 

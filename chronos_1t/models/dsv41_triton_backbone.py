@@ -649,6 +649,16 @@ def fast_block_forward(
                     num_warps=4,
                 )
 
+            use_cg = (
+                getattr(self.ffn, "w1_gu_u8", None) is None
+                or self.ffn.w1_gu_u8.is_cuda
+                or getattr(self.ffn, "_active_mt3", 6) == 0
+            )
+            if not use_cg:
+                xa = _run_step1_and_attn()
+                _run_subblock2(xa)
+                return x_out_buf, pre_out_buf
+
             ratio = getattr(self.attn, "compress_ratio", 0)
             compress_len = ((start_pos + 1) // ratio) if ratio else 0
             can_full_graph = (not getattr(self.attn, "is_kv_source", False)) and (compress_len <= 512) and (not attn_args)
@@ -1201,10 +1211,17 @@ def _triton_mla_decode_out_rope_quant_tc_kernel(
 
 def install_dsv41_triton_backbone(dsv41_model_mod: Any, enable_direct_uva_t3: bool = True) -> dict[str, Any]:
     """Patches `dsv41_model_mod` (`model.py`) in-place with fused Triton backbone & Tensor-Core decode kernels."""
-    orig_act_quant = dsv41_model_mod.act_quant
-    orig_fp4_act_quant = dsv41_model_mod.fp4_act_quant
-    orig_apply_rotary_emb = dsv41_model_mod.apply_rotary_emb
-    orig_sparse_attn = dsv41_model_mod.sparse_attn
+    if not hasattr(dsv41_model_mod, "_orig_act_quant"):
+        dsv41_model_mod._orig_act_quant = dsv41_model_mod.act_quant
+        dsv41_model_mod._orig_fp4_act_quant = dsv41_model_mod.fp4_act_quant
+        dsv41_model_mod._orig_apply_rotary_emb = dsv41_model_mod.apply_rotary_emb
+        dsv41_model_mod._orig_sparse_attn = dsv41_model_mod.sparse_attn
+        dsv41_model_mod._orig_Attention_forward = dsv41_model_mod.Attention.forward
+        dsv41_model_mod._orig_Block_forward = dsv41_model_mod.Block.forward
+    orig_act_quant = dsv41_model_mod._orig_act_quant
+    orig_fp4_act_quant = dsv41_model_mod._orig_fp4_act_quant
+    orig_apply_rotary_emb = dsv41_model_mod._orig_apply_rotary_emb
+    orig_sparse_attn = dsv41_model_mod._orig_sparse_attn
 
     def _fast_act_quant(x: torch.Tensor, block_size: int = 32, scale_fmt=None, scale_dtype=None, inplace: bool = False):
         if (
@@ -1290,7 +1307,7 @@ def install_dsv41_triton_backbone(dsv41_model_mod: Any, enable_direct_uva_t3: bo
                 _decode_bufs[dev] = b
         return b
 
-    orig_attn_forward = dsv41_model_mod.Attention.forward
+    orig_attn_forward = dsv41_model_mod._orig_Attention_forward
 
     def _fast_attn_forward(self: Any, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         bsz, seqlen, _ = x.size()
