@@ -2061,6 +2061,31 @@ def _dequantize_fp4_bf16scale_into(w_u8: torch.Tensor, s_bf16: torch.Tensor, out
     return out_bf16
 
 
+_OPTION_A_DELTAS: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
+
+
+def _get_option_a_delta(layer_idx: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+    global _OPTION_A_DELTAS
+    if _OPTION_A_DELTAS is None:
+        _OPTION_A_DELTAS = {}
+        cands = [
+            os.environ.get("CHRONOS_OPTION_A_PATH", ""),
+            "/pb27_vllm/dsv41_shared_experts_option_a_r64.pt",
+            "/home/defnotean/pb27/serving/pb27_vllm/dsv41_shared_experts_option_a_r64.pt",
+            str(Path(__file__).resolve().parent / "dsv41_shared_experts_option_a_r64.pt"),
+        ]
+        for opt_path in cands:
+            if opt_path and os.path.exists(opt_path):
+                try:
+                    raw = torch.load(opt_path, map_location="cpu", weights_only=True)
+                    for k, v in raw.items():
+                        _OPTION_A_DELTAS[int(k)] = (v["U"], v["V"])
+                    break
+                except Exception:
+                    pass
+    return _OPTION_A_DELTAS.get(layer_idx)
+
+
 class ChronosDsv41SparseMoeBlock(nn.Module):
     """Drop-in replacement for DeepSeek-V4.1-Flash-1017 (`DeepseekV41ForCausalLM`) Sparse MoE layer."""
 
@@ -2191,9 +2216,9 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
 
         default_dec_k = str(self.top_k)
         self.decode_top_k = max(1, min(self.top_k, int(os.environ.get("CHRONOS_DECODE_TOP_K", default_dec_k))))
-        self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "16"))
-        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "72"))
-        default_n1 = min(216, max(0, 384 - self.n4_slots - self.n2_slots))
+        self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "96"))
+        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "0"))
+        default_n1 = 0 if (self.n4_slots == 96 and self.n2_slots == 0) else min(216, max(0, 384 - self.n4_slots - self.n2_slots))
         self.n1_slots = int(os.environ.get("CHRONOS_TIER3_1BIT_SLOTS", str(default_n1)))
 
         if self.use_fp4_slot_cache:
@@ -2230,10 +2255,16 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self.cache_d_u8 = self.w4_d_u8
             self.cache_d_s_bf16 = self.s4_d_bf16
 
-            self.w2_gu_u8 = torch.empty((self.n2_slots, 4608, 1280), dtype=torch.uint8, device=device)
-            self.s2_gu_fp8 = torch.empty((self.n2_slots, 4608, 80), dtype=torch.uint8, device=device)
-            self.w2_d_u8 = torch.empty((self.n2_slots, 5120, 576), dtype=torch.uint8, device=device)
-            self.s2_d_fp8 = torch.empty((self.n2_slots, 5120, 36), dtype=torch.uint8, device=device)
+            if self.n2_slots > 0:
+                self.w2_gu_u8 = torch.empty((self.n2_slots, 4608, 1280), dtype=torch.uint8, device=device)
+                self.s2_gu_fp8 = torch.empty((self.n2_slots, 4608, 80), dtype=torch.uint8, device=device)
+                self.w2_d_u8 = torch.empty((self.n2_slots, 5120, 576), dtype=torch.uint8, device=device)
+                self.s2_d_fp8 = torch.empty((self.n2_slots, 4608, 36), dtype=torch.uint8, device=device) if False else torch.empty((self.n2_slots, 5120, 36), dtype=torch.uint8, device=device)
+            else:
+                self.w2_gu_u8 = self.w4_gu_u8
+                self.s2_gu_fp8 = self.w4_gu_u8
+                self.w2_d_u8 = self.w4_d_u8
+                self.s2_d_fp8 = self.w4_d_u8
 
             t3_cpu_from = int(os.environ.get("CHRONOS_T3_CPU_FROM_LAYER", "40"))
             self.t3_on_cpu = bool(self.n1_slots > 0 and layer_idx >= t3_cpu_from)
@@ -2256,11 +2287,26 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 self.s1_d_cpu = None
                 n1_gpu_alloc = self.n1_slots
 
-            self.w1_gu_u8 = torch.empty((n1_gpu_alloc, 4608, 640), dtype=torch.uint8, device=device)
-            self.s1_gu_fp8 = torch.empty((n1_gpu_alloc, 4608, 80), dtype=torch.uint8, device=device)
-            self.w1_d_u8 = torch.empty((n1_gpu_alloc, 5120, 288), dtype=torch.uint8, device=device)
-            self.s1_d_fp8 = torch.empty((n1_gpu_alloc, 5120, 36), dtype=torch.uint8, device=device)
+            if n1_gpu_alloc > 0:
+                self.w1_gu_u8 = torch.empty((n1_gpu_alloc, 4608, 640), dtype=torch.uint8, device=device)
+                self.s1_gu_fp8 = torch.empty((n1_gpu_alloc, 4608, 80), dtype=torch.uint8, device=device)
+                self.w1_d_u8 = torch.empty((n1_gpu_alloc, 5120, 288), dtype=torch.uint8, device=device)
+                self.s1_d_fp8 = torch.empty((n1_gpu_alloc, 5120, 36), dtype=torch.uint8, device=device)
+            else:
+                self.w1_gu_u8 = self.w4_gu_u8
+                self.s1_gu_fp8 = self.w4_gu_u8
+                self.w1_d_u8 = self.w4_d_u8
+                self.s1_d_fp8 = self.w4_d_u8
             self.tier_slot_map_gpu = torch.full((384,), -1, dtype=torch.int32, device=device)
+
+            self.sh_down_base_cpu = sh_down_tmp.cpu()
+            self.opt_a_alpha = float(os.environ.get("CHRONOS_OPTION_A_ALPHA", "1.0"))
+            opt_a_uv = _get_option_a_delta(layer_idx)
+            if opt_a_uv is not None and self.opt_a_alpha != 0.0:
+                u_a = opt_a_uv[0].to(device=device, dtype=torch.bfloat16)
+                v_a = opt_a_uv[1].to(device=device, dtype=torch.bfloat16)
+                sh_down_tmp.addmm_(u_a, v_a, beta=1.0, alpha=self.opt_a_alpha)
+                del u_a, v_a
 
             _triton_quantize_mse_fp4_32_kernel[(4608, 160)](
                 sh_gu_tmp,
@@ -2400,88 +2446,106 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 prior_mc = (freq_mc + scores_mc.mean(dim=0)).cpu().tolist()
                 del x_mc, logits_mc, scores_mc, top6_mc, freq_mc
 
-                hot_set = set(self.hot_expert_ids_list)
-                cold_ranked = sorted(
-                    (eid for eid in range(384) if eid not in hot_set),
-                    key=lambda e: prior_mc[e],
-                    reverse=True,
-                )
-                hot_ranked = sorted(self.hot_expert_ids_list, key=lambda e: prior_mc[e], reverse=True)
-                ranked_eids = hot_ranked + cold_ranked
+                ranked_eids = sorted(range(384), key=lambda e: prior_mc[e], reverse=True)
                 tier1_eids = ranked_eids[: self.n4_slots]
                 tier2_eids = ranked_eids[self.n4_slots : self.n4_slots + self.n2_slots]
                 tier3_eids = ranked_eids[
                     self.n4_slots + self.n2_slots : self.n4_slots + self.n2_slots + self.n1_slots
                 ]
 
-                needed_grps = {eid // 8 for eid in tier1_eids if self.hot_expert_to_idx[eid] < 0}
-                for eid in tier2_eids:
-                    if self.hot_expert_to_idx[eid] < 0:
-                        needed_grps.add(eid // 8)
-                for eid in tier3_eids:
-                    if self.hot_expert_to_idx[eid] < 0:
-                        needed_grps.add(eid // 8)
-                grp_map: dict[int, ChronosDsv41HolographicExpertGroup] = {}
-                for g_idx in sorted(needed_grps):
-                    gp = f"{tp}.chronos_groups.{g_idx}."
-                    if f"{gp}s_gu.weight" not in all_keys:
-                        gp = f"{tp}.chronos_groups.0."
-                    sub_t = {
-                        "s_gu.weight_scale_2": self._mmap_handle.get_tensor(f"{gp}s_gu.weight_scale_2"),
-                        "s_gu.beta": self._mmap_handle.get_tensor(f"{gp}s_gu.beta"),
-                        "s_down.weight_scale_2": self._mmap_handle.get_tensor(f"{gp}s_down.weight_scale_2"),
-                        "s_down.beta": self._mmap_handle.get_tensor(f"{gp}s_down.beta"),
-                        "tail.gu_bits": self._mmap_handle.get_tensor(f"{gp}tail.gu_bits") if f"{gp}tail.gu_bits" in all_keys else torch.tensor(1),
-                        "tail.down_bits": self._mmap_handle.get_tensor(f"{gp}tail.down_bits") if f"{gp}tail.down_bits" in all_keys else torch.tensor(1),
-                    }
-                    grp_map[g_idx] = ChronosDsv41HolographicExpertGroup(
-                        group_idx=g_idx,
-                        tensors=sub_t,
-                        device=device,
-                        offload_tail_to_cpu=True,
-                        mmap_zero_ram=True,
-                        mmap_handle=self._mmap_handle,
-                        mmap_prefix=gp,
-                        h128=shared_h128,
-                        r_basis=self.r_basis,
-                        swiglu_limit=swiglu_limit,
-                    )
-
-                tier_map_cpu = [-1] * 384
-                for s4, eid in enumerate(tier1_eids):
-                    tier_map_cpu[eid] = s4
-                    self.expert_to_slot[eid] = s4
-                    self.slot_to_expert[s4] = eid
-                for s2, eid in enumerate(tier2_eids):
-                    tier_map_cpu[eid] = 1024 + s2
-                for s1, eid in enumerate(tier3_eids):
-                    tier_map_cpu[eid] = 2048 + s1
-                self.tier_slot_map_gpu.copy_(torch.tensor(tier_map_cpu, dtype=torch.int32, device=device))
-                self.expert_to_slot_gpu.copy_(self.tier_slot_map_gpu)
-
-                hot_t1_entries = [
-                    (s4, eid) for s4, eid in enumerate(tier1_eids) if self.hot_expert_to_idx[eid] >= 0
-                ]
-                hot_sub_entries = [
-                    (2, s2, eid) for s2, eid in enumerate(tier2_eids) if self.hot_expert_to_idx[eid] >= 0
-                ] + [
-                    (3, s1, eid) for s1, eid in enumerate(tier3_eids) if self.hot_expert_to_idx[eid] >= 0
-                ]
-                cold_all_by_group: dict[int, list[tuple[int, int, int]]] = {}
-                for s4, eid in enumerate(tier1_eids):
-                    if self.hot_expert_to_idx[eid] < 0:
-                        cold_all_by_group.setdefault(eid // 8, []).append((1, s4, eid))
-                for s2, eid in enumerate(tier2_eids):
-                    if self.hot_expert_to_idx[eid] < 0:
-                        cold_all_by_group.setdefault(eid // 8, []).append((2, s2, eid))
-                for s1, eid in enumerate(tier3_eids):
-                    if self.hot_expert_to_idx[eid] < 0:
-                        cold_all_by_group.setdefault(eid // 8, []).append((3, s1, eid))
-
-                if hot_sub_entries or cold_all_by_group:
-                    scr_gu, scr_d = _get_shared_bf16_scratch(device)
-                else:
+                glm96_cand = Path(self.shard_path_str).with_name(
+                    f"chronos-dsv41-glm96-layer-{layer_idx:05d}-of-00040.safetensors"
+                )
+                if glm96_cand.exists() and self.n4_slots == 96 and self.n2_slots == 0 and self.n1_slots == 0:
+                    with safe_open(str(glm96_cand), framework="pt", device="cpu") as gf:
+                        self.w4_gu_u8.copy_(gf.get_tensor("w4_gu_u8").to(device=device, non_blocking=True))
+                        self.s4_gu_bf16.copy_(gf.get_tensor("s4_gu_bf16").to(device=device, non_blocking=True))
+                        self.w4_d_u8.copy_(gf.get_tensor("w4_d_u8").to(device=device, non_blocking=True))
+                        self.s4_d_bf16.copy_(gf.get_tensor("s4_d_bf16").to(device=device, non_blocking=True))
+                        t_map = gf.get_tensor("tier_slot_map").to(device=device, dtype=torch.int32)
+                        self.tier_slot_map_gpu.copy_(t_map)
+                        self.expert_to_slot_gpu.copy_(t_map)
+                        s2e = gf.get_tensor("slot_to_expert").tolist()
+                        self.slot_to_expert = [int(x) for x in s2e]
+                        for s4_i, eid_i in enumerate(self.slot_to_expert):
+                            self.expert_to_slot[eid_i] = s4_i
+                    if self.opt_a_alpha != 1.0:
+                        self.set_option_a_alpha(self.opt_a_alpha)
+                    needed_grps = set()
+                    grp_map: dict[int, ChronosDsv41HolographicExpertGroup] = {}
+                    hot_t1_entries = []
+                    hot_sub_entries = []
+                    cold_all_by_group: dict[int, list[tuple[int, int, int]]] = {}
                     scr_gu, scr_d = None, None
+                else:
+                    needed_grps = {eid // 8 for eid in tier1_eids if self.hot_expert_to_idx[eid] < 0}
+                    for eid in tier2_eids:
+                        if self.hot_expert_to_idx[eid] < 0:
+                            needed_grps.add(eid // 8)
+                    for eid in tier3_eids:
+                        if self.hot_expert_to_idx[eid] < 0:
+                            needed_grps.add(eid // 8)
+                    grp_map = {}
+                    for g_idx in sorted(needed_grps):
+                        gp = f"{tp}.chronos_groups.{g_idx}."
+                        if f"{gp}s_gu.weight" not in all_keys:
+                            gp = f"{tp}.chronos_groups.0."
+                        sub_t = {
+                            "s_gu.weight_scale_2": self._mmap_handle.get_tensor(f"{gp}s_gu.weight_scale_2"),
+                            "s_gu.beta": self._mmap_handle.get_tensor(f"{gp}s_gu.beta"),
+                            "s_down.weight_scale_2": self._mmap_handle.get_tensor(f"{gp}s_down.weight_scale_2"),
+                            "s_down.beta": self._mmap_handle.get_tensor(f"{gp}s_down.beta"),
+                            "tail.gu_bits": self._mmap_handle.get_tensor(f"{gp}tail.gu_bits") if f"{gp}tail.gu_bits" in all_keys else torch.tensor(1),
+                            "tail.down_bits": self._mmap_handle.get_tensor(f"{gp}tail.down_bits") if f"{gp}tail.down_bits" in all_keys else torch.tensor(1),
+                        }
+                        grp_map[g_idx] = ChronosDsv41HolographicExpertGroup(
+                            group_idx=g_idx,
+                            tensors=sub_t,
+                            device=device,
+                            offload_tail_to_cpu=True,
+                            mmap_zero_ram=True,
+                            mmap_handle=self._mmap_handle,
+                            mmap_prefix=gp,
+                            h128=shared_h128,
+                            r_basis=self.r_basis,
+                            swiglu_limit=swiglu_limit,
+                        )
+
+                    tier_map_cpu = [-1] * 384
+                    for s4, eid in enumerate(tier1_eids):
+                        tier_map_cpu[eid] = s4
+                        self.expert_to_slot[eid] = s4
+                        self.slot_to_expert[s4] = eid
+                    for s2, eid in enumerate(tier2_eids):
+                        tier_map_cpu[eid] = 1024 + s2
+                    for s1, eid in enumerate(tier3_eids):
+                        tier_map_cpu[eid] = 2048 + s1
+                    self.tier_slot_map_gpu.copy_(torch.tensor(tier_map_cpu, dtype=torch.int32, device=device))
+                    self.expert_to_slot_gpu.copy_(self.tier_slot_map_gpu)
+
+                    hot_t1_entries = [
+                        (s4, eid) for s4, eid in enumerate(tier1_eids) if self.hot_expert_to_idx[eid] >= 0
+                    ]
+                    hot_sub_entries = [
+                        (2, s2, eid) for s2, eid in enumerate(tier2_eids) if self.hot_expert_to_idx[eid] >= 0
+                    ] + [
+                        (3, s1, eid) for s1, eid in enumerate(tier3_eids) if self.hot_expert_to_idx[eid] >= 0
+                    ]
+                    cold_all_by_group = {}
+                    for s4, eid in enumerate(tier1_eids):
+                        if self.hot_expert_to_idx[eid] < 0:
+                            cold_all_by_group.setdefault(eid // 8, []).append((1, s4, eid))
+                    for s2, eid in enumerate(tier2_eids):
+                        if self.hot_expert_to_idx[eid] < 0:
+                            cold_all_by_group.setdefault(eid // 8, []).append((2, s2, eid))
+                    for s1, eid in enumerate(tier3_eids):
+                        if self.hot_expert_to_idx[eid] < 0:
+                            cold_all_by_group.setdefault(eid // 8, []).append((3, s1, eid))
+
+                    if hot_sub_entries or cold_all_by_group:
+                        scr_gu, scr_d = _get_shared_bf16_scratch(device)
+                    else:
+                        scr_gu, scr_d = None, None
 
                 if (hot_t1_entries or hot_sub_entries) and self._hot_handle is not None:
                     w1_w_all_cpu = self._hot_handle.get_tensor(f"{self._hot_tp}w1.weight")
@@ -2712,6 +2776,27 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                         os.close(fd)
                 except OSError:
                     pass
+
+    @torch.no_grad()
+    def set_option_a_alpha(self, alpha: float) -> None:
+        self.opt_a_alpha = float(alpha)
+        if not hasattr(self, "sh_down_base_cpu") or self.sh_down_base_cpu is None:
+            return
+        sh_d = self.sh_down_base_cpu.to(device=self.device, dtype=torch.bfloat16)
+        opt_a_uv = _get_option_a_delta(self.layer_idx)
+        if opt_a_uv is not None and self.opt_a_alpha != 0.0:
+            u_a = opt_a_uv[0].to(device=self.device, dtype=torch.bfloat16)
+            v_a = opt_a_uv[1].to(device=self.device, dtype=torch.bfloat16)
+            sh_d.addmm_(u_a, v_a, beta=1.0, alpha=self.opt_a_alpha)
+            del u_a, v_a
+        _triton_quantize_mse_fp4_32_kernel[(5120, 72)](
+            sh_d,
+            self.w4_d_u8[self.shared_slot],
+            self.s4_d_bf16[self.shared_slot],
+            N_BLOCKS_C=72,
+            num_warps=1,
+        )
+        del sh_d
 
     def _try_attach_hot_shard(self) -> bool:
         if self.num_hot_mxfp4_experts > 0:
