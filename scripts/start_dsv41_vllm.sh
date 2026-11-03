@@ -32,9 +32,9 @@ docker rm -f pb27-vllm >/dev/null 2>&1 || true
 sudo -n swapoff -a >/dev/null 2>&1 || true
 sleep 2
 
-# 3. Launch pb27-vllm container on :$PORT (hard-capped at 108g RAM / 0 swap to protect host sshd/OS)
+# 3. Launch pb27-vllm container on :$PORT (hard-capped at 96g RAM / 0 swap to protect host sshd/OS)
 nohup bash /home/defnotean/gpu_run.sh docker run --rm --name pb27-vllm --gpus all --ipc host --network host \
-  --memory=108g --memory-swap=108g \
+  --memory=96g --memory-swap=96g \
   -v /home/defnotean/.cache/huggingface:/root/.cache/huggingface \
   -v /home/defnotean/.cache/vllm:/root/.cache/vllm \
   -v /home/defnotean/.cache/flashinfer:/root/.cache/flashinfer \
@@ -48,9 +48,9 @@ nohup bash /home/defnotean/gpu_run.sh docker run --rm --name pb27-vllm --gpus al
   -e PB27_MEMORY=0 \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
   -e VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 \
-  -e CHRONOS_TIER1_4BIT_SLOTS=${CHRONOS_TIER1_4BIT_SLOTS:-20} \
-  -e CHRONOS_TIER2_2BIT_SLOTS=${CHRONOS_TIER2_2BIT_SLOTS:-76} \
-  -e CHRONOS_TIER3_1BIT_SLOTS=${CHRONOS_TIER3_1BIT_SLOTS:-288} \
+  -e CHRONOS_TIER1_4BIT_SLOTS=${CHRONOS_TIER1_4BIT_SLOTS:-16} \
+  -e CHRONOS_TIER2_2BIT_SLOTS=${CHRONOS_TIER2_2BIT_SLOTS:-80} \
+  -e CHRONOS_TIER3_1BIT_SLOTS=${CHRONOS_TIER3_1BIT_SLOTS:-208} \
   -e CHRONOS_DECODE_TOP_K=${CHRONOS_DECODE_TOP_K:-6} \
   --entrypoint bash vllm/vllm-openai:v0.31.0-aarch64 \
   -c "pip install --no-deps --no-build-isolation -q -e /pb27_vllm && exec vllm serve $MODEL_DIR \
