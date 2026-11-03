@@ -1,0 +1,44 @@
+[01/40] L00 (6.05s) | cos_K=0.999984 | fit_D=0.3966 | rad_drift=0.00294 | dW_norm=54.85
+[02/40] L01 (4.98s) | cos_K=1.000000 | fit_D=0.3334 | rad_drift=0.00041 | dW_norm=8.19
+[03/40] L02 (1.78s) | cos_K=0.999980 | fit_D=0.3496 | rad_drift=0.00304 | dW_norm=59.36
+[04/40] L03 (4.93s) | cos_K=0.999991 | fit_D=0.3619 | rad_drift=0.00162 | dW_norm=62.54
+[05/40] L04 (5.06s) | cos_K=0.999997 | fit_D=0.3523 | rad_drift=0.00107 | dW_norm=55.40
+[06/40] L05 (4.91s) | cos_K=0.999994 | fit_D=0.3735 | rad_drift=0.00180 | dW_norm=57.62
+[07/40] L06 (5.15s) | cos_K=0.999996 | fit_D=0.3842 | rad_drift=0.00176 | dW_norm=60.52
+[08/40] L07 (4.96s) | cos_K=0.999996 | fit_D=0.4111 | rad_drift=0.00160 | dW_norm=68.30
+[09/40] L08 (5.02s) | cos_K=0.999996 | fit_D=0.3794 | rad_drift=0.00085 | dW_norm=85.86
+[10/40] L09 (4.98s) | cos_K=0.999996 | fit_D=0.3880 | rad_drift=0.00095 | dW_norm=68.92
+[11/40] L10 (5.24s) | cos_K=0.999999 | fit_D=0.3906 | rad_drift=0.00075 | dW_norm=72.16
+[12/40] L11 (5.10s) | cos_K=0.999998 | fit_D=0.4375 | rad_drift=0.00186 | dW_norm=72.99
+[13/40] L12 (4.69s) | cos_K=0.999996 | fit_D=0.3903 | rad_drift=0.00143 | dW_norm=97.39
+[14/40] L13 (5.47s) | cos_K=0.999964 | fit_D=0.3700 | rad_drift=0.01050 | dW_norm=131.98
+[15/40] L14 (4.91s) | cos_K=0.999994 | fit_D=0.3730 | rad_drift=0.00344 | dW_norm=99.42
+[16/40] L15 (4.83s) | cos_K=0.999999 | fit_D=0.3997 | rad_drift=0.00027 | dW_norm=54.28
+[17/40] L16 (4.99s) | cos_K=0.999997 | fit_D=0.3766 | rad_drift=0.00102 | dW_norm=109.84
+[18/40] L17 (5.15s) | cos_K=0.999983 | fit_D=0.3796 | rad_drift=0.00329 | dW_norm=135.69
+[19/40] L18 (5.58s) | cos_K=0.999996 | fit_D=0.3820 | rad_drift=0.00169 | dW_norm=133.77
+[20/40] L19 (4.87s) | cos_K=0.999997 | fit_D=0.4165 | rad_drift=0.00170 | dW_norm=88.61
+[21/40] L20 (5.01s) | cos_K=0.999999 | fit_D=0.3146 | rad_drift=0.00045 | dW_norm=29.95
+[22/40] L21 (5.08s) | cos_K=0.999984 | fit_D=0.3724 | rad_drift=0.00599 | dW_norm=154.88
+[23/40] L22 (4.99s) | cos_K=0.999982 | fit_D=0.3497 | rad_drift=0.00077 | dW_norm=160.32
+[24/40] L23 (4.92s) | cos_K=0.999999 | fit_D=0.3775 | rad_drift=0.00048 | dW_norm=70.46
+[25/40] L24 (4.94s) | cos_K=0.999999 | fit_D=0.3652 | rad_drift=0.00036 | dW_norm=114.45
+[26/40] L25 (4.84s) | cos_K=1.000000 | fit_D=0.3916 | rad_drift=0.00024 | dW_norm=71.27
+[27/40] L26 (5.03s) | cos_K=1.000000 | fit_D=0.4451 | rad_drift=0.00027 | dW_norm=67.33
+[28/40] L27 (5.02s) | cos_K=1.000000 | fit_D=0.4039 | rad_drift=0.00022 | dW_norm=58.45
+[29/40] L28 (5.00s) | cos_K=1.000000 | fit_D=0.4191 | rad_drift=0.00020 | dW_norm=38.23
+[30/40] L29 (5.09s) | cos_K=1.000000 | fit_D=0.3972 | rad_drift=0.00018 | dW_norm=40.59
+[31/40] L30 (4.84s) | cos_K=1.000000 | fit_D=0.3900 | rad_drift=0.00012 | dW_norm=38.68
+[32/40] L31 (5.65s) | cos_K=1.000000 | fit_D=0.4488 | rad_drift=0.00041 | dW_norm=39.50
+[33/40] L32 (5.14s) | cos_K=1.000000 | fit_D=0.3851 | rad_drift=0.00063 | dW_norm=51.16
+[34/40] L33 (4.87s) | cos_K=1.000000 | fit_D=0.3852 | rad_drift=0.00025 | dW_norm=47.10
+[35/40] L34 (5.02s) | cos_K=1.000000 | fit_D=0.3835 | rad_drift=0.00028 | dW_norm=49.59
+[36/40] L35 (4.83s) | cos_K=0.999999 | fit_D=0.4193 | rad_drift=0.00105 | dW_norm=66.23
+[37/40] L36 (4.95s) | cos_K=1.000000 | fit_D=0.3879 | rad_drift=0.00080 | dW_norm=57.17
+[38/40] L37 (4.76s) | cos_K=0.999999 | fit_D=0.4054 | rad_drift=0.00188 | dW_norm=71.33
+[39/40] L38 (4.89s) | cos_K=0.999998 | fit_D=0.4239 | rad_drift=0.00394 | dW_norm=96.92
+[40/40] L39 (5.09s) | cos_K=1.000000 | fit_D=0.4757 | rad_drift=0.00119 | dW_norm=83.29
+================================================================================
+ALL 40 LAYERS COMPLETE in 198.70s -> /content/dsv41_shared_experts_option_a_r64.pt (38.04 MB)
+40-Layer Mean cos_K=0.999995 | Mean fit_D=0.3897 | Mean radial_drift=0.00154
+================================================================================

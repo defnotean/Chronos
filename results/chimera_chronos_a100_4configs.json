@@ -1,0 +1,57 @@
+[
+  {
+    "name": "GLM-96 + Chimera-LSA Geodesic Option-A (96/0/0)",
+    "n4": 96,
+    "n2": 0,
+    "n1": 0,
+    "ternary": true,
+    "gib_40_layers": 72.1554183959961,
+    "decode_latency_us": 578.5644950083224,
+    "cos_vs_384_gt": 0.7726588249206543,
+    "snr_vs_384_gt_db": 3.456440269947052
+  },
+  {
+    "name": "Tiered 212 + Chimera-LSA Ternary + Option-A (56/56/100)",
+    "n4": 56,
+    "n2": 56,
+    "n1": 100,
+    "ternary": true,
+    "gib_40_layers": 80.7253646850586,
+    "decode_latency_us": 478.5387499941862,
+    "cos_vs_384_gt": 0.8666383028030396,
+    "snr_vs_384_gt_db": 6.0264259576797485
+  },
+  {
+    "name": "Hybrid 224 + Chimera-LSA Ternary + Option-A (96/128/0)",
+    "n4": 96,
+    "n2": 128,
+    "n1": 0,
+    "ternary": true,
+    "gib_40_layers": 116.9796371459961,
+    "decode_latency_us": 506.89813000644784,
+    "cos_vs_384_gt": 0.9307078719139099,
+    "snr_vs_384_gt_db": 8.853113055229187
+  },
+  {
+    "name": "Full 384 Active: 96 4-Bit Hot + 288 Legacy 2-Bit (96/288/0)",
+    "n4": 96,
+    "n2": 288,
+    "n1": 0,
+    "ternary": false,
+    "gib_40_layers": 173.0099105834961,
+    "decode_latency_us": 506.61360000958666,
+    "cos_vs_384_gt": 0.9653208255767822,
+    "snr_vs_384_gt_db": 11.600029468536377
+  },
+  {
+    "name": "Full 384 Active: 96 4-Bit Hot + 288 1.58-Bit Ternary (96/288/0)",
+    "n4": 96,
+    "n2": 288,
+    "n1": 0,
+    "ternary": true,
+    "gib_40_layers": 173.0099105834961,
+    "decode_latency_us": 504.9322100057907,
+    "cos_vs_384_gt": 0.9499839544296265,
+    "snr_vs_384_gt_db": 10.156937837600708
+  }
+]

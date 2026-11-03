@@ -187,8 +187,25 @@ def main() -> None:
             dW_sh = (H_w.T @ torch.linalg.solve(A, Y_w_tan)).T  # (5120, 2304)
 
             U_d, S_d, Vh_d = torch.linalg.svd(dW_sh, full_matrices=False)
-            U_r = (U_d[:, :RANK_OUT] * S_d[:RANK_OUT].unsqueeze(0)).to(torch.bfloat16).cpu().contiguous()
-            V_r = Vh_d[:RANK_OUT, :].to(torch.bfloat16).cpu().contiguous()
+            U_r_f = U_d[:, :RANK_OUT] * S_d[:RANK_OUT].unsqueeze(0)
+            V_r_f = Vh_d[:RANK_OUT, :]
+            dW_r64_raw = U_r_f @ V_r_f
+
+            # Post-SVD Spherical Radial Norm Calibration (Theorem 6): absorb optimal scalar gamma* into U_r
+            dY_raw = OPT_A_ALPHA * (H_D @ dW_r64_raw.T)
+            r_target = Y_anchor_D.norm(dim=-1)
+            gammas = torch.linspace(0.25, 1.75, 61, device=device)
+            best_g = 1.0
+            best_drift = 1e30
+            for g_cand in gammas.tolist():
+                r_cand = (Y_sh_D + g_cand * dY_raw).norm(dim=-1)
+                drift_c = ((r_cand - r_target).abs() / r_target.clamp(min=1e-6)).mean().item()
+                if drift_c < best_drift:
+                    best_drift = drift_c
+                    best_g = g_cand
+
+            U_r = (U_r_f * best_g).to(torch.bfloat16).cpu().contiguous()
+            V_r = V_r_f.to(torch.bfloat16).cpu().contiguous()
 
             dW_r64 = U_r.to(device=device, dtype=torch.float32) @ V_r.to(device=device, dtype=torch.float32)
             W_new = sh_w2 + OPT_A_ALPHA * dW_r64

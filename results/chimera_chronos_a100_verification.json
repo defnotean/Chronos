@@ -1,0 +1,56 @@
+{
+  "hardware": "NVIDIA A100-SXM4-80GB",
+  "torch_version": "2.11.0+cu130",
+  "tests": {
+    "upgrade_a_ternary_tier2": {
+      "shannon_entropy_bits": 1.56044242435545,
+      "theoretical_bound_bits": 1.584962500721156,
+      "exact_zero_sparsity_pct": 42.18733608722687,
+      "invalid_code3_count": 0,
+      "snr_ternary_db": 7.255988717079163,
+      "snr_legacy_db": 8.917370438575745,
+      "cos_ternary": 0.9010525941848755,
+      "cos_legacy": 0.9366718530654907,
+      "passed": true
+    },
+    "upgrade_b_tangent_sphere": {
+      "drift_unretracted_pct": 380.4946184158325,
+      "drift_retracted_pct": 1.3665163578480133e-05,
+      "identity_max_err": 0.0,
+      "passed": true
+    },
+    "upgrade_c_geodesic_option_a_and_live_moe": {
+      "cos_K_euclidean": 0.9999567866325378,
+      "cos_K_geodesic": 0.9999796748161316,
+      "fit_D_euclidean": 0.313816100358963,
+      "fit_D_geodesic": 0.3495900630950928,
+      "radial_drift_euclidean": 0.004904534202069044,
+      "radial_drift_geodesic": 0.003042326308786869,
+      "glm96_decode_latency_us": 579.9275249955826,
+      "full384_ternary_decode_latency_us": 492.7650700119557,
+      "cos_glm96_vs_384_active": 0.8304921984672546,
+      "passed": true
+    },
+    "upgrade_d_opencode_tool_bridge": {
+      "deepseek_v41_args": {
+        "path": "src/main.py",
+        "start_line": 42,
+        "create_backup": true,
+        "threshold": 0.95
+      },
+      "lfm3_xml_args": {
+        "path": "src/main.py",
+        "start_line": 42,
+        "create_backup": true,
+        "threshold": 0.95
+      },
+      "qwen_json_args": {
+        "path": "src/main.py",
+        "start_line": 42,
+        "create_backup": false,
+        "threshold": 0.95
+      },
+      "passed": true
+    }
+  }
+}
