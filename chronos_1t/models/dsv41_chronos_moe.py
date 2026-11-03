@@ -783,7 +783,7 @@ try:
             + tl.abs(w7),
             axis=0,
         )
-        s_l1 = _encode_ufp8_e5m3(l1_sum * (1.05 / 64.0))
+        s_l1 = _encode_ufp8_e5m3(l1_sum * (1.0 / 64.0))
 
         par1 = ((row + grp + offs8) & 1) == 0
         b0 = tl.where(tl.where(par1, w0 > 0.0, w0 >= 0.0), 1, 0).to(tl.uint8)
@@ -2191,9 +2191,9 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
 
         default_dec_k = str(self.top_k)
         self.decode_top_k = max(1, min(self.top_k, int(os.environ.get("CHRONOS_DECODE_TOP_K", default_dec_k))))
-        self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "52"))
+        self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "48"))
         self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "56"))
-        default_n1 = min(96, max(0, 384 - self.n4_slots - self.n2_slots))
+        default_n1 = min(88, max(0, 384 - self.n4_slots - self.n2_slots))
         self.n1_slots = int(os.environ.get("CHRONOS_TIER3_1BIT_SLOTS", str(default_n1)))
 
         if self.use_fp4_slot_cache:

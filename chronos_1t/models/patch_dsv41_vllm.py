@@ -50,7 +50,7 @@ def _evict_page_cache(file_path: str) -> None:
     gc.collect()
     if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
         try:
-            fd = os.open(file_path, os.O_RDONLY)
+            fd = os.open(os.path.realpath(file_path), os.O_RDONLY)
             try:
                 os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
             finally:
@@ -872,7 +872,8 @@ def enable_chronos_dsv41_vllm_hook(
         _def_eff = int(os.environ.get("CHRONOS_DEFAULT_REASONING_EFFORT", "20"))
         if hasattr(_dsv41_enc, "REASONING_EFFORT_MAPPINGS"):
             _dsv41_enc.REASONING_EFFORT_MAPPINGS["low"] = _def_eff
-            _dsv41_enc.REASONING_EFFORT_MAPPINGS["high"] = _def_eff
+            if os.environ.get("CHRONOS_FORCE_HIGH_REASONING_EFFORT"):
+                _dsv41_enc.REASONING_EFFORT_MAPPINGS["high"] = int(os.environ["CHRONOS_FORCE_HIGH_REASONING_EFFORT"])
     except Exception:
         pass
 
