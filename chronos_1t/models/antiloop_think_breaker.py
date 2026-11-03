@@ -138,11 +138,10 @@ def _antiloop_think_kernel(
 
     row_logits_ptr = logits_ptr + row_idx * logits_stride
 
-    # Only penalize 6-token phrase loops when the 5-token context [t5,t4,t3,t2,t1] has ALREADY occurred >= 2 times in this section
+    # Penalize 6-token exact phrase loops within the current section
     m5 = v_m5 & (prev1 == t1) & (prev2 == t2) & (prev3 == t3) & (prev4 == t4) & (prev5 == t5)
-    m5_count = tl.sum(m5.to(tl.int32), axis=0)
-    has_pen = m5 & (m5_count >= 2) & (win_tok >= 0) & (win_tok < 129280)
-    tl.atomic_add(row_logits_ptr + tl.maximum(win_tok, 0), tl.full((WIN_SIZE,), -5.0, dtype=tl.bfloat16), mask=has_pen)
+    has_pen = m5 & (win_tok >= 0) & (win_tok < 129280)
+    tl.atomic_add(row_logits_ptr + tl.maximum(win_tok, 0), tl.full((WIN_SIZE,), -6.0, dtype=tl.bfloat16), mask=has_pen)
 
     is_prior = offs < (WIN_SIZE - 1)
     a3 = is_prior & v_m2 & (win_tok == t1) & (prev1 == t2) & (prev2 == t3)
@@ -171,13 +170,13 @@ def _antiloop_think_kernel(
         tl.store(row_logits_ptr + THINK_START_ID, tl.full((), -1000.0, dtype=tl.bfloat16))
         tl.store(row_logits_ptr + THINK_END_ID, tl.full((), -1000.0, dtype=tl.bfloat16))
         post_think_len = eff_len - (last_end + 1)
-        if (last_end >= 0) & (post_think_len < 6) & (t1 != 128807):
+        if (last_end >= 0) & (post_think_len < 2) & (t1 != 128807):
             tl.store(row_logits_ptr + 1, tl.full((), -1000.0, dtype=tl.bfloat16))
             tl.store(row_logits_ptr + 128805, tl.full((), -1000.0, dtype=tl.bfloat16))
 
     loop_in_think = (
-        (prior_6gram >= 3)
-        | (prior_4gram >= 5)
+        (prior_6gram >= 1)
+        | (prior_4gram >= 3)
         | stutter_4
         | tandem_2
         | tandem_3
