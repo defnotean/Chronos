@@ -30,11 +30,12 @@ rm -rf "$SERVING_DIR/chronos_1t/models/__pycache__" "$SERVING_DIR/pb27_vllm/__py
 # 2. Stop any existing pb27-vllm container and disable swap to prevent GB10 UVM/kswapd0 live-lock
 docker rm -f pb27-vllm >/dev/null 2>&1 || true
 sudo -n swapoff -a >/dev/null 2>&1 || true
+sudo -n sysctl -w vm.min_free_kbytes=1048576 >/dev/null 2>&1 || true
 sleep 2
 
-# 3. Launch pb27-vllm container on :$PORT (hard-capped at 96g RAM / 0 swap to protect host sshd/OS)
+# 3. Launch pb27-vllm container on :$PORT (hard-capped at 96g RAM / 0 swap + oom-score-adj=500 to protect host sshd/OS)
 nohup bash /home/defnotean/gpu_run.sh docker run --rm --name pb27-vllm --gpus all --ipc host --network host \
-  --memory=96g --memory-swap=96g \
+  --memory=96g --memory-swap=96g --oom-score-adj=500 \
   -v /home/defnotean/.cache/huggingface:/root/.cache/huggingface \
   -v /home/defnotean/.cache/vllm:/root/.cache/vllm \
   -v /home/defnotean/.cache/flashinfer:/root/.cache/flashinfer \
