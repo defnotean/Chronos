@@ -596,6 +596,7 @@ def enable_chronos_dsv41_vllm_hook(
 
         if not getattr(_dg_mod, "_chronos_sm120_bkv32_patched", False):
             _orig_paged_mqa = _dg_mod.fp8_fp4_paged_mqa_logits
+            _zeroed_mqa_ptrs: set[int] = set()
 
             def _chronos_paged_mqa_logits(
                 q: Any,
@@ -608,6 +609,16 @@ def enable_chronos_dsv41_vllm_hook(
                 clean_logits: bool = False,
                 indices: torch.Tensor | None = None,
             ) -> torch.Tensor:
+                if kv_cache.shape[0] > 0:
+                    if not torch.cuda.is_current_stream_capturing():
+                        _ptr = int(kv_cache.data_ptr())
+                        if _ptr not in _zeroed_mqa_ptrs:
+                            kv_cache.zero_()
+                            _zeroed_mqa_ptrs.add(_ptr)
+                        else:
+                            kv_cache[0].zero_()
+                    else:
+                        kv_cache[0].zero_()
                 eff_max_len = min(int(max_model_len), max(512, int(block_tables.shape[1]) * 64))
                 if kv_cache.ndim == 4 and kv_cache.shape[1] == 32 and q[1] is None:
                     bsz = block_tables.shape[0]
@@ -690,6 +701,7 @@ def enable_chronos_dsv41_vllm_hook(
 
         if not getattr(_fis_mod, "_chronos_sm120_chunk_patched", False):
             _orig_fi_dsv4 = _fis_mod.flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+            _zeroed_fi_ptrs: set[int] = set()
 
             def _chronos_fi_dsv4(
                 *,
@@ -707,6 +719,27 @@ def enable_chronos_dsv41_vllm_hook(
                 extra_sparse_topk_lens: torch.Tensor | None = None,
                 **kwargs: Any,
             ) -> torch.Tensor:
+                _capturing = torch.cuda.is_current_stream_capturing()
+                if swa_kv_cache.shape[0] > 0:
+                    if not _capturing:
+                        _sptr = int(swa_kv_cache.data_ptr())
+                        if _sptr not in _zeroed_fi_ptrs:
+                            swa_kv_cache.zero_()
+                            _zeroed_fi_ptrs.add(_sptr)
+                        else:
+                            swa_kv_cache[0].zero_()
+                    else:
+                        swa_kv_cache[0].zero_()
+                if compressed_kv_cache is not None and compressed_kv_cache.shape[0] > 0:
+                    if not _capturing:
+                        _cptr = int(compressed_kv_cache.data_ptr())
+                        if _cptr not in _zeroed_fi_ptrs:
+                            compressed_kv_cache.zero_()
+                            _zeroed_fi_ptrs.add(_cptr)
+                        else:
+                            compressed_kv_cache[0].zero_()
+                    else:
+                        compressed_kv_cache[0].zero_()
                 n_tok = query.shape[0]
                 if n_tok <= 64:
                     return _orig_fi_dsv4(
