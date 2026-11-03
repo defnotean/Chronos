@@ -748,7 +748,7 @@ try:
         wq_dot = tl.sum(w0 * q0 + w1 * q1 + w2 * q2 + w3 * q3, axis=0)
         q_sq = tl.sum(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3, axis=0)
         packed = c0 | (c1 << 2) | (c2 << 4) | (c3 << 6)
-        s_norm = _encode_ufp8_e5m3((tl.maximum(wq_dot, 0.0) / (q_sq + 1e-12)) * 1.08)
+        s_norm = _encode_ufp8_e5m3(tl.maximum(wq_dot, 0.0) / (q_sq + 1e-12))
         tl.store(Out_s_fp8_ptr + row * N_GROUPS_C + grp, s_norm)
         tl.store(Out_u8_ptr + row * (N_GROUPS_C * 16) + grp * 16 + offs16, packed)
 
@@ -783,7 +783,7 @@ try:
             + tl.abs(w7),
             axis=0,
         )
-        s_l1 = _encode_ufp8_e5m3(l1_sum * (1.25 / 64.0))
+        s_l1 = _encode_ufp8_e5m3(l1_sum * (1.0 / 64.0))
 
         par1 = ((row + grp + offs8) & 1) == 0
         b0 = tl.where(tl.where(par1, w0 > 0.0, w0 >= 0.0), 1, 0).to(tl.uint8)
@@ -2124,10 +2124,8 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         tp = f"layers.{layer_idx}.ffn"
         if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_SEQUENTIAL"):
             try:
-                _fd_r = os.open(self.shard_path_str, os.O_RDONLY)
+                _fd_r = os.open(os.path.realpath(self.shard_path_str), os.O_RDONLY)
                 os.posix_fadvise(_fd_r, 0, 0, os.POSIX_FADV_SEQUENTIAL)
-                if hasattr(os, "POSIX_FADV_WILLNEED") and layer_idx < 16:
-                    os.posix_fadvise(_fd_r, 0, 0, os.POSIX_FADV_WILLNEED)
                 os.close(_fd_r)
             except OSError:
                 pass
@@ -2193,9 +2191,9 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
 
         default_dec_k = str(self.top_k)
         self.decode_top_k = max(1, min(self.top_k, int(os.environ.get("CHRONOS_DECODE_TOP_K", default_dec_k))))
-        self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "16"))
-        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "88"))
-        default_n1 = min(200, max(0, 384 - self.n4_slots - self.n2_slots))
+        self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "48"))
+        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "56"))
+        default_n1 = min(88, max(0, 384 - self.n4_slots - self.n2_slots))
         self.n1_slots = int(os.environ.get("CHRONOS_TIER3_1BIT_SLOTS", str(default_n1)))
 
         if self.use_fp4_slot_cache:
@@ -2707,9 +2705,11 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
             for _ev_p in (self.shard_path_str, str(self._hot_shard_cand)):
                 try:
-                    fd = os.open(_ev_p, os.O_RDONLY)
-                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                    os.close(fd)
+                    _rp = os.path.realpath(_ev_p)
+                    if os.path.exists(_rp):
+                        fd = os.open(_rp, os.O_RDONLY)
+                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                        os.close(fd)
                 except OSError:
                     pass
 
@@ -2721,10 +2721,8 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         try:
             if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_SEQUENTIAL"):
                 try:
-                    fd_h = os.open(str(self._hot_shard_cand), os.O_RDONLY)
+                    fd_h = os.open(os.path.realpath(str(self._hot_shard_cand)), os.O_RDONLY)
                     os.posix_fadvise(fd_h, 0, 0, os.POSIX_FADV_SEQUENTIAL)
-                    if hasattr(os, "POSIX_FADV_WILLNEED") and self.layer_idx < 16:
-                        os.posix_fadvise(fd_h, 0, 0, os.POSIX_FADV_WILLNEED)
                     os.close(fd_h)
                 except OSError:
                     pass

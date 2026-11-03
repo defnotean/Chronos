@@ -1,11 +1,15 @@
 import os
 import torch
-from vllm.triton_utils import triton, tl
+try:
+    from vllm.triton_utils import triton, tl
+except ImportError:
+    import triton
+    import triton.language as tl
 
 THINK_START_ID = 128821     # <think> in DeepSeek-V4.1-Flash-1017
 THINK_END_ID = 128822       # </think> in DeepSeek-V4.1-Flash-1017
-TOOL_CALLS_END_ID = 128807  # <?tool?calls?end?>
-EOS_ID = 1                  # <?end?of?sentence?>
+TOOL_CALLS_END_ID = 128807  # <｜tool▁calls▁end｜>
+EOS_ID = 1                  # <｜end▁of▁sentence｜>
 EOT_ID = 128805             # <|EOT|>
 
 
@@ -80,11 +84,13 @@ def _antiloop_think_kernel(
     last_end = tl.max(tl.where(valid_think_scan & (win_tok == THINK_END_ID), pos, -1), axis=0)
 
     raw_think_len = eff_len - (last_start + 1)
-    in_think = (last_start >= 0) & (last_start > last_end) & (raw_think_len <= think_budget + 4)
-    think_closed = ((last_end >= tl.maximum(prefill_len - 1, 0)) & (last_end > last_start)) | (raw_think_len > think_budget + 4)
+    in_think = (last_start >= 0) & (last_start > last_end) & (raw_think_len <= think_budget + 24)
+    think_closed = ((last_end >= tl.maximum(prefill_len - 1, 0)) & (last_end > last_start)) | (raw_think_len > think_budget + 24)
     think_len = tl.where(in_think, raw_think_len, 0)
 
-    gen_len = eff_len - prefill_len
+    # Isolate post-</think> content from <think> so final answers/code never get penalized for echoing <think>
+    section_start = tl.where(think_closed & (last_end >= prefill_len), last_end + 1, prefill_len)
+    gen_len = eff_len - section_start
 
     t1 = tl.sum(tl.where(offs == WIN_SIZE - 1, win_tok, 0), axis=0)
     t2 = tl.sum(tl.where(offs == WIN_SIZE - 2, win_tok, 0), axis=0)
@@ -99,14 +105,14 @@ def _antiloop_think_kernel(
     pos_m4 = pos - 4
     pos_m5 = pos - 5
 
-    v_m2 = pos_m2 >= prefill_len
-    v_m3 = pos_m3 >= prefill_len
-    v_m4 = pos_m4 >= prefill_len
-    v_m5 = pos_m5 >= prefill_len
+    v_m2 = pos_m2 >= section_start
+    v_m3 = pos_m3 >= section_start
+    v_m4 = pos_m4 >= section_start
+    v_m5 = pos_m5 >= section_start
 
     prev1 = tl.where(
         pos_m1 < total_len,
-        tl.load(all_token_ids_ptr + req_idx.to(tl.int64) * all_token_ids_stride + tl.maximum(pos_m1, 0), mask=pos_m1 >= prefill_len, other=-2),
+        tl.load(all_token_ids_ptr + req_idx.to(tl.int64) * all_token_ids_stride + tl.maximum(pos_m1, 0), mask=pos_m1 >= section_start, other=-2),
         tl.load(s_ids_ptr + first_row + (pos_m1 - total_len) + 1, mask=(pos_m1 >= total_len) & (pos_m1 < eff_len), other=-2),
     )
     prev2 = tl.where(
@@ -132,10 +138,11 @@ def _antiloop_think_kernel(
 
     row_logits_ptr = logits_ptr + row_idx * logits_stride
 
-    # Only penalize true 6-token exact phrase loops (when the 5-token context [t5,t4,t3,t2,t1] already occurred)
+    # Only penalize 6-token phrase loops when the 5-token context [t5,t4,t3,t2,t1] has ALREADY occurred >= 2 times in this section
     m5 = v_m5 & (prev1 == t1) & (prev2 == t2) & (prev3 == t3) & (prev4 == t4) & (prev5 == t5)
-    has_pen = m5 & (win_tok >= 0) & (win_tok < 129280)
-    tl.atomic_add(row_logits_ptr + tl.maximum(win_tok, 0), tl.full((WIN_SIZE,), -6.0, dtype=tl.bfloat16), mask=has_pen)
+    m5_count = tl.sum(m5.to(tl.int32), axis=0)
+    has_pen = m5 & (m5_count >= 2) & (win_tok >= 0) & (win_tok < 129280)
+    tl.atomic_add(row_logits_ptr + tl.maximum(win_tok, 0), tl.full((WIN_SIZE,), -5.0, dtype=tl.bfloat16), mask=has_pen)
 
     is_prior = offs < (WIN_SIZE - 1)
     a3 = is_prior & v_m2 & (win_tok == t1) & (prev1 == t2) & (prev2 == t3)
@@ -156,7 +163,7 @@ def _antiloop_think_kernel(
     if tandem_3 & (t3 >= 0) & (t3 < 129280):
         tl.atomic_add(row_logits_ptr + t3, tl.full((), -12.0, dtype=tl.bfloat16))
 
-    # Immediate clean termination right after <?tool?calls?end?> (128807)
+    # Immediate clean termination right after <｜tool▁calls▁end｜> (128807)
     if t1 == 128807:
         tl.store(row_logits_ptr + 1, tl.full((), 1000.0, dtype=tl.bfloat16))
 
@@ -169,15 +176,17 @@ def _antiloop_think_kernel(
             tl.store(row_logits_ptr + 128805, tl.full((), -1000.0, dtype=tl.bfloat16))
 
     loop_in_think = (
-        (prior_6gram >= 1)
-        | (prior_4gram >= 3)
+        (prior_6gram >= 3)
+        | (prior_4gram >= 5)
         | stutter_4
         | tandem_2
         | tandem_3
     )
-    if in_think & (think_len >= (think_budget - 24)):
-        tl.atomic_add(row_logits_ptr + THINK_END_ID, tl.full((), 6.0, dtype=tl.bfloat16))
-    if in_think & ((think_len >= think_budget) | loop_in_think):
+    if in_think & (think_len >= (think_budget - 16)):
+        tl.atomic_add(row_logits_ptr + THINK_END_ID, tl.full((), 5.5, dtype=tl.bfloat16))
+    if in_think & (think_len >= think_budget):
+        tl.atomic_add(row_logits_ptr + THINK_END_ID, tl.full((), 8.5, dtype=tl.bfloat16))
+    if in_think & ((think_len >= (think_budget + 20)) | loop_in_think):
         tl.store(row_logits_ptr + THINK_END_ID, tl.full((), 1000.0, dtype=tl.bfloat16))
 
 
