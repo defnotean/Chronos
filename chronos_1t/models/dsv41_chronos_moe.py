@@ -816,7 +816,7 @@ try:
         wq_dot = tl.sum(w0 * q0 + w1 * q1 + w2 * q2 + w3 * q3, axis=0)
         q_sq = tl.sum(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3, axis=0)
         packed = c0 | (c1 << 2) | (c2 << 4) | (c3 << 6)
-        s_norm = _encode_ufp8_e5m3(tl.maximum(wq_dot, 0.0) / (q_sq + 1e-12))
+        s_norm = _encode_ufp8_e5m3((tl.maximum(wq_dot, 0.0) / (q_sq + 1e-12)) * 1.08)
         tl.store(Out_s_fp8_ptr + row * N_GROUPS_C + grp, s_norm)
         tl.store(Out_u8_ptr + row * (N_GROUPS_C * 16) + grp * 16 + offs16, packed)
 
@@ -944,6 +944,7 @@ try:
         routed_scaling_factor,
         SHARED_SLOT: tl.constexpr,
         K_ACT: tl.constexpr,
+        MAX_T3: tl.constexpr = 6,
     ):
         offs = tl.arange(0, 512)
         mask = offs < 384
@@ -954,16 +955,24 @@ try:
         bias_raw = tl.load(Bias_ptr + offs, mask=mask, other=-1e30).to(tl.float32)
         bias = tl.where(bias_raw == bias_raw, bias_raw, 0.0)
         tslot_all = tl.load(Tier_slot_map_ptr + offs, mask=mask, other=-1).to(tl.int32)
-        valid_mask = mask & (tslot_all >= 0)
+        if MAX_T3 == 0:
+            valid_mask = mask & (tslot_all >= 0) & (tslot_all < 2048)
+        else:
+            valid_mask = mask & (tslot_all >= 0)
         biased = tl.where(valid_mask, score + bias, -1e30)
 
         k_offs = tl.arange(0, 8)
         kept_vec = tl.zeros((8,), dtype=tl.float32)
+        t3_cnt = tl.zeros((), dtype=tl.int32)
         for k in tl.static_range(K_ACT):
+            if MAX_T3 > 0 and MAX_T3 < 6:
+                biased = tl.where((t3_cnt >= MAX_T3) & (tslot_all >= 2048), -1e30, biased)
             best_idx = tl.argmax(biased, axis=0)
             in_bounds = (best_idx >= 0) & (best_idx < 384)
             w_k = tl.max(tl.where(offs == best_idx, score, 0.0), axis=0)
             tslot = tl.load(Tier_slot_map_ptr + best_idx, mask=in_bounds, other=-1).to(tl.int32)
+            if MAX_T3 > 0 and MAX_T3 < 6:
+                t3_cnt += tl.where(tslot >= 2048, 1, 0)
             tl.store(Active_slots_ptr + k, tslot)
             is_kept = tl.where(tslot >= 0, w_k, 0.0)
             kept_vec = tl.where(k_offs == k, is_kept, kept_vec)
@@ -2363,7 +2372,8 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 self.s2_d_fp8 = self.w4_d_u8
 
             t3_cpu_from = int(os.environ.get("CHRONOS_T3_CPU_FROM_LAYER", "40"))
-            self.t3_on_cpu = bool(self.n1_slots > 0 and layer_idx >= t3_cpu_from)
+            t3_cpu_to = int(os.environ.get("CHRONOS_T3_CPU_TO_LAYER", "40"))
+            self.t3_on_cpu = bool(self.n1_slots > 0 and (t3_cpu_from <= layer_idx < t3_cpu_to))
             if self.t3_on_cpu:
                 try:
                     self.w1_gu_cpu = torch.empty((self.n1_slots, 4608, 640), dtype=torch.uint8, device="cpu", pin_memory=True)
@@ -2542,7 +2552,14 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 prior_mc = (freq_mc + scores_mc.mean(dim=0)).cpu().tolist()
                 del x_mc, logits_mc, scores_mc, top6_mc, freq_mc
 
-                ranked_eids = sorted(range(384), key=lambda e: prior_mc[e], reverse=True)
+                hot_set = set(self.hot_expert_ids_list)
+                hot_ranked = sorted(self.hot_expert_ids_list, key=lambda e: prior_mc[e], reverse=True)
+                cold_ranked = sorted(
+                    (eid for eid in range(384) if eid not in hot_set),
+                    key=lambda e: prior_mc[e],
+                    reverse=True,
+                )
+                ranked_eids = hot_ranked + cold_ranked
                 tier1_eids = ranked_eids[: self.n4_slots]
                 tier2_eids = ranked_eids[self.n4_slots : self.n4_slots + self.n2_slots]
                 tier3_eids = ranked_eids[
@@ -3145,8 +3162,9 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     image_mask = (input_ids >= 129264) & (input_ids < 129269)
 
             raw_logits = F.linear(x, self.router_w)
+            mt3 = int(getattr(self, "_active_mt3", 6))
             has_t2 = self.n2_slots > 0
-            has_t3 = self.n1_slots > 0
+            has_t3 = (self.n1_slots > 0) and (mt3 > 0)
             if n_toks == 1:
                 out_y = getattr(self, "_out_y_buf", None)
                 if out_y is None or out_y.shape != x.shape or out_y.is_inference():
@@ -3167,9 +3185,10 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     float(self.routed_scaling_factor),
                     SHARED_SLOT=self.shared_slot,
                     K_ACT=k_act,
+                    MAX_T3=mt3,
                     num_warps=4,
                 )
-                if self.t3_on_cpu:
+                if self.t3_on_cpu and mt3 > 0:
                     self._stage_t3_bounce_slots(k_act)
                 _triton_dsv41_tiered_gu_swiglu_kernel[(2304 // 8, n_active)](
                     x,
@@ -3245,9 +3264,10 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     float(self.routed_scaling_factor),
                     SHARED_SLOT=self.shared_slot,
                     K_ACT=k_act,
+                    MAX_T3=mt3,
                     num_warps=4,
                 )
-                if self.t3_on_cpu:
+                if self.t3_on_cpu and mt3 > 0:
                     self._stage_t3_bounce_slots(k_act)
                 _triton_dsv41_tiered_gu_swiglu_kernel[(2304 // 8, n_active)](
                     x[t_i : t_i + 1],
