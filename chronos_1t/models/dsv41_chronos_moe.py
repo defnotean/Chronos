@@ -693,6 +693,19 @@ try:
         return tl.where(u < 8, sub_f, norm_f)
 
     @triton.jit
+    def _encode_ufp8_e5m3(val_f32):
+        v = tl.minimum(tl.maximum(val_f32, 0.0), 480.0)
+        bits = v.to(tl.int32, bitcast=True) + (1 << 19)
+        u = tl.minimum(tl.maximum((bits >> 20) - 832, 1), 255).to(tl.uint8)
+        return tl.where(v > 1.3411045e-7, u, tl.zeros_like(u))
+
+    @triton.jit
+    def _decode_ufp8_e5m3(u8_val):
+        u = u8_val.to(tl.int32) & 0xFF
+        f = ((u + 832) << 20).to(tl.float32, bitcast=True)
+        return tl.where(u == 0, 0.0, f)
+
+    @triton.jit
     def _triton_quantize_2bit_g64_kernel(
         W_ptr,
         Out_u8_ptr,
@@ -726,9 +739,10 @@ try:
         q1 = c1.to(tl.float32) - 1.5
         q2 = c2.to(tl.float32) - 1.5
         q3 = c3.to(tl.float32) - 1.5
+        wq_dot = tl.sum(w0 * q0 + w1 * q1 + w2 * q2 + w3 * q3, axis=0)
         q_sq = tl.sum(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3, axis=0)
         packed = c0 | (c1 << 2) | (c2 << 4) | (c3 << 6)
-        s_norm = _encode_pos_f32_to_fp8e4m3_u8(tl.sqrt(sq_sum / (q_sq + 1e-12)))
+        s_norm = _encode_ufp8_e5m3((tl.maximum(wq_dot, 0.0) / (q_sq + 1e-12)) * 1.08)
         tl.store(Out_s_fp8_ptr + row * N_GROUPS_C + grp, s_norm)
         tl.store(Out_u8_ptr + row * (N_GROUPS_C * 16) + grp * 16 + offs16, packed)
 
@@ -752,18 +766,18 @@ try:
         w6 = tl.load(base_w + offs8 + 48).to(tl.float32)
         w7 = tl.load(base_w + offs8 + 56).to(tl.float32)
 
-        sq_sum = tl.sum(
-            w0 * w0
-            + w1 * w1
-            + w2 * w2
-            + w3 * w3
-            + w4 * w4
-            + w5 * w5
-            + w6 * w6
-            + w7 * w7,
+        l1_sum = tl.sum(
+            tl.abs(w0)
+            + tl.abs(w1)
+            + tl.abs(w2)
+            + tl.abs(w3)
+            + tl.abs(w4)
+            + tl.abs(w5)
+            + tl.abs(w6)
+            + tl.abs(w7),
             axis=0,
         )
-        s_rms = _encode_pos_f32_to_fp8e4m3_u8(tl.sqrt(sq_sum * (1.0 / 64.0) + 1e-12))
+        s_l1 = _encode_ufp8_e5m3(l1_sum * (1.25 / 64.0))
 
         b0 = tl.where(w0 >= 0.0, 1, 0).to(tl.uint8)
         b1 = tl.where(w1 >= 0.0, 2, 0).to(tl.uint8)
@@ -775,7 +789,7 @@ try:
         b7 = tl.where(w7 >= 0.0, 128, 0).to(tl.uint8)
         packed = b0 | b1 | b2 | b3 | b4 | b5 | b6 | b7
 
-        tl.store(Out_s_fp8_ptr + row * N_GROUPS_C + grp, s_rms)
+        tl.store(Out_s_fp8_ptr + row * N_GROUPS_C + grp, s_l1)
         tl.store(Out_u8_ptr + row * (N_GROUPS_C * 8) + grp * 8 + offs8, packed)
 
     @triton.jit
@@ -968,7 +982,7 @@ try:
                 x_sum = (x0 + x1 + x2 + x3) * 1.5
 
                 w1_b = tl.load(w1_base2 + b_idx[None, :])
-                s1_f = _decode_pos_fp8e4m3_u8_to_f32(tl.load(s1_base2 + sg_idx[None, :]))
+                s1_f = _decode_ufp8_e5m3(tl.load(s1_base2 + sg_idx[None, :]))
                 v1 = (
                     (w1_b & 3).to(tl.float32) * x0[None, :]
                     + ((w1_b >> 2) & 3).to(tl.float32) * x1[None, :]
@@ -979,7 +993,7 @@ try:
                 acc1 += tl.sum(v1, axis=1)
 
                 w3_b = tl.load(w3_base2 + b_idx[None, :])
-                s3_f = _decode_pos_fp8e4m3_u8_to_f32(tl.load(s3_base2 + sg_idx[None, :]))
+                s3_f = _decode_ufp8_e5m3(tl.load(s3_base2 + sg_idx[None, :]))
                 v3 = (
                     (w3_b & 3).to(tl.float32) * x0[None, :]
                     + ((w3_b >> 2) & 3).to(tl.float32) * x1[None, :]
@@ -1016,7 +1030,7 @@ try:
                 x_half_sum = (x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7) * 0.5
 
                 w1_b = tl.load(w1_base1 + b_idx[None, :])
-                s1_f2 = _decode_pos_fp8e4m3_u8_to_f32(tl.load(s1_base1 + sg_idx[None, :])) * 2.0
+                s1_f2 = _decode_ufp8_e5m3(tl.load(s1_base1 + sg_idx[None, :])) * 2.0
                 v1 = (
                     (w1_b & 1).to(tl.float32) * x0[None, :]
                     + ((w1_b >> 1) & 1).to(tl.float32) * x1[None, :]
@@ -1031,7 +1045,7 @@ try:
                 acc1 += tl.sum(v1, axis=1)
 
                 w3_b = tl.load(w3_base1 + b_idx[None, :])
-                s3_f2 = _decode_pos_fp8e4m3_u8_to_f32(tl.load(s3_base1 + sg_idx[None, :])) * 2.0
+                s3_f2 = _decode_ufp8_e5m3(tl.load(s3_base1 + sg_idx[None, :])) * 2.0
                 v3 = (
                     (w3_b & 1).to(tl.float32) * x0[None, :]
                     + ((w3_b >> 1) & 1).to(tl.float32) * x1[None, :]
@@ -1122,7 +1136,7 @@ try:
                 a3 = tl.load(act_base + a_base_idx + 48).to(tl.float32)
                 a_sum = (a0 + a1 + a2 + a3) * 1.5
                 wd_b = tl.load(wd_base2 + b_idx[None, :])
-                sd_f = _decode_pos_fp8e4m3_u8_to_f32(tl.load(sd_base2 + sg_idx[None, :]))
+                sd_f = _decode_ufp8_e5m3(tl.load(sd_base2 + sg_idx[None, :]))
                 vd = (
                     (wd_b & 3).to(tl.float32) * a0[None, :]
                     + ((wd_b >> 2) & 3).to(tl.float32) * a1[None, :]
@@ -1156,7 +1170,7 @@ try:
                 a7 = tl.load(act_base + a_base_idx + 56).to(tl.float32)
                 a_half_sum = (a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7) * 0.5
                 wd_b = tl.load(wd_base1 + b_idx[None, :])
-                sd_f2 = _decode_pos_fp8e4m3_u8_to_f32(tl.load(sd_base1 + sg_idx[None, :])) * 2.0
+                sd_f2 = _decode_ufp8_e5m3(tl.load(sd_base1 + sg_idx[None, :])) * 2.0
                 vd = (
                     (wd_b & 1).to(tl.float32) * a0[None, :]
                     + ((wd_b >> 1) & 1).to(tl.float32) * a1[None, :]
@@ -1497,8 +1511,47 @@ try:
 
         tl.store(Y_out_ptr + offs_n, acc.to(tl.bfloat16), mask=mask_n)
 
+    @triton.jit
+    def _triton_bmm_mxfp8_m1_kernel(
+        X_ptr,
+        W_fp8_ptr,
+        S_u8_ptr,
+        Z_out_ptr,
+        N_OUT: tl.constexpr,
+        N_BLOCKS_K: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        sub_blocks_k: tl.constexpr,
+        SCALE_ROW_DIV: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        g_idx = tl.program_id(1)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        ELEMS_PER_ITER: tl.constexpr = sub_blocks_k * 32
+        offs_k = tl.arange(0, ELEMS_PER_ITER)
+        offs_sb = offs_k // 32
+
+        x_base = X_ptr + g_idx * (N_BLOCKS_K * 32)
+        row_idx = g_idx * N_OUT + offs_n
+        w_base = W_fp8_ptr + row_idx[:, None] * (N_BLOCKS_K * 32)
+        s_row = row_idx // SCALE_ROW_DIV
+        s_base = S_u8_ptr + s_row[:, None] * N_BLOCKS_K
+
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        for sb_start in range(0, N_BLOCKS_K, sub_blocks_k):
+            k_idx = sb_start * 32 + offs_k
+            sb_idx = sb_start + offs_sb
+            x_val = tl.load(x_base + k_idx).to(tl.float32)
+            w_val = tl.load(w_base + k_idx[None, :]).to(tl.float32)
+            s_u8 = tl.load(s_base + sb_idx[None, :]).to(tl.int32)
+            s_f = (s_u8 << 23).to(tl.float32, bitcast=True)
+            acc += tl.sum((w_val * x_val[None, :]) * s_f, axis=1)
+
+        tl.store(Z_out_ptr + row_idx, acc.to(tl.bfloat16))
+
 except Exception:
     _HAS_TRITON = False
+    _triton_bmm_mxfp8_m1_kernel = None
 
 from chronos_1t.models.chronos_moe_block import (
     NVFP4_LUT,
@@ -2104,7 +2157,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
 
         self.r_basis: torch.Tensor | None = None
         self.r_basis_f32: torch.Tensor | None = None
-        if f"{tp}.abliteration.r_basis" in all_keys:
+        if os.environ.get("CHRONOS_RUNTIME_R_BASIS", "0") == "1" and f"{tp}.abliteration.r_basis" in all_keys:
             self.r_basis = self._mmap_handle.get_tensor(f"{tp}.abliteration.r_basis").to(device=device, dtype=torch.bfloat16).contiguous()
             self.r_basis_f32 = self.r_basis.float().contiguous()
 
@@ -2133,8 +2186,8 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
 
         default_dec_k = str(self.top_k)
         self.decode_top_k = max(1, min(self.top_k, int(os.environ.get("CHRONOS_DECODE_TOP_K", default_dec_k))))
-        self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "16"))
-        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "80"))
+        self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "8"))
+        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "24"))
         default_n1 = max(0, 384 - self.n4_slots - self.n2_slots)
         self.n1_slots = int(os.environ.get("CHRONOS_TIER3_1BIT_SLOTS", str(default_n1)))
 
@@ -2327,10 +2380,17 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 gen_mc = torch.Generator(device=device).manual_seed(42 + layer_idx)
                 x_mc = F.normalize(
                     torch.randn((2048, 5120), generator=gen_mc, device=device, dtype=torch.bfloat16), dim=-1
-                )
+                ) * (5120.0**0.5)
+                fn_k = f"layers.{layer_idx}.ffn_norm.weight"
+                if fn_k not in all_keys and f"model.{fn_k}" in all_keys:
+                    fn_k = f"model.{fn_k}"
+                if fn_k in all_keys:
+                    x_mc = x_mc * self._mmap_handle.get_tensor(fn_k).to(
+                        device=device, dtype=torch.bfloat16
+                    ).unsqueeze(0)
                 logits_mc = F.linear(x_mc, self.router_w).float()
                 scores_mc = F.softplus(logits_mc).sqrt() + self.e_score_bias.unsqueeze(0)
-                _, top6_mc = torch.topk(scores_mc, k=6, dim=-1)
+                _, top6_mc = torch.topk(scores_mc, k=self.top_k, dim=-1)
                 freq_mc = torch.bincount(top6_mc.view(-1), minlength=384).float()
                 prior_mc = (freq_mc + scores_mc.mean(dim=0)).cpu().tolist()
                 del x_mc, logits_mc, scores_mc, top6_mc, freq_mc
@@ -2348,7 +2408,8 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     reverse=True,
                 )
                 cold_ranked = [e for g in ranked_grps for e in cold_by_grp[g]]
-                ranked_eids = list(self.hot_expert_ids_list) + cold_ranked
+                hot_ranked = sorted(self.hot_expert_ids_list, key=lambda e: prior_mc[e], reverse=True)
+                ranked_eids = hot_ranked + cold_ranked
                 tier1_eids = ranked_eids[: self.n4_slots]
                 tier2_eids = ranked_eids[self.n4_slots : self.n4_slots + self.n2_slots]
                 tier3_eids = ranked_eids[
@@ -2400,61 +2461,18 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 self.tier_slot_map_gpu.copy_(torch.tensor(tier_map_cpu, dtype=torch.int32, device=device))
                 self.expert_to_slot_gpu.copy_(self.tier_slot_map_gpu)
 
-                n_hot_t1 = min(len(tier1_eids), self.num_hot_mxfp4_experts)
-                if n_hot_t1 > 0 and self._hot_handle is not None:
-                    self.w4_gu_u8[:n_hot_t1, :2304].copy_(
-                        _copy_via_pinned_dma(
-                            self._hot_handle.get_slice(f"{self._hot_tp}w1.weight")[:n_hot_t1].view(torch.uint8),
-                            device,
-                            101,
-                        ),
-                        non_blocking=True,
-                    )
-                    self.w4_gu_u8[:n_hot_t1, 2304:].copy_(
-                        _copy_via_pinned_dma(
-                            self._hot_handle.get_slice(f"{self._hot_tp}w3.weight")[:n_hot_t1].view(torch.uint8),
-                            device,
-                            102,
-                        ),
-                        non_blocking=True,
-                    )
-                    self.w4_d_u8[:n_hot_t1].copy_(
-                        _copy_via_pinned_dma(
-                            self._hot_handle.get_slice(f"{self._hot_tp}w2.weight")[:n_hot_t1].view(torch.uint8),
-                            device,
-                            103,
-                        ),
-                        non_blocking=True,
-                    )
-                    w1_s_b = _copy_via_pinned_dma(
-                        self._hot_handle.get_slice(f"{self._hot_tp}w1.scale")[:n_hot_t1], device, 104
-                    )
-                    w3_s_b = _copy_via_pinned_dma(
-                        self._hot_handle.get_slice(f"{self._hot_tp}w3.scale")[:n_hot_t1], device, 105
-                    )
-                    w2_s_b = _copy_via_pinned_dma(
-                        self._hot_handle.get_slice(f"{self._hot_tp}w2.scale")[:n_hot_t1], device, 106
-                    )
-                    self.s4_gu_bf16[:n_hot_t1, :2304].copy_(
-                        ((w1_s_b.view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
-                    )
-                    self.s4_gu_bf16[:n_hot_t1, 2304:].copy_(
-                        ((w3_s_b.view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
-                    )
-                    self.s4_d_bf16[:n_hot_t1].copy_(
-                        ((w2_s_b.view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
-                    )
-                    del w1_s_b, w3_s_b, w2_s_b
-
+                hot_t1_entries = [
+                    (s4, eid) for s4, eid in enumerate(tier1_eids) if self.hot_expert_to_idx[eid] >= 0
+                ]
                 hot_sub_entries = [
                     (2, s2, eid) for s2, eid in enumerate(tier2_eids) if self.hot_expert_to_idx[eid] >= 0
                 ] + [
                     (3, s1, eid) for s1, eid in enumerate(tier3_eids) if self.hot_expert_to_idx[eid] >= 0
                 ]
                 cold_all_by_group: dict[int, list[tuple[int, int, int]]] = {}
-                for s4 in range(n_hot_t1, len(tier1_eids)):
-                    eid = tier1_eids[s4]
-                    cold_all_by_group.setdefault(eid // 8, []).append((1, s4, eid))
+                for s4, eid in enumerate(tier1_eids):
+                    if self.hot_expert_to_idx[eid] < 0:
+                        cold_all_by_group.setdefault(eid // 8, []).append((1, s4, eid))
                 for s2, eid in enumerate(tier2_eids):
                     if self.hot_expert_to_idx[eid] < 0:
                         cold_all_by_group.setdefault(eid // 8, []).append((2, s2, eid))
@@ -2467,79 +2485,105 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 else:
                     scr_gu, scr_d = None, None
 
-                if hot_sub_entries and self._hot_handle is not None:
-                    h_start = self.hot_expert_to_idx[hot_sub_entries[0][2]]
-                    h_end = self.hot_expert_to_idx[hot_sub_entries[-1][2]] + 1
-                    w1_w_h2_cpu = self._hot_handle.get_slice(f"{self._hot_tp}w1.weight")[h_start:h_end]
-                    w3_w_h2_cpu = self._hot_handle.get_slice(f"{self._hot_tp}w3.weight")[h_start:h_end]
-                    w2_w_h2_cpu = self._hot_handle.get_slice(f"{self._hot_tp}w2.weight")[h_start:h_end]
-                    w1_s_h2 = _copy_via_pinned_dma(
-                        self._hot_handle.get_slice(f"{self._hot_tp}w1.scale")[h_start:h_end], device, 107
+                if (hot_t1_entries or hot_sub_entries) and self._hot_handle is not None:
+                    w1_w_all_cpu = self._hot_handle.get_tensor(f"{self._hot_tp}w1.weight")
+                    w3_w_all_cpu = self._hot_handle.get_tensor(f"{self._hot_tp}w3.weight")
+                    w2_w_all_cpu = self._hot_handle.get_tensor(f"{self._hot_tp}w2.weight")
+                    w1_s_all = _copy_via_pinned_dma(
+                        self._hot_handle.get_tensor(f"{self._hot_tp}w1.scale"), device, 107
                     )
-                    w3_s_h2 = _copy_via_pinned_dma(
-                        self._hot_handle.get_slice(f"{self._hot_tp}w3.scale")[h_start:h_end], device, 108
+                    w3_s_all = _copy_via_pinned_dma(
+                        self._hot_handle.get_tensor(f"{self._hot_tp}w3.scale"), device, 108
                     )
-                    w2_s_h2 = _copy_via_pinned_dma(
-                        self._hot_handle.get_slice(f"{self._hot_tp}w2.scale")[h_start:h_end], device, 109
+                    w2_s_all = _copy_via_pinned_dma(
+                        self._hot_handle.get_tensor(f"{self._hot_tp}w2.scale"), device, 109
                     )
-                    tmp_u8_gu = torch.empty((4608, 2560), dtype=torch.uint8, device=device)
-                    tmp_s_gu = torch.empty((4608, 160), dtype=torch.bfloat16, device=device)
-                    tmp_u8_d = torch.empty((5120, 1152), dtype=torch.uint8, device=device)
-                    tmp_s_d = torch.empty((5120, 72), dtype=torch.bfloat16, device=device)
-                    for tier_id, slot_i, eid in hot_sub_entries:
-                        rel_h = self.hot_expert_to_idx[eid] - h_start
-                        tmp_u8_gu[:2304].copy_(
-                            _copy_via_pinned_dma(w1_w_h2_cpu[rel_h].view(torch.uint8), device, 110),
+                    for s4, eid in sorted(hot_t1_entries, key=lambda item: self.hot_expert_to_idx[item[1]]):
+                        rel_h = self.hot_expert_to_idx[eid]
+                        self.w4_gu_u8[s4, :2304].copy_(
+                            _copy_via_pinned_dma(w1_w_all_cpu[rel_h].view(torch.uint8), device, 101),
                             non_blocking=True,
                         )
-                        tmp_u8_gu[2304:].copy_(
-                            _copy_via_pinned_dma(w3_w_h2_cpu[rel_h].view(torch.uint8), device, 111),
+                        self.w4_gu_u8[s4, 2304:].copy_(
+                            _copy_via_pinned_dma(w3_w_all_cpu[rel_h].view(torch.uint8), device, 102),
                             non_blocking=True,
                         )
-                        tmp_u8_d.copy_(
-                            _copy_via_pinned_dma(w2_w_h2_cpu[rel_h].view(torch.uint8), device, 112),
+                        self.w4_d_u8[s4].copy_(
+                            _copy_via_pinned_dma(w2_w_all_cpu[rel_h].view(torch.uint8), device, 103),
                             non_blocking=True,
                         )
-                        tmp_s_gu[:2304].copy_(
-                            ((w1_s_h2[rel_h].view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
+                        self.s4_gu_bf16[s4, :2304].copy_(
+                            ((w1_s_all[rel_h].view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
                         )
-                        tmp_s_gu[2304:].copy_(
-                            ((w3_s_h2[rel_h].view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
+                        self.s4_gu_bf16[s4, 2304:].copy_(
+                            ((w3_s_all[rel_h].view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
                         )
-                        tmp_s_d.copy_(
-                            ((w2_s_h2[rel_h].view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
+                        self.s4_d_bf16[s4].copy_(
+                            ((w2_s_all[rel_h].view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
                         )
-                        _dequantize_fp4_bf16scale_into(tmp_u8_gu, tmp_s_gu, scr_gu)
-                        _dequantize_fp4_bf16scale_into(tmp_u8_d, tmp_s_d, scr_d)
-                        if self.r_basis is not None:
-                            rb = self.r_basis.to(torch.bfloat16)
-                            scr_d.addmm_(rb.T, torch.matmul(rb, scr_d), beta=1.0, alpha=-1.0)
-                        if tier_id == 2:
-                            _triton_quantize_2bit_g64_kernel[(4608, 80)](
-                                scr_gu, self.w2_gu_u8[slot_i], self.s2_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
+
+                    if hot_sub_entries:
+                        tmp_u8_gu = torch.empty((4608, 2560), dtype=torch.uint8, device=device)
+                        tmp_s_gu = torch.empty((4608, 160), dtype=torch.bfloat16, device=device)
+                        tmp_u8_d = torch.empty((5120, 1152), dtype=torch.uint8, device=device)
+                        tmp_s_d = torch.empty((5120, 72), dtype=torch.bfloat16, device=device)
+                        for tier_id, slot_i, eid in sorted(
+                            hot_sub_entries, key=lambda item: self.hot_expert_to_idx[item[2]]
+                        ):
+                            rel_h = self.hot_expert_to_idx[eid]
+                            tmp_u8_gu[:2304].copy_(
+                                _copy_via_pinned_dma(w1_w_all_cpu[rel_h].view(torch.uint8), device, 110),
+                                non_blocking=True,
                             )
-                            _triton_quantize_2bit_g64_kernel[(5120, 36)](
-                                scr_d, self.w2_d_u8[slot_i], self.s2_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
+                            tmp_u8_gu[2304:].copy_(
+                                _copy_via_pinned_dma(w3_w_all_cpu[rel_h].view(torch.uint8), device, 111),
+                                non_blocking=True,
                             )
-                        elif self.t3_on_cpu:
-                            _triton_quantize_1bit_g64_kernel[(4608, 80)](
-                                scr_gu, self.w1_gu_u8[0], self.s1_gu_fp8[0], N_GROUPS_C=80, num_warps=1
+                            tmp_u8_d.copy_(
+                                _copy_via_pinned_dma(w2_w_all_cpu[rel_h].view(torch.uint8), device, 112),
+                                non_blocking=True,
                             )
-                            _triton_quantize_1bit_g64_kernel[(5120, 36)](
-                                scr_d, self.w1_d_u8[0], self.s1_d_fp8[0], N_GROUPS_C=36, num_warps=1
+                            tmp_s_gu[:2304].copy_(
+                                ((w1_s_all[rel_h].view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
                             )
-                            self.w1_gu_cpu[slot_i].copy_(self.w1_gu_u8[0], non_blocking=False)
-                            self.s1_gu_cpu[slot_i].copy_(self.s1_gu_fp8[0], non_blocking=False)
-                            self.w1_d_cpu[slot_i].copy_(self.w1_d_u8[0], non_blocking=False)
-                            self.s1_d_cpu[slot_i].copy_(self.s1_d_fp8[0], non_blocking=False)
-                        else:
-                            _triton_quantize_1bit_g64_kernel[(4608, 80)](
-                                scr_gu, self.w1_gu_u8[slot_i], self.s1_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
+                            tmp_s_gu[2304:].copy_(
+                                ((w3_s_all[rel_h].view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
                             )
-                            _triton_quantize_1bit_g64_kernel[(5120, 36)](
-                                scr_d, self.w1_d_u8[slot_i], self.s1_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
+                            tmp_s_d.copy_(
+                                ((w2_s_all[rel_h].view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
                             )
-                    del w1_w_h2_cpu, w3_w_h2_cpu, w2_w_h2_cpu, w1_s_h2, w3_s_h2, w2_s_h2, tmp_u8_gu, tmp_s_gu, tmp_u8_d, tmp_s_d
+                            _dequantize_fp4_bf16scale_into(tmp_u8_gu, tmp_s_gu, scr_gu)
+                            _dequantize_fp4_bf16scale_into(tmp_u8_d, tmp_s_d, scr_d)
+                            if self.r_basis is not None:
+                                rb = self.r_basis.to(torch.bfloat16)
+                                scr_d.addmm_(rb.T, torch.matmul(rb, scr_d), beta=1.0, alpha=-1.0)
+                            if tier_id == 2:
+                                _triton_quantize_2bit_g64_kernel[(4608, 80)](
+                                    scr_gu, self.w2_gu_u8[slot_i], self.s2_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
+                                )
+                                _triton_quantize_2bit_g64_kernel[(5120, 36)](
+                                    scr_d, self.w2_d_u8[slot_i], self.s2_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
+                                )
+                            elif self.t3_on_cpu:
+                                _triton_quantize_1bit_g64_kernel[(4608, 80)](
+                                    scr_gu, self.w1_gu_u8[0], self.s1_gu_fp8[0], N_GROUPS_C=80, num_warps=1
+                                )
+                                _triton_quantize_1bit_g64_kernel[(5120, 36)](
+                                    scr_d, self.w1_d_u8[0], self.s1_d_fp8[0], N_GROUPS_C=36, num_warps=1
+                                )
+                                self.w1_gu_cpu[slot_i].copy_(self.w1_gu_u8[0], non_blocking=False)
+                                self.s1_gu_cpu[slot_i].copy_(self.s1_gu_fp8[0], non_blocking=False)
+                                self.w1_d_cpu[slot_i].copy_(self.w1_d_u8[0], non_blocking=False)
+                                self.s1_d_cpu[slot_i].copy_(self.s1_d_fp8[0], non_blocking=False)
+                            else:
+                                _triton_quantize_1bit_g64_kernel[(4608, 80)](
+                                    scr_gu, self.w1_gu_u8[slot_i], self.s1_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
+                                )
+                                _triton_quantize_1bit_g64_kernel[(5120, 36)](
+                                    scr_d, self.w1_d_u8[slot_i], self.s1_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
+                                )
+                        del tmp_u8_gu, tmp_s_gu, tmp_u8_d, tmp_s_d
+                    del w1_w_all_cpu, w3_w_all_cpu, w2_w_all_cpu, w1_s_all, w3_s_all, w2_s_all
 
                 for g_idx, entries in sorted(cold_all_by_group.items()):
                     grp = grp_map[g_idx]
@@ -2647,13 +2691,23 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self.cache_hits = 0
             self.cache_misses = 0
 
+        if self.use_fp4_slot_cache and (self.n4_slots + self.n2_slots + self.n1_slots >= 384):
+            self._hot_handle = None
+            self._mmap_handle = None
+            if self.layer_idx >= 39:
+                _PINNED_DMA_BUFS.clear()
+                _SHARED_SCRATCH_GU_BF16.clear()
+                _SHARED_SCRATCH_D_BF16.clear()
+            gc.collect()
+
         if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
-            try:
-                fd = os.open(self.shard_path_str, os.O_RDONLY)
-                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                os.close(fd)
-            except OSError:
-                pass
+            for _ev_p in (self.shard_path_str, str(self._hot_shard_cand)):
+                try:
+                    fd = os.open(_ev_p, os.O_RDONLY)
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def _try_attach_hot_shard(self) -> bool:
         if self.num_hot_mxfp4_experts > 0:

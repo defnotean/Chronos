@@ -36,6 +36,7 @@ from chronos_1t.models.dsv41_chronos_moe import (
     _HAS_TRITON,
     _triton_bmm_fp4_m1_kernel,
     _triton_bmm_int4_m1_kernel,
+    _triton_bmm_mxfp8_m1_kernel,
     _triton_gemv_fp4_m1_kernel,
     _triton_gemv_int4_m1_kernel,
     _triton_gemv_mxfp8_m1_kernel,
@@ -126,6 +127,7 @@ def _chronos_fast_o_proj(
     out_buf = torch.empty((m_tok, 5120), dtype=torch.bfloat16, device=o.device)
     x_inv_buf = self_a._o_proj_x_inv_buf
     z_inter_buf = self_a._o_proj_z_inter_buf
+    has_fp8 = hasattr(self_a, "_wo_a_w_fp8")
     for t_i in range(m_tok):
         o_t = o[t_i]
         _triton_inv_rope_m1_kernel[(64,)](
@@ -136,28 +138,54 @@ def _chronos_fast_o_proj(
             o_t.stride(0),
             num_warps=2,
         )
-        _triton_bmm_int4_m1_kernel[(1024 // 16, 8)](
-            x_inv_buf.view(8, 4096),
-            self_a._wo_a_w4_u8,
-            self_a._wo_a_s4_bf16,
-            z_inter_buf.view(8, 1024),
-            N_OUT=1024,
-            N_BLOCKS_K=128,
-            BLOCK_N=16,
-            sub_blocks_k=32,
-            num_warps=4,
-        )
-        _triton_gemv_int4_m1_kernel[(5120 // 16,)](
-            z_inter_buf,
-            self_a._wo_b_w4_u8,
-            self_a._wo_b_s4_bf16,
-            out_buf[t_i],
-            N_OUT=5120,
-            N_BLOCKS_K=256,
-            BLOCK_N=16,
-            sub_blocks_k=32,
-            num_warps=4,
-        )
+        if has_fp8:
+            _triton_bmm_mxfp8_m1_kernel[(1024 // 16, 8)](
+                x_inv_buf.view(8, 4096),
+                self_a._wo_a_w_fp8,
+                self_a._wo_a_s_u8,
+                z_inter_buf.view(8, 1024),
+                N_OUT=1024,
+                N_BLOCKS_K=128,
+                BLOCK_N=16,
+                sub_blocks_k=32,
+                SCALE_ROW_DIV=self_a._wo_a_scale_row_div,
+                num_warps=4,
+            )
+            _triton_gemv_mxfp8_m1_kernel[(5120 // 16,)](
+                z_inter_buf,
+                self_a._wo_b_w_fp8,
+                self_a._wo_b_s_u8,
+                out_buf[t_i],
+                N_OUT=5120,
+                N_BLOCKS_K=256,
+                BLOCK_N=16,
+                sub_blocks_k=32,
+                SCALE_ROW_DIV=self_a._wo_b_scale_row_div,
+                num_warps=4,
+            )
+        else:
+            _triton_bmm_int4_m1_kernel[(1024 // 16, 8)](
+                x_inv_buf.view(8, 4096),
+                self_a._wo_a_w4_u8,
+                self_a._wo_a_s4_bf16,
+                z_inter_buf.view(8, 1024),
+                N_OUT=1024,
+                N_BLOCKS_K=128,
+                BLOCK_N=16,
+                sub_blocks_k=32,
+                num_warps=4,
+            )
+            _triton_gemv_int4_m1_kernel[(5120 // 16,)](
+                z_inter_buf,
+                self_a._wo_b_w4_u8,
+                self_a._wo_b_s4_bf16,
+                out_buf[t_i],
+                N_OUT=5120,
+                N_BLOCKS_K=256,
+                BLOCK_N=16,
+                sub_blocks_k=32,
+                num_warps=4,
+            )
     return out_buf if o.dtype == torch.bfloat16 else out_buf.to(o.dtype)
 
 
@@ -224,6 +252,7 @@ def _install_chronos_dsv41_decode_accelerators(model: nn.Module) -> None:
     layers = getattr(inner_model, "layers", [])
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     fast_wqb = os.environ.get("CHRONOS_FAST_WQB", "0") == "1"
+    wo_int4 = os.environ.get("CHRONOS_WO_INT4", "0") == "1"
     lmhead_int4 = os.environ.get("CHRONOS_LMHEAD_INT4", "0") == "1"
 
     for lyr in layers:
@@ -265,7 +294,7 @@ def _install_chronos_dsv41_decode_accelerators(model: nn.Module) -> None:
         elif wq_b is not None and hasattr(wq_b, "_chronos_raw_scale_u8"):
             delattr(wq_b, "_chronos_raw_scale_u8")
 
-        # 3. wo_a (8 x 1024 x 4096) & wo_b (5120 x 8192): quantize to 16-level INT4-MSE (cos = 0.9965) & free weights
+        # 3. wo_a (8 x 1024 x 4096) & wo_b (5120 x 8192): default keep Exact 8-bit MXFP8 (cos = 1.000000)
         wo_a = getattr(attn, "wo_a", None)
         wo_b = getattr(attn, "wo_b", None)
         if (
@@ -279,30 +308,41 @@ def _install_chronos_dsv41_decode_accelerators(model: nn.Module) -> None:
             raw_s_oa = getattr(wo_a, "_chronos_raw_scale_u8", getattr(wo_a, "weight_scale", None))
             raw_s_ob = getattr(wo_b, "_chronos_raw_scale_u8", getattr(wo_b, "weight_scale", None))
             if raw_s_oa is not None and raw_s_ob is not None:
-                oa_bf16 = _dequant_mxfp8_to_bf16(wo_a.weight.data.view(8192, 4096), raw_s_oa)
-                attn._wo_a_w4_u8 = torch.empty((8, 1024, 2048), dtype=torch.uint8, device=device)
-                attn._wo_a_s4_bf16 = torch.empty((8, 1024, 128), dtype=torch.bfloat16, device=device)
-                _triton_quantize_int4_32_kernel[(8192, 128)](
-                    oa_bf16,
-                    attn._wo_a_w4_u8.view(8192, 2048),
-                    attn._wo_a_s4_bf16.view(8192, 128),
-                    N_BLOCKS_C=128,
-                    num_warps=1,
-                )
-                del oa_bf16
+                if wo_int4:
+                    oa_bf16 = _dequant_mxfp8_to_bf16(wo_a.weight.data.view(8192, 4096), raw_s_oa)
+                    attn._wo_a_w4_u8 = torch.empty((8, 1024, 2048), dtype=torch.uint8, device=device)
+                    attn._wo_a_s4_bf16 = torch.empty((8, 1024, 128), dtype=torch.bfloat16, device=device)
+                    _triton_quantize_int4_32_kernel[(8192, 128)](
+                        oa_bf16,
+                        attn._wo_a_w4_u8.view(8192, 2048),
+                        attn._wo_a_s4_bf16.view(8192, 128),
+                        N_BLOCKS_C=128,
+                        num_warps=1,
+                    )
+                    del oa_bf16
+                    ob_bf16 = _dequant_mxfp8_to_bf16(wo_b.weight.data, raw_s_ob)
+                    attn._wo_b_w4_u8 = torch.empty((5120, 4096), dtype=torch.uint8, device=device)
+                    attn._wo_b_s4_bf16 = torch.empty((5120, 256), dtype=torch.bfloat16, device=device)
+                    _triton_quantize_int4_32_kernel[(5120, 256)](
+                        ob_bf16, attn._wo_b_w4_u8, attn._wo_b_s4_bf16, N_BLOCKS_C=256, num_warps=1
+                    )
+                    del ob_bf16
+                else:
+                    attn._wo_a_w_fp8 = wo_a.weight.data.view(torch.float8_e4m3fn).view(8192, 4096).contiguous()
+                    s_oa_u8 = raw_s_oa.view(torch.uint8).reshape(-1, 128).contiguous()
+                    attn._wo_a_s_u8 = s_oa_u8
+                    attn._wo_a_scale_row_div = max(1, 8192 // int(s_oa_u8.shape[0]))
+
+                    attn._wo_b_w_fp8 = wo_b.weight.data.view(torch.float8_e4m3fn).view(5120, 8192).contiguous()
+                    s_ob_u8 = raw_s_ob.view(torch.uint8).reshape(-1, 256).contiguous()
+                    attn._wo_b_s_u8 = s_ob_u8
+                    attn._wo_b_scale_row_div = max(1, 5120 // int(s_ob_u8.shape[0]))
+
                 wo_a.weight.data = torch.empty((0,), dtype=wo_a.weight.dtype, device=device)
                 if hasattr(wo_a, "weight_scale") and isinstance(wo_a.weight_scale, torch.Tensor):
                     wo_a.weight_scale.data = torch.empty((0,), dtype=wo_a.weight_scale.dtype, device=device)
                 if hasattr(wo_a, "_chronos_raw_scale_u8"):
                     delattr(wo_a, "_chronos_raw_scale_u8")
-
-                ob_bf16 = _dequant_mxfp8_to_bf16(wo_b.weight.data, raw_s_ob)
-                attn._wo_b_w4_u8 = torch.empty((5120, 4096), dtype=torch.uint8, device=device)
-                attn._wo_b_s4_bf16 = torch.empty((5120, 256), dtype=torch.bfloat16, device=device)
-                _triton_quantize_int4_32_kernel[(5120, 256)](
-                    ob_bf16, attn._wo_b_w4_u8, attn._wo_b_s4_bf16, N_BLOCKS_C=256, num_warps=1
-                )
-                del ob_bf16
                 wo_b.weight.data = torch.empty((0,), dtype=wo_b.weight.dtype, device=device)
                 if hasattr(wo_b, "weight_scale") and isinstance(wo_b.weight_scale, torch.Tensor):
                     wo_b.weight_scale.data = torch.empty((0,), dtype=wo_b.weight_scale.dtype, device=device)
@@ -568,8 +608,6 @@ def enable_chronos_dsv41_vllm_hook(
                 clean_logits: bool = False,
                 indices: torch.Tensor | None = None,
             ) -> torch.Tensor:
-                if kv_cache.shape[0] > 0:
-                    kv_cache[0].zero_()
                 eff_max_len = min(int(max_model_len), max(512, int(block_tables.shape[1]) * 64))
                 if kv_cache.ndim == 4 and kv_cache.shape[1] == 32 and q[1] is None:
                     bsz = block_tables.shape[0]
@@ -669,10 +707,6 @@ def enable_chronos_dsv41_vllm_hook(
                 extra_sparse_topk_lens: torch.Tensor | None = None,
                 **kwargs: Any,
             ) -> torch.Tensor:
-                if swa_kv_cache.shape[0] > 0:
-                    swa_kv_cache[0].zero_()
-                if compressed_kv_cache is not None and compressed_kv_cache.shape[0] > 0:
-                    compressed_kv_cache[0].zero_()
                 n_tok = query.shape[0]
                 if n_tok <= 64:
                     return _orig_fi_dsv4(
@@ -687,7 +721,7 @@ def enable_chronos_dsv41_vllm_hook(
                         kv_layout=kv_layout,
                         swa_topk_lens=swa_topk_lens,
                         extra_sparse_indices=extra_sparse_indices,
-                        extra_sparse_topk_lens=extra_sparse_lengths if False else extra_sparse_topk_lens,
+                        extra_sparse_topk_lens=extra_sparse_topk_lens,
                         **kwargs,
                     )
                 if out is None:
@@ -721,6 +755,7 @@ def enable_chronos_dsv41_vllm_hook(
         pass
 
     try:
+        from flashinfer.mla import _sparse_mla_sm120 as _fi_sm120
         from flashinfer.mla import _sparse_mla_sm120_cpb as _fi_cpb
         from flashinfer.mla import _sparse_mla_sm120_plan as _fi_plan
 
@@ -728,7 +763,10 @@ def enable_chronos_dsv41_vllm_hook(
         _fi_cpb.get_decode_max_tokens = lambda *args, **kwargs: 64
         _fi_cpb.is_calibration_failed = lambda *args, **kwargs: True
         _fi_cpb.is_crossover_failed = lambda *args, **kwargs: True
+        _fi_plan._resolve_cpb = lambda *args, **kwargs: 1
+        _fi_sm120._resolve_cpb = lambda *args, **kwargs: 1
         _fi_plan._plan_memo.clear()
+        _fi_plan._cpb_hot_cache.clear()
     except Exception:
         pass
 
