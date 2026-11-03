@@ -866,6 +866,163 @@ def enable_chronos_dsv41_vllm_hook(
     except Exception:
         pass
 
+    try:
+        from vllm.tokenizers import deepseek_v41_encoding as _dsv41_enc
+
+        _def_eff = int(os.environ.get("CHRONOS_DEFAULT_REASONING_EFFORT", "20"))
+        if hasattr(_dsv41_enc, "REASONING_EFFORT_MAPPINGS"):
+            _dsv41_enc.REASONING_EFFORT_MAPPINGS["low"] = _def_eff
+            _dsv41_enc.REASONING_EFFORT_MAPPINGS["high"] = _def_eff
+    except Exception:
+        pass
+
+    # Ensure DeepseekV4Attention._sparse_indexer_and_attn populates topk_indices for 128 < seq_len <= 1024
+    try:
+        import functools
+        from vllm.forward_context import get_forward_context
+        from vllm.models.deepseek_v41.nvidia import model as _dsv41_nv_mod
+
+        _AttnCls = getattr(_dsv41_nv_mod, "DeepseekV4Attention", None)
+        if _AttnCls is not None and not getattr(_AttnCls, "_chronos_short_ctx_patched", False):
+            _orig_sia = _AttnCls._sparse_indexer_and_attn
+            _inner_sia = getattr(_orig_sia, "__wrapped__", _orig_sia)
+
+            def _fill_short_context_topk_indices(self_a: Any, topk_indices: torch.Tensor) -> None:
+                if torch.cuda.is_current_stream_capturing():
+                    return
+                fc = get_forward_context()
+                am = getattr(fc, "attn_metadata", None)
+                if not isinstance(am, dict):
+                    return
+                idx_meta = am.get(f"{self_a.prefix}.indexer")
+                if idx_meta is None:
+                    for k, v in am.items():
+                        if k.endswith(".indexer"):
+                            idx_meta = v
+                            break
+                if idx_meta is None:
+                    return
+                n_tok = topk_indices.shape[0]
+                topk_val = topk_indices.shape[1]
+                for chunk in getattr(idx_meta, "chunks", ()):
+                    if not getattr(chunk, "skip_Copy", False):
+                        continue
+                    t_start = int(getattr(chunk, "token_start", 0))
+                    t_end = min(int(getattr(chunk, "token_end", n_tok)), n_tok)
+                    if t_end <= t_start:
+                        continue
+                    bt = getattr(chunk, "block_table", None)
+                    seq_lens = getattr(chunk, "seq_lens", None)
+                    cu_seqlens = getattr(chunk, "cu_seqlens", None)
+                    if bt is None or seq_lens is None:
+                        continue
+                    num_reqs = int(bt.shape[0])
+                    if num_reqs == (t_end - t_start):
+                        for r in range(num_reqs):
+                            row = t_start + r
+                            slen = int(seq_lens[r].item())
+                            sw_end = max(0, slen - 128)
+                            n_valid = min(sw_end, topk_val)
+                            topk_indices[row].fill_(-1)
+                            if n_valid > 0:
+                                pos = torch.arange(n_valid, device=topk_indices.device, dtype=torch.int64)
+                                blk_idx = pos // 64
+                                blk_off = pos % 64
+                                phys_blk = bt[r, blk_idx].to(torch.int64)
+                                topk_indices[row, :n_valid] = (phys_blk * 64 + blk_off).to(topk_indices.dtype)
+                    elif cu_seqlens is not None and int(cu_seqlens.shape[0]) == num_reqs + 1:
+                        for r in range(num_reqs):
+                            r_s = int(cu_seqlens[r].item())
+                            r_e = int(cu_seqlens[r + 1].item())
+                            q_cnt = r_e - r_s
+                            slen = int(seq_lens[r].item())
+                            base_pos = slen - q_cnt
+                            for q_i in range(q_cnt):
+                                row = t_start + r_s + q_i
+                                if row >= t_end:
+                                    break
+                                cur_slen = base_pos + q_i + 1
+                                sw_end = max(0, cur_slen - 128)
+                                n_valid = min(sw_end, topk_val)
+                                topk_indices[row].fill_(-1)
+                                if n_valid > 0:
+                                    pos = torch.arange(n_valid, device=topk_indices.device, dtype=torch.int64)
+                                    blk_idx = pos // 64
+                                    blk_off = pos % 64
+                                    phys_blk = bt[r, blk_idx].to(torch.int64)
+                                    topk_indices[row, :n_valid] = (phys_blk * 64 + blk_off).to(topk_indices.dtype)
+
+            @functools.wraps(_inner_sia)
+            def _chronos_sia(
+                self_a: Any,
+                hidden_states: torch.Tensor,
+                qr: torch.Tensor,
+                q_all: torch.Tensor,
+                k_nope: torch.Tensor,
+                k_pe: torch.Tensor,
+                topk_indices: torch.Tensor,
+                positions: torch.Tensor,
+            ) -> torch.Tensor:
+                try:
+                    _fill_short_context_topk_indices(self_a, topk_indices)
+                except Exception:
+                    pass
+                return _inner_sia(self_a, hidden_states, qr, q_all, k_nope, k_pe, topk_indices, positions)
+
+            if hasattr(_orig_sia, "__wrapped__"):
+                _orig_sia.__wrapped__ = _chronos_sia
+            else:
+                _AttnCls._sparse_indexer_and_attn = torch.compiler.disable(_chronos_sia)
+            _AttnCls._chronos_short_ctx_patched = True
+    except Exception:
+        pass
+
+    # Auto-install Triton anti-loop & think-budget breaker on GPUModelRunner.sample + compute_logits
+    try:
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+        from vllm.models.deepseek_v41.nvidia.model import DeepseekV41LLMForCausalLM
+        import chronos_1t.models.antiloop_think_breaker as _atb
+
+        if not hasattr(GPUModelRunner, "_orig_sample_dsv41"):
+            GPUModelRunner._orig_sample_dsv41 = GPUModelRunner.sample
+
+            def _dsv41_sample(self_mr: Any, hidden_states: torch.Tensor, input_batch: Any, *args: Any, **kwargs: Any) -> Any:
+                lm_mod = getattr(self_mr.model, "language_model", self_mr.model)
+                try:
+                    lm_mod._sample_input_ids = input_batch.input_ids[input_batch.logits_indices]
+                    lm_mod._sample_batch = input_batch
+                    lm_mod._sample_req_states = self_mr.req_states
+                except Exception:
+                    pass
+                try:
+                    return GPUModelRunner._orig_sample_dsv41(self_mr, hidden_states, input_batch, *args, **kwargs)
+                finally:
+                    lm_mod._sample_batch = None
+
+            GPUModelRunner.sample = _dsv41_sample
+
+        if not hasattr(DeepseekV41LLMForCausalLM, "_orig_compute_logits_dsv41"):
+            DeepseekV41LLMForCausalLM._orig_compute_logits_dsv41 = DeepseekV41LLMForCausalLM.compute_logits
+
+            def _dsv41_compute_logits(self_lm: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+                logits = self_lm.logits_processor(self_lm.lm_head, hidden_states)
+                try:
+                    s_batch = getattr(self_lm, "_sample_batch", None)
+                    s_states = getattr(self_lm, "_sample_req_states", None)
+                    s_ids = getattr(self_lm, "_sample_input_ids", None)
+                    if logits is not None and s_batch is not None and s_states is not None and s_ids is not None:
+                        budget = int(os.environ.get("CHRONOS_THINK_BUDGET", "80"))
+                        _atb.apply_antiloop_and_think_breaker(
+                            logits, s_batch, s_states, s_ids, think_budget=budget
+                        )
+                except Exception:
+                    pass
+                return logits
+
+            DeepseekV41LLMForCausalLM.compute_logits = _dsv41_compute_logits
+    except Exception:
+        pass
+
     return patched
 
 

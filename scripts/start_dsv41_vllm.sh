@@ -7,8 +7,8 @@ SERVED_NAME=${1:-deepseek-v4.1-flash}
 PORT=${2:-8000}
 WAIT_READY=${3:-0}
 
-# 1. Ensure newest dsv41_chronos_moe.py and patch_dsv41_vllm.py are synced to serving plugin dir
-for f in dsv41_chronos_moe.py patch_dsv41_vllm.py; do
+# 1. Ensure newest dsv41_chronos_moe.py, patch_dsv41_vllm.py, and antiloop_think_breaker.py are synced to serving plugin dir
+for f in dsv41_chronos_moe.py patch_dsv41_vllm.py antiloop_think_breaker.py; do
   newest=""
   for cand in "$SERVING_DIR/chronos_1t/models/$f" "$MODEL_DIR/$f" "$MODEL_DIR/chronos_1t/models/$f"; do
     if [ -f "$cand" ]; then
@@ -50,16 +50,17 @@ nohup bash /home/defnotean/gpu_run.sh docker run --rm --name pb27-vllm --gpus al
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
   -e VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 \
   -e CHRONOS_TIER1_4BIT_SLOTS=${CHRONOS_TIER1_4BIT_SLOTS:-16} \
-  -e CHRONOS_TIER2_2BIT_SLOTS=${CHRONOS_TIER2_2BIT_SLOTS:-80} \
-  -e CHRONOS_TIER3_1BIT_SLOTS=${CHRONOS_TIER3_1BIT_SLOTS:-208} \
+  -e CHRONOS_TIER2_2BIT_SLOTS=${CHRONOS_TIER2_2BIT_SLOTS:-88} \
+  -e CHRONOS_TIER3_1BIT_SLOTS=${CHRONOS_TIER3_1BIT_SLOTS:-200} \
   -e CHRONOS_DECODE_TOP_K=${CHRONOS_DECODE_TOP_K:-6} \
+  -e CHRONOS_DEFAULT_REASONING_EFFORT=${CHRONOS_DEFAULT_REASONING_EFFORT:-20} \
   --entrypoint bash vllm/vllm-openai:v0.31.0-aarch64 \
-  -c "pip install --no-deps --no-build-isolation -q -e /pb27_vllm && exec vllm serve $MODEL_DIR \
+  -c "rm -rf /pb27_vllm/chronos_1t/models/__pycache__ /pb27_vllm/pb27_vllm/__pycache__ && pip install --no-deps --no-build-isolation -q -e /pb27_vllm && exec vllm serve $MODEL_DIR \
     --served-model-name $SERVED_NAME --port $PORT --host 127.0.0.1 \
     --max-model-len 1048576 --max-num-batched-tokens 1024 --max-num-seqs 4 \
     --gpu-memory-utilization 0.88 --kv-cache-memory-bytes 2G --block-size 64 \
     --no-enable-prefix-caching \
-    --compilation-config '{\"cudagraph_capture_sizes\":[1,2,4,8]}' \
+    --compilation-config '{\"cudagraph_capture_sizes\":[1,2,4,8],\"cudagraph_mode\":\"PIECEWISE\"}' \
     --reasoning-parser deepseek_v41 --enable-auto-tool-choice --tool-call-parser deepseek_v41" \
   > "$ROOT/vllm_dsv41.log" 2>&1 < /dev/null &
 

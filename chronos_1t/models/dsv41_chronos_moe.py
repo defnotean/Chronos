@@ -730,10 +730,16 @@ try:
         z2 = w2 * inv_sig
         z3 = w3 * inv_sig
 
-        c0 = (tl.where(z0 >= -0.996, 1, 0) + tl.where(z0 >= 0.0, 1, 0) + tl.where(z0 >= 0.996, 1, 0)).to(tl.uint8)
-        c1 = (tl.where(z1 >= -0.996, 1, 0) + tl.where(z1 >= 0.0, 1, 0) + tl.where(z1 >= 0.996, 1, 0)).to(tl.uint8)
-        c2 = (tl.where(z2 >= -0.996, 1, 0) + tl.where(z2 >= 0.0, 1, 0) + tl.where(z2 >= 0.996, 1, 0)).to(tl.uint8)
-        c3 = (tl.where(z3 >= -0.996, 1, 0) + tl.where(z3 >= 0.0, 1, 0) + tl.where(z3 >= 0.996, 1, 0)).to(tl.uint8)
+        par0 = ((row + grp + offs16) & 1) == 0
+        mid0 = tl.where(par0, z0 > 0.0, z0 >= 0.0)
+        mid1 = tl.where(par0, z1 >= 0.0, z1 > 0.0)
+        mid2 = tl.where(par0, z2 > 0.0, z2 >= 0.0)
+        mid3 = tl.where(par0, z3 >= 0.0, z3 > 0.0)
+
+        c0 = (tl.where(z0 >= -0.996, 1, 0) + tl.where(mid0, 1, 0) + tl.where(z0 >= 0.996, 1, 0)).to(tl.uint8)
+        c1 = (tl.where(z1 >= -0.996, 1, 0) + tl.where(mid1, 1, 0) + tl.where(z1 >= 0.996, 1, 0)).to(tl.uint8)
+        c2 = (tl.where(z2 >= -0.996, 1, 0) + tl.where(mid2, 1, 0) + tl.where(z2 >= 0.996, 1, 0)).to(tl.uint8)
+        c3 = (tl.where(z3 >= -0.996, 1, 0) + tl.where(mid3, 1, 0) + tl.where(z3 >= 0.996, 1, 0)).to(tl.uint8)
 
         q0 = c0.to(tl.float32) - 1.5
         q1 = c1.to(tl.float32) - 1.5
@@ -779,14 +785,15 @@ try:
         )
         s_l1 = _encode_ufp8_e5m3(l1_sum * (1.25 / 64.0))
 
-        b0 = tl.where(w0 >= 0.0, 1, 0).to(tl.uint8)
-        b1 = tl.where(w1 >= 0.0, 2, 0).to(tl.uint8)
-        b2 = tl.where(w2 >= 0.0, 4, 0).to(tl.uint8)
-        b3 = tl.where(w3 >= 0.0, 8, 0).to(tl.uint8)
-        b4 = tl.where(w4 >= 0.0, 16, 0).to(tl.uint8)
-        b5 = tl.where(w5 >= 0.0, 32, 0).to(tl.uint8)
-        b6 = tl.where(w6 >= 0.0, 64, 0).to(tl.uint8)
-        b7 = tl.where(w7 >= 0.0, 128, 0).to(tl.uint8)
+        par1 = ((row + grp + offs8) & 1) == 0
+        b0 = tl.where(tl.where(par1, w0 > 0.0, w0 >= 0.0), 1, 0).to(tl.uint8)
+        b1 = tl.where(tl.where(par1, w1 >= 0.0, w1 > 0.0), 2, 0).to(tl.uint8)
+        b2 = tl.where(tl.where(par1, w2 > 0.0, w2 >= 0.0), 4, 0).to(tl.uint8)
+        b3 = tl.where(tl.where(par1, w3 >= 0.0, w3 > 0.0), 8, 0).to(tl.uint8)
+        b4 = tl.where(tl.where(par1, w4 > 0.0, w4 >= 0.0), 16, 0).to(tl.uint8)
+        b5 = tl.where(tl.where(par1, w5 >= 0.0, w5 > 0.0), 32, 0).to(tl.uint8)
+        b6 = tl.where(tl.where(par1, w6 > 0.0, w6 >= 0.0), 64, 0).to(tl.uint8)
+        b7 = tl.where(tl.where(par1, w7 >= 0.0, w7 > 0.0), 128, 0).to(tl.uint8)
         packed = b0 | b1 | b2 | b3 | b4 | b5 | b6 | b7
 
         tl.store(Out_s_fp8_ptr + row * N_GROUPS_C + grp, s_l1)
@@ -2186,9 +2193,9 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
 
         default_dec_k = str(self.top_k)
         self.decode_top_k = max(1, min(self.top_k, int(os.environ.get("CHRONOS_DECODE_TOP_K", default_dec_k))))
-        self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "8"))
-        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "24"))
-        default_n1 = max(0, 384 - self.n4_slots - self.n2_slots)
+        self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "16"))
+        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "88"))
+        default_n1 = min(200, max(0, 384 - self.n4_slots - self.n2_slots))
         self.n1_slots = int(os.environ.get("CHRONOS_TIER3_1BIT_SLOTS", str(default_n1)))
 
         if self.use_fp4_slot_cache:
@@ -2396,18 +2403,11 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 del x_mc, logits_mc, scores_mc, top6_mc, freq_mc
 
                 hot_set = set(self.hot_expert_ids_list)
-                cold_by_grp: dict[int, list[int]] = {}
-                for eid in range(384):
-                    if eid not in hot_set:
-                        cold_by_grp.setdefault(eid // 8, []).append(eid)
-                for g_eids in cold_by_grp.values():
-                    g_eids.sort(key=lambda e: prior_mc[e], reverse=True)
-                ranked_grps = sorted(
-                    cold_by_grp.keys(),
-                    key=lambda g: max(prior_mc[e] for e in cold_by_grp[g]),
+                cold_ranked = sorted(
+                    (eid for eid in range(384) if eid not in hot_set),
+                    key=lambda e: prior_mc[e],
                     reverse=True,
                 )
-                cold_ranked = [e for g in ranked_grps for e in cold_by_grp[g]]
                 hot_ranked = sorted(self.hot_expert_ids_list, key=lambda e: prior_mc[e], reverse=True)
                 ranked_eids = hot_ranked + cold_ranked
                 tier1_eids = ranked_eids[: self.n4_slots]
@@ -2649,7 +2649,10 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                             )
                     del s_gu_c, s_dn_c, u_gu_g, v_gu_g, u_dn_g, v_dn_g, gu_p_g, gu_s_g, dn_p_g, dn_s_g
 
+                for g_obj in grp_map.values():
+                    g_obj.mmap_handle = None
                 del grp_map
+                grp = None
                 sub_t = None
                 self.pinned_slots = self.n4_slots
                 self.groups = nn.ModuleList()
@@ -2667,8 +2670,9 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
                     for fpath in (self.shard_path_str, str(self._hot_shard_cand)):
                         try:
-                            if os.path.exists(fpath):
-                                fd = os.open(fpath, os.O_RDONLY)
+                            rp = os.path.realpath(fpath)
+                            if os.path.exists(rp):
+                                fd = os.open(rp, os.O_RDONLY)
                                 os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
                                 os.close(fd)
                         except OSError:
