@@ -4,11 +4,28 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-MODEL_DIR = "/home/defnotean/pb27/hf/dsv41_chronos_v75_abliterated"
-OUT_PATH = "/home/defnotean/pb27/serving/pb27_vllm/dsv41_shared_experts_option_a_r64.pt"
-RANK_OUT = 64
-N_KEEP = int(os.environ.get("CHRONOS_OPTION_A_KEEP", "212"))
+MODEL_DIR = os.environ.get("CHRONOS_MODEL_DIR", "/home/defnotean/pb27/hf/dsv41_chronos_v75_abliterated")
+OUT_PATH = os.environ.get("CHRONOS_OPTION_A_OUT", "/home/defnotean/pb27/serving/pb27_vllm/dsv41_shared_experts_option_a_r64.pt")
+RANK_OUT = int(os.environ.get("CHRONOS_OPTION_A_RANK", "64"))
+N_KEEP = int(os.environ.get("CHRONOS_OPTION_A_KEEP", "96"))
+OPT_A_ALPHA = float(os.environ.get("CHRONOS_OPTION_A_ALPHA", "0.05"))
 SWIGLU_LIMIT = 10.0
+
+
+def project_onto_tangent_sphere(
+    h: torch.Tensor,
+    h_anchor: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Chimera-LSA Theorem 6: Tangential retraction onto the spherical manifold of radius ||h_anchor||."""
+    r_anchor = h_anchor.norm(dim=-1, keepdim=True).clamp(min=eps)
+    u_anchor = h_anchor / r_anchor
+    delta = h - h_anchor
+    radial = (delta * u_anchor).sum(dim=-1, keepdim=True) * u_anchor
+    delta_tan = delta - radial
+    h_tan = h_anchor + delta_tan
+    r_tan = h_tan.norm(dim=-1, keepdim=True).clamp(min=eps)
+    return h_tan * (r_anchor / r_tan)
 
 
 def ue8m0_to_float32(scale_e8m0: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -150,18 +167,35 @@ def main() -> None:
                 rb = f.get_tensor(f"{tp}.abliteration.r_basis").to(device=device, dtype=torch.float32)
                 Y_D_target = Y_D_target - (Y_D_target @ rb.T) @ rb
 
-            lam = 5e-2 * (H_D_perp.norm() ** 2 / float(max(1, len(drop_l))))
-            A = H_D_perp @ H_D_perp.T + lam * torch.eye(len(drop_l), device=device)
-            dW_sh = (H_D_perp.T @ torch.linalg.solve(A, Y_D_target)).T  # (5120, 2304)
+            # Chimera-LSA Theorem 7: Unit-norm Geodesic Cosine Alignment weighting on S^(D-1)
+            row_w = 1.0 / (H_D_perp.norm(dim=-1, keepdim=True) * Y_D_target.norm(dim=-1, keepdim=True) + 1e-6).sqrt()
+            row_w = row_w / row_w.mean().clamp(min=1e-6)
+            H_w = H_D_perp * row_w
+            Y_w = Y_D_target * row_w
+
+            lam = 5e-2 * (H_w.norm() ** 2 / float(max(1, len(drop_l))))
+            A = H_w @ H_w.T + lam * torch.eye(len(drop_l), device=device)
+            dW_sh_init = (H_w.T @ torch.linalg.solve(A, Y_w)).T  # (5120, 2304)
+
+            # Chimera-LSA Theorem 6: Spherical Manifold Tangential Retraction on total MoE output
+            Y_sh_D = H_D @ sh_w2.T
+            Y_anchor_D = Y_sh_D + OPT_A_ALPHA * Y_D_target
+            Y_pred_init = Y_sh_D + OPT_A_ALPHA * (H_D_perp @ dW_sh_init.T)
+            Y_retracted = project_onto_tangent_sphere(Y_pred_init, Y_anchor_D)
+            Y_D_tangent = (Y_retracted - Y_sh_D) / max(OPT_A_ALPHA, 1e-6)
+            Y_w_tan = Y_D_tangent * row_w
+            dW_sh = (H_w.T @ torch.linalg.solve(A, Y_w_tan)).T  # (5120, 2304)
 
             U_d, S_d, Vh_d = torch.linalg.svd(dW_sh, full_matrices=False)
             U_r = (U_d[:, :RANK_OUT] * S_d[:RANK_OUT].unsqueeze(0)).to(torch.bfloat16).cpu().contiguous()
             V_r = Vh_d[:RANK_OUT, :].to(torch.bfloat16).cpu().contiguous()
 
             dW_r64 = U_r.to(device=device, dtype=torch.float32) @ V_r.to(device=device, dtype=torch.float32)
-            W_new = sh_w2 + 0.05 * dW_r64
+            W_new = sh_w2 + OPT_A_ALPHA * dW_r64
             cos_K = F.cosine_similarity(H_prot[:96] @ sh_w2.T, H_prot[:96] @ W_new.T, dim=-1).mean().item()
             fit_D = F.cosine_similarity(H_D @ dW_r64.T, Y_D_target, dim=-1).mean().item()
+            Y_final_D = H_D @ W_new.T
+            radial_drift = ((Y_final_D.norm(dim=-1) - Y_anchor_D.norm(dim=-1)).abs() / Y_anchor_D.norm(dim=-1).clamp(min=1e-6)).mean().item()
             dw_norm = dW_r64.norm().item()
 
             results[l] = {
@@ -169,10 +203,11 @@ def main() -> None:
                 "V": V_r,
                 "cos_K": cos_K,
                 "fit_D": fit_D,
+                "radial_drift": radial_drift,
                 "dw_norm": dw_norm,
             }
             print(
-                f"[{l+1:02d}/40] L{l:02d} ({time.time()-tl0:.2f}s) | hits(56/56/100): T1={h1:.1f}% T2={h2:.1f}% T3={h3:.1f}% Miss={100-h1-h2-h3:.1f}% | dW_norm={dw_norm:.3f} | cos_K={cos_K:.6f} | fit_D={fit_D:.4f}",
+                f"[{l+1:02d}/40] L{l:02d} ({time.time()-tl0:.2f}s) | hits(56/56/100): T1={h1:.1f}% T2={h2:.1f}% T3={h3:.1f}% | dW_norm={dw_norm:.3f} | cos_K={cos_K:.6f} | fit_D={fit_D:.4f} | rad_drift={radial_drift:.5f}",
                 flush=True,
             )
 

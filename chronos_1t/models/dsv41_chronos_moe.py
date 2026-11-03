@@ -753,6 +753,74 @@ try:
         tl.store(Out_u8_ptr + row * (N_GROUPS_C * 16) + grp * 16 + offs16, packed)
 
     @triton.jit
+    def _triton_quantize_ternary_2bit_g64_kernel(
+        W_ptr,
+        Out_u8_ptr,
+        Out_s_fp8_ptr,
+        N_GROUPS_C: tl.constexpr,
+    ):
+        """Chimera-LSA Theorem 3/8a/9: 1.58-Bit Ternary {-s, 0, +s} packed in 2-bit uint8 (c = trit + 1 in {0, 1, 2})."""
+        row = tl.program_id(0)
+        grp = tl.program_id(1)
+        offs16 = tl.arange(0, 16)
+        base_w = W_ptr + row * (N_GROUPS_C * 64) + grp * 64
+        w0 = tl.load(base_w + offs16 + 0).to(tl.float32)
+        w1 = tl.load(base_w + offs16 + 16).to(tl.float32)
+        w2 = tl.load(base_w + offs16 + 32).to(tl.float32)
+        w3 = tl.load(base_w + offs16 + 48).to(tl.float32)
+
+        abs0 = tl.abs(w0)
+        abs1 = tl.abs(w1)
+        abs2 = tl.abs(w2)
+        abs3 = tl.abs(w3)
+        sq_sum = tl.sum(w0 * w0 + w1 * w1 + w2 * w2 + w3 * w3, axis=0)
+        sigma = tl.sqrt(sq_sum / 64.0 + 1e-12)
+        tau = 0.60 * sigma
+
+        # 2-step in-register Lloyd-Max refinement for exact groupwise ternary MSE threshold
+        for _ in tl.static_range(2):
+            m0 = abs0 > tau
+            m1 = abs1 > tau
+            m2 = abs2 > tau
+            m3 = abs3 > tau
+            cnt = tl.sum(
+                tl.where(m0, 1.0, 0.0)
+                + tl.where(m1, 1.0, 0.0)
+                + tl.where(m2, 1.0, 0.0)
+                + tl.where(m3, 1.0, 0.0),
+                axis=0,
+            )
+            s_est = tl.sum(
+                tl.where(m0, abs0, 0.0)
+                + tl.where(m1, abs1, 0.0)
+                + tl.where(m2, abs2, 0.0)
+                + tl.where(m3, abs3, 0.0),
+                axis=0,
+            ) / tl.maximum(cnt, 1.0)
+            tau = 0.5 * s_est
+
+        t0 = tl.where(w0 > tau, 1, tl.where(w0 < -tau, -1, 0))
+        t1 = tl.where(w1 > tau, 1, tl.where(w1 < -tau, -1, 0))
+        t2 = tl.where(w2 > tau, 1, tl.where(w2 < -tau, -1, 0))
+        t3 = tl.where(w3 > tau, 1, tl.where(w3 < -tau, -1, 0))
+
+        c0 = (t0 + 1).to(tl.uint8)
+        c1 = (t1 + 1).to(tl.uint8)
+        c2 = (t2 + 1).to(tl.uint8)
+        c3 = (t3 + 1).to(tl.uint8)
+
+        q0 = t0.to(tl.float32)
+        q1 = t1.to(tl.float32)
+        q2 = t2.to(tl.float32)
+        q3 = t3.to(tl.float32)
+        wq_dot = tl.sum(w0 * q0 + w1 * q1 + w2 * q2 + w3 * q3, axis=0)
+        q_sq = tl.sum(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3, axis=0)
+        packed = c0 | (c1 << 2) | (c2 << 4) | (c3 << 6)
+        s_norm = _encode_ufp8_e5m3(tl.maximum(wq_dot, 0.0) / (q_sq + 1e-12))
+        tl.store(Out_s_fp8_ptr + row * N_GROUPS_C + grp, s_norm)
+        tl.store(Out_u8_ptr + row * (N_GROUPS_C * 16) + grp * 16 + offs16, packed)
+
+    @triton.jit
     def _triton_quantize_1bit_g64_kernel(
         W_ptr,
         Out_u8_ptr,
@@ -928,6 +996,7 @@ try:
         sub_groups_k2: tl.constexpr,
         HAS_TIER2: tl.constexpr = False,
         HAS_TIER3: tl.constexpr = False,
+        TIER2_TERNARY: tl.constexpr = True,
     ):
         pid_n = tl.program_id(0)
         e_idx = tl.program_id(1)
@@ -986,7 +1055,7 @@ try:
                 x1 = tl.load(X_ptr + x_base_idx + 16).to(tl.float32)
                 x2 = tl.load(X_ptr + x_base_idx + 32).to(tl.float32)
                 x3 = tl.load(X_ptr + x_base_idx + 48).to(tl.float32)
-                x_sum = (x0 + x1 + x2 + x3) * 1.5
+                x_sum = (x0 + x1 + x2 + x3) if TIER2_TERNARY else (x0 + x1 + x2 + x3) * 1.5
 
                 w1_b = tl.load(w1_base2 + b_idx[None, :])
                 s1_f = _decode_ufp8_e5m3(tl.load(s1_base2 + sg_idx[None, :]))
@@ -1091,6 +1160,7 @@ try:
         sub_groups_k2: tl.constexpr,
         HAS_TIER2: tl.constexpr = False,
         HAS_TIER3: tl.constexpr = False,
+        TIER2_TERNARY: tl.constexpr = True,
     ):
         pid_d = tl.program_id(0)
         e_idx = tl.program_id(1)
@@ -1141,7 +1211,7 @@ try:
                 a1 = tl.load(act_base + a_base_idx + 16).to(tl.float32)
                 a2 = tl.load(act_base + a_base_idx + 32).to(tl.float32)
                 a3 = tl.load(act_base + a_base_idx + 48).to(tl.float32)
-                a_sum = (a0 + a1 + a2 + a3) * 1.5
+                a_sum = (a0 + a1 + a2 + a3) if TIER2_TERNARY else (a0 + a1 + a2 + a3) * 1.5
                 wd_b = tl.load(wd_base2 + b_idx[None, :])
                 sd_f = _decode_ufp8_e5m3(tl.load(sd_base2 + sg_idx[None, :]))
                 vd = (
@@ -2086,6 +2156,31 @@ def _get_option_a_delta(layer_idx: int) -> tuple[torch.Tensor, torch.Tensor] | N
     return _OPTION_A_DELTAS.get(layer_idx)
 
 
+def project_onto_tangent_sphere(
+    h: torch.Tensor,
+    h_anchor: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Chimera-LSA Theorem 6: Projects a perturbed hidden state `h` back onto the spherical manifold
+    defined by `h_anchor` via tangential retraction:
+      1. Decompose `delta = h - h_anchor` into radial (along `h_anchor`) and tangential
+         (orthogonal to `h_anchor`) components.
+      2. Discard pure radial inflation while preserving the angular/tangential
+         update on the hypersphere of radius `||h_anchor||`.
+    """
+    orig_dtype = h.dtype
+    h_f = h.float()
+    a_f = h_anchor.float()
+    r_anchor = a_f.norm(dim=-1, keepdim=True).clamp(min=eps)
+    u_anchor = a_f / r_anchor
+    delta = h_f - a_f
+    radial = (delta * u_anchor).sum(dim=-1, keepdim=True) * u_anchor
+    delta_tan = delta - radial
+    h_tan = a_f + delta_tan
+    r_tan = h_tan.norm(dim=-1, keepdim=True).clamp(min=eps)
+    return (h_tan * (r_anchor / r_tan)).to(orig_dtype)
+
+
 class ChronosDsv41SparseMoeBlock(nn.Module):
     """Drop-in replacement for DeepSeek-V4.1-Flash-1017 (`DeepseekV41ForCausalLM`) Sparse MoE layer."""
 
@@ -2220,6 +2315,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "0"))
         default_n1 = 0 if (self.n4_slots == 96 and self.n2_slots == 0) else min(216, max(0, 384 - self.n4_slots - self.n2_slots))
         self.n1_slots = int(os.environ.get("CHRONOS_TIER3_1BIT_SLOTS", str(default_n1)))
+        self.tier2_ternary = os.environ.get("CHRONOS_TIER2_TERNARY", "1").strip() not in ("0", "false", "False")
 
         if self.use_fp4_slot_cache:
             self._keys_384 = None
@@ -2620,10 +2716,15 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                                 rb = self.r_basis.to(torch.bfloat16)
                                 scr_d.addmm_(rb.T, torch.matmul(rb, scr_d), beta=1.0, alpha=-1.0)
                             if tier_id == 2:
-                                _triton_quantize_2bit_g64_kernel[(4608, 80)](
+                                q2_kern = (
+                                    _triton_quantize_ternary_2bit_g64_kernel
+                                    if self.tier2_ternary
+                                    else _triton_quantize_2bit_g64_kernel
+                                )
+                                q2_kern[(4608, 80)](
                                     scr_gu, self.w2_gu_u8[slot_i], self.s2_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
                                 )
-                                _triton_quantize_2bit_g64_kernel[(5120, 36)](
+                                q2_kern[(5120, 36)](
                                     scr_d, self.w2_d_u8[slot_i], self.s2_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
                                 )
                             elif self.t3_on_cpu:
@@ -2685,10 +2786,15 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                                 scr_d, self.w4_d_u8[slot_i], self.s4_d_bf16[slot_i], N_BLOCKS_C=72, num_warps=1
                             )
                         elif tier_id == 2:
-                            _triton_quantize_2bit_g64_kernel[(4608, 80)](
+                            q2_kern = (
+                                _triton_quantize_ternary_2bit_g64_kernel
+                                if self.tier2_ternary
+                                else _triton_quantize_2bit_g64_kernel
+                            )
+                            q2_kern[(4608, 80)](
                                 scr_gu, self.w2_gu_u8[slot_i], self.s2_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
                             )
-                            _triton_quantize_2bit_g64_kernel[(5120, 36)](
+                            q2_kern[(5120, 36)](
                                 scr_d, self.w2_d_u8[slot_i], self.s2_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
                             )
                         elif self.t3_on_cpu:
@@ -3085,6 +3191,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     sub_groups_k2=4,
                     HAS_TIER2=has_t2,
                     HAS_TIER3=has_t3,
+                    TIER2_TERNARY=self.tier2_ternary,
                     num_warps=4,
                 )
                 _triton_dsv41_tiered_down_kernel[(5120 // 8, n_active)](
@@ -3105,6 +3212,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     sub_groups_k2=4,
                     HAS_TIER2=has_t2,
                     HAS_TIER3=has_t3,
+                    TIER2_TERNARY=self.tier2_ternary,
                     num_warps=8,
                 )
                 _triton_dsv41_reduce_sum_bf16_kernel[(40,)](
@@ -3161,6 +3269,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     sub_groups_k2=4,
                     HAS_TIER2=has_t2,
                     HAS_TIER3=has_t3,
+                    TIER2_TERNARY=self.tier2_ternary,
                     num_warps=4,
                 )
                 _triton_dsv41_tiered_down_kernel[(5120 // 8, n_active)](
@@ -3181,6 +3290,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     sub_groups_k2=4,
                     HAS_TIER2=has_t2,
                     HAS_TIER3=has_t3,
+                    TIER2_TERNARY=self.tier2_ternary,
                     num_warps=8,
                 )
                 _triton_dsv41_reduce_sum_bf16_kernel[(40,)](
