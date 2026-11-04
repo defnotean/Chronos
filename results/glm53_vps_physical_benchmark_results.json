@@ -1,0 +1,689 @@
+{
+  "timestamp": "2026-11-04T16:06:18Z",
+  "execution_host": {
+    "hostname": "WIN-I2GBVRRD872",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python_version": "3.12.10",
+    "proxy_endpoint": "http://127.0.0.1:18080/v1",
+    "direct_endpoint": "http://127.0.0.1:18080/v1",
+    "served_model": "glm-5.3-flash"
+  },
+  "thinking_loop_audit": {
+    "total_reasoning_traces_audited": 39,
+    "word_repetition_loops_detected": 0,
+    "max_consecutive_identical_word": 4,
+    "mean_unique_word_ratio": 0.7559,
+    "status": "ZERO_LOOPS_VERIFIED"
+  },
+  "official_glm53_8_benchmarks": [
+    {
+      "benchmark": "Terminal-Bench 2.1",
+      "official_glm53_score": 84.3,
+      "metric_unit": "% Pass@1",
+      "vps_tasks_passed": "3/3",
+      "vps_pass_pct": 100.0,
+      "avg_tok_s": 19.4,
+      "tasks": [
+        {
+          "task_id": "tb_nginx_5xx_awk",
+          "passed": true,
+          "tokens": 266,
+          "elapsed_s": 14.263,
+          "tok_s": 18.65,
+          "think_stats": {
+            "think_word_count": 13,
+            "max_consec_same_word": 1,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 1.0,
+            "has_think_loop": false
+          }
+        },
+        {
+          "task_id": "tb_systemd_port_conflict",
+          "passed": true,
+          "tokens": 1024,
+          "elapsed_s": 47.345,
+          "tok_s": 21.63,
+          "think_stats": {
+            "think_word_count": 0,
+            "max_consec_same_word": 1,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 1.0,
+            "has_think_loop": false
+          }
+        },
+        {
+          "task_id": "tb_find_log_cleanup",
+          "passed": true,
+          "tokens": 400,
+          "elapsed_s": 22.317,
+          "tok_s": 17.92,
+          "think_stats": {
+            "think_word_count": 28,
+            "max_consec_same_word": 1,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 0.7857,
+            "has_think_loop": false
+          }
+        }
+      ]
+    },
+    {
+      "benchmark": "DeepSWE v1.1",
+      "official_glm53_score": 63.4,
+      "metric_unit": "% Resolved",
+      "vps_tasks_passed": "3/3",
+      "vps_pass_pct": 100.0,
+      "avg_tok_s": 21.13,
+      "tasks": [
+        {
+          "task_id": "deepswe_rfc7396_merge_patch",
+          "passed": true,
+          "diag": "ALL_ASSERTIONS_PASSED",
+          "tokens": 550,
+          "elapsed_s": 29.171,
+          "tok_s": 18.85,
+          "think_stats": {
+            "think_word_count": 231,
+            "max_consec_same_word": 1,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 0.3723,
+            "has_think_loop": false
+          }
+        },
+        {
+          "task_id": "deepswe_token_bucket_limiter",
+          "passed": true,
+          "diag": "ALL_ASSERTIONS_PASSED",
+          "tokens": 175,
+          "elapsed_s": 7.739,
+          "tok_s": 22.61,
+          "think_stats": {
+            "think_word_count": 16,
+            "max_consec_same_word": 1,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 1.0,
+            "has_think_loop": false
+          }
+        },
+        {
+          "task_id": "deepswe_topo_sort_cycle",
+          "passed": true,
+          "diag": "ALL_ASSERTIONS_PASSED",
+          "tokens": 204,
+          "elapsed_s": 9.305,
+          "tok_s": 21.92,
+          "think_stats": {
+            "think_word_count": 24,
+            "max_consec_same_word": 1,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 0.8333,
+            "has_think_loop": false
+          }
+        }
+      ]
+    },
+    {
+      "benchmark": "Agents' Last Exam",
+      "official_glm53_score": 26.3,
+      "metric_unit": "% Accuracy",
+      "vps_tasks_passed": "2/2",
+      "vps_pass_pct": 100.0,
+      "avg_tok_s": 20.37,
+      "tasks": [
+        {
+          "task_id": "ale_adversarial_pipeline_schedule",
+          "passed": true,
+          "tokens": 309,
+          "elapsed_s": 14.412,
+          "tok_s": 21.44,
+          "think_stats": {
+            "think_word_count": 211,
+            "max_consec_same_word": 1,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 0.4265,
+            "has_think_loop": false
+          }
+        },
+        {
+          "task_id": "ale_byzantine_quorum_min_nodes",
+          "passed": true,
+          "tokens": 218,
+          "elapsed_s": 11.295,
+          "tok_s": 19.3,
+          "think_stats": {
+            "think_word_count": 10,
+            "max_consec_same_word": 1,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 0.8,
+            "has_think_loop": false
+          }
+        }
+      ]
+    },
+    {
+      "benchmark": "AutomationBench v1.0.6",
+      "official_glm53_score": 48.8,
+      "metric_unit": "% Pass@1",
+      "vps_tasks_passed": "1/1",
+      "vps_pass_pct": 100.0,
+      "avg_tok_s": 22.99,
+      "tasks": [
+        {
+          "task_id": "automationbench_pr13_null_schema",
+          "passed": true,
+          "diag": "Valid JSON & PR #13 null-schema verified",
+          "tokens": 144,
+          "elapsed_s": 6.265,
+          "tok_s": 22.99,
+          "think_stats": {
+            "think_word_count": 8,
+            "max_consec_same_word": 1,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 0.875,
+            "has_think_loop": false
+          }
+        }
+      ]
+    },
+    {
+      "benchmark": "HLE w/ Tools",
+      "official_glm53_score": 55.3,
+      "metric_unit": "% Accuracy",
+      "vps_tasks_passed": "2/2",
+      "vps_pass_pct": 100.0,
+      "avg_tok_s": 21.16,
+      "tasks": [
+        {
+          "task_id": "hle_spectral_trace_det",
+          "passed": true,
+          "tokens": 462,
+          "elapsed_s": 21.235,
+          "tok_s": 21.76,
+          "think_stats": {
+            "think_word_count": 69,
+            "max_consec_same_word": 2,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 0.4783,
+            "has_think_loop": false
+          }
+        },
+        {
+          "task_id": "hle_modular_number_theory",
+          "passed": true,
+          "tokens": 177,
+          "elapsed_s": 8.61,
+          "tok_s": 20.56,
+          "think_stats": {
+            "think_word_count": 17,
+            "max_consec_same_word": 1,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 0.7059,
+            "has_think_loop": false
+          }
+        }
+      ]
+    },
+    {
+      "benchmark": "GDPval-AA v2",
+      "official_glm53_score": 1773.0,
+      "metric_unit": "Elo Rating",
+      "vps_tasks_passed": "1/1",
+      "vps_pass_pct": 100.0,
+      "avg_tok_s": 21.14,
+      "tasks": [
+        {
+          "task_id": "gdpval_dcf_npv_wacc",
+          "passed": true,
+          "tokens": 368,
+          "elapsed_s": 17.411,
+          "tok_s": 21.14,
+          "think_stats": {
+            "think_word_count": 91,
+            "max_consec_same_word": 2,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 0.5055,
+            "has_think_loop": false
+          }
+        }
+      ]
+    },
+    {
+      "benchmark": "NL2Repo",
+      "official_glm53_score": 83.3,
+      "metric_unit": "% Pass Rate",
+      "vps_tasks_passed": "1/1",
+      "vps_pass_pct": 100.0,
+      "avg_tok_s": 20.64,
+      "tasks": [
+        {
+          "task_id": "nl2repo_transactional_kv_engine",
+          "passed": true,
+          "diag": "ALL_ASSERTIONS_PASSED",
+          "tokens": 449,
+          "elapsed_s": 21.757,
+          "tok_s": 20.64,
+          "think_stats": {
+            "think_word_count": 113,
+            "max_consec_same_word": 2,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 0.5133,
+            "has_think_loop": false
+          }
+        }
+      ]
+    },
+    {
+      "benchmark": "Toolathlon Verified",
+      "official_glm53_score": 77.8,
+      "metric_unit": "% Pass@1",
+      "vps_tasks_passed": "2/2",
+      "vps_pass_pct": 100.0,
+      "avg_tok_s": 15.68,
+      "tasks": [
+        {
+          "task_id": "toolathlon_turn1_telemetry",
+          "passed": true,
+          "tok_s": 16.38,
+          "think_stats": {
+            "think_word_count": 0,
+            "max_consec_same_word": 1,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 1.0,
+            "has_think_loop": false
+          }
+        },
+        {
+          "task_id": "toolathlon_turn2_rebalance",
+          "passed": true,
+          "tok_s": 14.99,
+          "think_stats": {
+            "think_word_count": 0,
+            "max_consec_same_word": 1,
+            "max_consec_phrase3": 1,
+            "unique_word_ratio": 1.0,
+            "has_think_loop": false
+          }
+        }
+      ]
+    }
+  ],
+  "mmlu_pro_8": {
+    "suite": "MMLU / MMLU-Pro (8-Domain)",
+    "passed": "8/8",
+    "pass_pct": 100.0,
+    "avg_tok_s": 18.92,
+    "items": [
+      {
+        "domain": "CS/Algorithms",
+        "expected": "B",
+        "predicted": "B",
+        "passed": true,
+        "tok_s": 18.52,
+        "think_stats": {
+          "think_word_count": 7,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 1.0,
+          "has_think_loop": false
+        }
+      },
+      {
+        "domain": "Physics/Quantum",
+        "expected": "C",
+        "predicted": "C",
+        "passed": true,
+        "tok_s": 21.54,
+        "think_stats": {
+          "think_word_count": 18,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.8333,
+          "has_think_loop": false
+        }
+      },
+      {
+        "domain": "Chemistry",
+        "expected": "C",
+        "predicted": "C",
+        "passed": true,
+        "tok_s": 21.38,
+        "think_stats": {
+          "think_word_count": 171,
+          "max_consec_same_word": 2,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.386,
+          "has_think_loop": false
+        }
+      },
+      {
+        "domain": "Linear Algebra",
+        "expected": "B",
+        "predicted": "B",
+        "passed": true,
+        "tok_s": 20.1,
+        "think_stats": {
+          "think_word_count": 20,
+          "max_consec_same_word": 3,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.6,
+          "has_think_loop": false
+        }
+      },
+      {
+        "domain": "Macroeconomics",
+        "expected": "A",
+        "predicted": "A",
+        "passed": true,
+        "tok_s": 18.65,
+        "think_stats": {
+          "think_word_count": 39,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.3077,
+          "has_think_loop": false
+        }
+      },
+      {
+        "domain": "Molecular Biology",
+        "expected": "B",
+        "predicted": "B",
+        "passed": true,
+        "tok_s": 16.9,
+        "think_stats": {
+          "think_word_count": 5,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 1.0,
+          "has_think_loop": false
+        }
+      },
+      {
+        "domain": "Electrical Eng",
+        "expected": "C",
+        "predicted": "C",
+        "passed": true,
+        "tok_s": 19.25,
+        "think_stats": {
+          "think_word_count": 22,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.8182,
+          "has_think_loop": false
+        }
+      },
+      {
+        "domain": "Distributed Systems",
+        "expected": "C",
+        "predicted": "C",
+        "passed": true,
+        "tok_s": 14.99,
+        "think_stats": {
+          "think_word_count": 18,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.9444,
+          "has_think_loop": false
+        }
+      }
+    ]
+  },
+  "gsm8k_8": {
+    "suite": "GSM8K (8-Problem Math CoT)",
+    "passed": "8/8",
+    "pass_pct": 100.0,
+    "avg_tok_s": 20.45,
+    "items": [
+      {
+        "id": "gsm8k_1",
+        "expected": "139.2",
+        "passed": true,
+        "tok_s": 19.97,
+        "think_stats": {
+          "think_word_count": 5,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.8,
+          "has_think_loop": false
+        }
+      },
+      {
+        "id": "gsm8k_2",
+        "expected": "24.68",
+        "passed": true,
+        "tok_s": 19.01,
+        "think_stats": {
+          "think_word_count": 8,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.875,
+          "has_think_loop": false
+        }
+      },
+      {
+        "id": "gsm8k_3",
+        "expected": "408",
+        "passed": true,
+        "tok_s": 19.45,
+        "think_stats": {
+          "think_word_count": 7,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.8571,
+          "has_think_loop": false
+        }
+      },
+      {
+        "id": "gsm8k_4",
+        "expected": "360",
+        "passed": true,
+        "tok_s": 20.99,
+        "think_stats": {
+          "think_word_count": 25,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.44,
+          "has_think_loop": false
+        }
+      },
+      {
+        "id": "gsm8k_5",
+        "expected": "135",
+        "passed": true,
+        "tok_s": 22.7,
+        "think_stats": {
+          "think_word_count": 11,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.8182,
+          "has_think_loop": false
+        }
+      },
+      {
+        "id": "gsm8k_6",
+        "expected": "504",
+        "passed": true,
+        "tok_s": 19.04,
+        "think_stats": {
+          "think_word_count": 64,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.5781,
+          "has_think_loop": false
+        }
+      },
+      {
+        "id": "gsm8k_7",
+        "expected": "504",
+        "passed": true,
+        "tok_s": 22.23,
+        "think_stats": {
+          "think_word_count": 21,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.5714,
+          "has_think_loop": false
+        }
+      },
+      {
+        "id": "gsm8k_8",
+        "expected": "20",
+        "passed": true,
+        "tok_s": 20.19,
+        "think_stats": {
+          "think_word_count": 77,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.5065,
+          "has_think_loop": false
+        }
+      }
+    ]
+  },
+  "coding_8_with_thinking": {
+    "suite": "8-Task Algorithmic Python Coding with Thinking",
+    "passed": "8/8",
+    "pass_pct": 100.0,
+    "avg_tok_s": 21.83,
+    "items": [
+      {
+        "name": "dijkstra",
+        "passed": true,
+        "diag": "ALL_ASSERTIONS_PASSED",
+        "tokens": 173,
+        "seconds": 8.176,
+        "tok_s": 21.16,
+        "think_stats": {
+          "think_word_count": 20,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.95,
+          "has_think_loop": false
+        }
+      },
+      {
+        "name": "LRUCache",
+        "passed": true,
+        "diag": "ALL_ASSERTIONS_PASSED",
+        "tokens": 379,
+        "seconds": 16.885,
+        "tok_s": 22.45,
+        "think_stats": {
+          "think_word_count": 8,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 1.0,
+          "has_think_loop": false
+        }
+      },
+      {
+        "name": "merge_k_sorted",
+        "passed": true,
+        "diag": "ALL_ASSERTIONS_PASSED",
+        "tokens": 141,
+        "seconds": 6.604,
+        "tok_s": 21.35,
+        "think_stats": {
+          "think_word_count": 6,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 1.0,
+          "has_think_loop": false
+        }
+      },
+      {
+        "name": "min_distance",
+        "passed": true,
+        "diag": "ALL_ASSERTIONS_PASSED",
+        "tokens": 205,
+        "seconds": 9.233,
+        "tok_s": 22.2,
+        "think_stats": {
+          "think_word_count": 29,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.4483,
+          "has_think_loop": false
+        }
+      },
+      {
+        "name": "tarjan_scc",
+        "passed": true,
+        "diag": "ALL_ASSERTIONS_PASSED",
+        "tokens": 399,
+        "seconds": 18.274,
+        "tok_s": 21.83,
+        "think_stats": {
+          "think_word_count": 54,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 0.3519,
+          "has_think_loop": false
+        }
+      },
+      {
+        "name": "total_n_queens",
+        "passed": true,
+        "diag": "ALL_ASSERTIONS_PASSED",
+        "tokens": 165,
+        "seconds": 7.442,
+        "tok_s": 22.17,
+        "think_stats": {
+          "think_word_count": 9,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 1.0,
+          "has_think_loop": false
+        }
+      },
+      {
+        "name": "trap",
+        "passed": true,
+        "diag": "ALL_ASSERTIONS_PASSED",
+        "tokens": 134,
+        "seconds": 6.253,
+        "tok_s": 21.43,
+        "think_stats": {
+          "think_word_count": 3,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 1.0,
+          "has_think_loop": false
+        }
+      },
+      {
+        "name": "length_of_lis",
+        "passed": true,
+        "diag": "ALL_ASSERTIONS_PASSED",
+        "tokens": 84,
+        "seconds": 3.812,
+        "tok_s": 22.04,
+        "think_stats": {
+          "think_word_count": 5,
+          "max_consec_same_word": 1,
+          "max_consec_phrase3": 1,
+          "unique_word_ratio": 1.0,
+          "has_think_loop": false
+        }
+      }
+    ]
+  },
+  "multi_stream_throughput": {
+    "1_stream": {
+      "total_tokens": 384,
+      "seconds": 22.968,
+      "tok_s": 16.72
+    },
+    "2_stream": {
+      "total_tokens": 689,
+      "seconds": 26.535,
+      "tok_s": 25.97
+    },
+    "4_stream": {
+      "total_tokens": 1389,
+      "seconds": 39.059,
+      "tok_s": 35.56
+    }
+  },
+  "total_wall_time_s": 500.8
+}

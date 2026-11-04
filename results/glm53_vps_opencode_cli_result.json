@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-11-04T16:20:10Z",
+  "hostname": "WIN-I2GBVRRD872",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "opencode_binary": "C:\\re\\bin\\opencode-cli.exe",
+  "configured_model": "pseudobrain/glm-5.3-flash",
+  "models_check_passed": true,
+  "agentic_run_passed": true,
+  "elapsed_s": 6.425,
+  "output": "READY_GLM53\n\n\u001b[0m\n> build \u00b7 glm-5.3-flash"
+}
