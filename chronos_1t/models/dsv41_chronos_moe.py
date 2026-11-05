@@ -941,6 +941,7 @@ try:
         Tier_slot_map_ptr,
         Active_slots_ptr,
         Gates_ptr,
+        Tier_cfg_ptr,
         routed_scaling_factor,
         SHARED_SLOT: tl.constexpr,
         K_ACT: tl.constexpr,
@@ -955,34 +956,60 @@ try:
         bias_raw = tl.load(Bias_ptr + offs, mask=mask, other=-1e30).to(tl.float32)
         bias = tl.where(bias_raw == bias_raw, bias_raw, 0.0)
         tslot_all = tl.load(Tier_slot_map_ptr + offs, mask=mask, other=-1).to(tl.int32)
-        if MAX_T3 == 0:
-            valid_mask = mask & (tslot_all >= 0) & (tslot_all < 2048)
-        else:
-            valid_mask = mask & (tslot_all >= 0)
-        biased = tl.where(valid_mask, score + bias, -1e30)
+
+        m_t1 = tl.load(Tier_cfg_ptr + 0).to(tl.float32)
+        m_t2 = tl.load(Tier_cfg_ptr + 1).to(tl.float32)
+        m_t3 = tl.load(Tier_cfg_ptr + 2).to(tl.float32)
+        t2_bias = tl.load(Tier_cfg_ptr + 3).to(tl.float32)
+        t3_bias = tl.load(Tier_cfg_ptr + 4).to(tl.float32)
+        max_t3_dyn = tl.load(Tier_cfg_ptr + 5).to(tl.int32)
+        norm_blend = tl.load(Tier_cfg_ptr + 6).to(tl.float32)
+        allow_unmapped = tl.load(Tier_cfg_ptr + 7).to(tl.float32)
+        m_shared = tl.load(Tier_cfg_ptr + 10).to(tl.float32)
+        renorm_mult = tl.load(Tier_cfg_ptr + 11).to(tl.float32)
+
+        tier_bias = tl.where(
+            tslot_all >= 2048,
+            t3_bias,
+            tl.where(tslot_all >= 1024, t2_bias, 0.0),
+        )
+        valid_mask = tl.where(allow_unmapped > 0.5, mask, mask & (tslot_all >= 0))
+        valid_mask = tl.where((MAX_T3 == 0) | (max_t3_dyn <= 0), valid_mask & (tslot_all < 2048), valid_mask)
+        biased = tl.where(valid_mask, score + bias + tier_bias, -1e30)
 
         k_offs = tl.arange(0, 8)
         kept_vec = tl.zeros((8,), dtype=tl.float32)
+        raw_kept_vec = tl.zeros((8,), dtype=tl.float32)
+        all_vec = tl.zeros((8,), dtype=tl.float32)
         t3_cnt = tl.zeros((), dtype=tl.int32)
         for k in tl.static_range(K_ACT):
-            if MAX_T3 > 0 and MAX_T3 < 6:
-                biased = tl.where((t3_cnt >= MAX_T3) & (tslot_all >= 2048), -1e30, biased)
+            biased = tl.where((t3_cnt >= max_t3_dyn) & (tslot_all >= 2048), -1e30, biased)
             best_idx = tl.argmax(biased, axis=0)
             in_bounds = (best_idx >= 0) & (best_idx < 384)
             w_k = tl.max(tl.where(offs == best_idx, score, 0.0), axis=0)
             tslot = tl.load(Tier_slot_map_ptr + best_idx, mask=in_bounds, other=-1).to(tl.int32)
-            if MAX_T3 > 0 and MAX_T3 < 6:
-                t3_cnt += tl.where(tslot >= 2048, 1, 0)
+            t3_cnt += tl.where(tslot >= 2048, 1, 0)
             tl.store(Active_slots_ptr + k, tslot)
-            is_kept = tl.where(tslot >= 0, w_k, 0.0)
-            kept_vec = tl.where(k_offs == k, is_kept, kept_vec)
+            m_k = tl.where(
+                tslot < 0,
+                0.0,
+                tl.where(tslot < 1024, m_t1, tl.where(tslot < 2048, m_t2, m_t3)),
+            )
+            raw_kept_k = tl.where(tslot >= 0, w_k, 0.0)
+            kept_vec = tl.where(k_offs == k, w_k * m_k, kept_vec)
+            raw_kept_vec = tl.where(k_offs == k, raw_kept_k, raw_kept_vec)
+            all_vec = tl.where(k_offs == k, w_k, all_vec)
             biased = tl.where(offs == best_idx, -1e30, biased)
 
-        w_kept_sum = tl.sum(kept_vec, axis=0) + 1e-20
-        gates = (kept_vec / w_kept_sum) * routed_scaling_factor
+        w_mult_sum = tl.sum(kept_vec, axis=0) + 1e-20
+        w_kept_sum = tl.sum(raw_kept_vec, axis=0) + 1e-20
+        w_all_sum = tl.sum(all_vec, axis=0) + 1e-20
+        base_denom = (1.0 - norm_blend) * w_kept_sum + norm_blend * w_all_sum
+        denom = (1.0 - renorm_mult) * base_denom + renorm_mult * w_mult_sum
+        gates = (kept_vec / denom) * routed_scaling_factor
         tl.store(Gates_ptr + k_offs, gates, mask=k_offs < K_ACT)
         tl.store(Active_slots_ptr + K_ACT, SHARED_SLOT)
-        tl.store(Gates_ptr + K_ACT, 1.0)
+        tl.store(Gates_ptr + K_ACT, m_shared)
 
     @triton.jit
     def _triton_dsv41_tiered_gu_swiglu_kernel(
@@ -995,6 +1022,7 @@ try:
         S1_gu_fp8_ptr,
         Active_slots_ptr,
         Gates_ptr,
+        Tier_cfg_ptr,
         Act_out_ptr,
         swiglu_limit,
         N_INTER: tl.constexpr,
@@ -1087,6 +1115,9 @@ try:
                     - x_sum[None, :]
                 ) * s3_f
                 acc3 += tl.sum(v3, axis=1)
+            gu_mult_t2 = tl.load(Tier_cfg_ptr + 8).to(tl.float32)
+            acc1 = acc1 * gu_mult_t2
+            acc3 = acc3 * gu_mult_t2
         else:
             slot1 = tslot - 2048
             BYTES_PER_ITER1: tl.constexpr = sub_groups_k2 * 8
@@ -1143,6 +1174,9 @@ try:
                     - x_half_sum[None, :]
                 ) * s3_f2
                 acc3 += tl.sum(v3, axis=1)
+            gu_mult_t3 = tl.load(Tier_cfg_ptr + 9).to(tl.float32)
+            acc1 = acc1 * gu_mult_t3
+            acc3 = acc3 * gu_mult_t3
 
         gate_scale = tl.load(Gates_ptr + e_idx).to(tl.float32)
         g = tl.minimum(acc1, swiglu_limit)
@@ -2190,6 +2224,23 @@ def project_onto_tangent_sphere(
     return (h_tan * (r_anchor / r_tan)).to(orig_dtype)
 
 
+_LIVE_MOE_BLOCKS: dict[int, Any] = {}
+
+
+@torch.no_grad()
+def update_all_tier_configs(cfg_vals: list[float]) -> int:
+    count = 0
+    for blk in _LIVE_MOE_BLOCKS.values():
+        t_gpu = getattr(blk, "_tier_cfg_gpu", None)
+        if t_gpu is not None:
+            vals = t_gpu.detach().cpu().tolist()
+            for i_c, v_c in enumerate(cfg_vals[:16]):
+                vals[i_c] = float(v_c)
+            t_gpu.copy_(torch.tensor(vals, dtype=torch.float32, device=t_gpu.device))
+            count += 1
+    return count
+
+
 class ChronosDsv41SparseMoeBlock(nn.Module):
     """Drop-in replacement for DeepSeek-V4.1-Flash-1017 (`DeepseekV41ForCausalLM`) Sparse MoE layer."""
 
@@ -2324,7 +2375,8 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "0"))
         default_n1 = 0 if (self.n4_slots == 96 and self.n2_slots == 0) else min(216, max(0, 384 - self.n4_slots - self.n2_slots))
         self.n1_slots = int(os.environ.get("CHRONOS_TIER3_1BIT_SLOTS", str(default_n1)))
-        self.tier2_ternary = os.environ.get("CHRONOS_TIER2_TERNARY", "1").strip() not in ("0", "false", "False")
+        default_ternary = "1" if self.n4_slots >= 48 else "0"
+        self.tier2_ternary = os.environ.get("CHRONOS_TIER2_TERNARY", default_ternary).strip() not in ("0", "false", "False")
 
         if self.use_fp4_slot_cache:
             self._keys_384 = None
@@ -2406,7 +2458,8 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self.tier_slot_map_gpu = torch.full((384,), -1, dtype=torch.int32, device=device)
 
             self.sh_down_base_cpu = sh_down_tmp.cpu()
-            self.opt_a_alpha = float(os.environ.get("CHRONOS_OPTION_A_ALPHA", "1.0"))
+            default_opt_a = "0.05" if (self.n4_slots == 52 and self.n2_slots == 44) else "0.0"
+            self.opt_a_alpha = float(os.environ.get("CHRONOS_OPTION_A_ALPHA", default_opt_a))
             opt_a_uv = _get_option_a_delta(layer_idx)
             if opt_a_uv is not None and self.opt_a_alpha != 0.0:
                 u_a = opt_a_uv[0].to(device=device, dtype=torch.bfloat16)
@@ -2526,6 +2579,16 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         self._active_slots_buf = torch.empty((self.top_k + 1,), dtype=torch.int32, device=device)
         self._active_slots_buf[self.top_k] = self.shared_slot
         self._active_gates_buf = torch.ones((self.top_k + 1,), dtype=torch.float32, device=device)
+        # [0]=m_t1, [1]=m_t2, [2]=m_t3, [3]=t2_bias, [4]=t3_bias, [5]=max_t3,
+        # [6]=norm_blend, [7]=allow_unmapped, [8]=gu_mult_t2, [9]=gu_mult_t3, [10]=m_shared, [11]=renorm_mult
+        default_tier_cfg = [1.0, 0.85, 0.45, 0.0, -0.02, 3.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+        env_tier_cfg = os.environ.get("CHRONOS_DSV41_TIER_CFG", "").strip()
+        if env_tier_cfg:
+            parts = [float(v) for v in env_tier_cfg.split(",") if v.strip()]
+            for i_c, v_c in enumerate(parts[:16]):
+                default_tier_cfg[i_c] = v_c
+        self._tier_cfg_gpu = torch.tensor(default_tier_cfg, dtype=torch.float32, device=device)
+        _LIVE_MOE_BLOCKS[layer_idx] = self
         self._act_inter_buf = torch.empty((self.top_k + 1, 2304), dtype=torch.bfloat16, device=device)
         self._y_partial_buf = torch.empty((self.top_k + 1, 5120), dtype=torch.float32, device=device)
         if self.use_fp4_slot_cache:
@@ -3182,6 +3245,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     self.tier_slot_map_gpu,
                     self._active_slots_buf,
                     self._active_gates_buf,
+                    self._tier_cfg_gpu,
                     float(self.routed_scaling_factor),
                     SHARED_SLOT=self.shared_slot,
                     K_ACT=k_act,
@@ -3200,6 +3264,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     self.s1_gu_fp8,
                     self._active_slots_buf,
                     self._active_gates_buf,
+                    self._tier_cfg_gpu,
                     self._act_inter_buf,
                     float(self.swiglu_limit),
                     N_INTER=2304,
@@ -3261,6 +3326,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     self.tier_slot_map_gpu,
                     self._active_slots_buf,
                     self._active_gates_buf,
+                    self._tier_cfg_gpu,
                     float(self.routed_scaling_factor),
                     SHARED_SLOT=self.shared_slot,
                     K_ACT=k_act,
@@ -3279,6 +3345,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     self.s1_gu_fp8,
                     self._active_slots_buf,
                     self._active_gates_buf,
+                    self._tier_cfg_gpu,
                     self._act_inter_buf,
                     float(self.swiglu_limit),
                     N_INTER=2304,

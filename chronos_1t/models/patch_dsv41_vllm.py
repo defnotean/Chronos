@@ -596,7 +596,6 @@ def enable_chronos_dsv41_vllm_hook(
 
         if not getattr(_dg_mod, "_chronos_sm120_bkv32_patched", False):
             _orig_paged_mqa = _dg_mod.fp8_fp4_paged_mqa_logits
-            _zeroed_mqa_ptrs: set[int] = set()
 
             def _chronos_paged_mqa_logits(
                 q: Any,
@@ -609,16 +608,6 @@ def enable_chronos_dsv41_vllm_hook(
                 clean_logits: bool = False,
                 indices: torch.Tensor | None = None,
             ) -> torch.Tensor:
-                if kv_cache.shape[0] > 0:
-                    if not torch.cuda.is_current_stream_capturing():
-                        _ptr = int(kv_cache.data_ptr())
-                        if _ptr not in _zeroed_mqa_ptrs:
-                            kv_cache.zero_()
-                            _zeroed_mqa_ptrs.add(_ptr)
-                        else:
-                            kv_cache[0].zero_()
-                    else:
-                        kv_cache[0].zero_()
                 eff_max_len = min(int(max_model_len), max(512, int(block_tables.shape[1]) * 64))
                 if kv_cache.ndim == 4 and kv_cache.shape[1] == 32 and q[1] is None:
                     bsz = block_tables.shape[0]
@@ -701,7 +690,6 @@ def enable_chronos_dsv41_vllm_hook(
 
         if not getattr(_fis_mod, "_chronos_sm120_chunk_patched", False):
             _orig_fi_dsv4 = _fis_mod.flashinfer_trtllm_batch_decode_sparse_mla_dsv4
-            _zeroed_fi_ptrs: set[int] = set()
 
             def _chronos_fi_dsv4(
                 *,
@@ -719,27 +707,6 @@ def enable_chronos_dsv41_vllm_hook(
                 extra_sparse_topk_lens: torch.Tensor | None = None,
                 **kwargs: Any,
             ) -> torch.Tensor:
-                _capturing = torch.cuda.is_current_stream_capturing()
-                if swa_kv_cache.shape[0] > 0:
-                    if not _capturing:
-                        _sptr = int(swa_kv_cache.data_ptr())
-                        if _sptr not in _zeroed_fi_ptrs:
-                            swa_kv_cache.zero_()
-                            _zeroed_fi_ptrs.add(_sptr)
-                        else:
-                            swa_kv_cache[0].zero_()
-                    else:
-                        swa_kv_cache[0].zero_()
-                if compressed_kv_cache is not None and compressed_kv_cache.shape[0] > 0:
-                    if not _capturing:
-                        _cptr = int(compressed_kv_cache.data_ptr())
-                        if _cptr not in _zeroed_fi_ptrs:
-                            compressed_kv_cache.zero_()
-                            _zeroed_fi_ptrs.add(_cptr)
-                        else:
-                            compressed_kv_cache[0].zero_()
-                    else:
-                        compressed_kv_cache[0].zero_()
                 n_tok = query.shape[0]
                 if n_tok <= 64:
                     return _orig_fi_dsv4(
@@ -872,117 +839,117 @@ def enable_chronos_dsv41_vllm_hook(
         _def_eff = int(os.environ.get("CHRONOS_DEFAULT_REASONING_EFFORT", "20"))
         if hasattr(_dsv41_enc, "REASONING_EFFORT_MAPPINGS"):
             _dsv41_enc.REASONING_EFFORT_MAPPINGS["low"] = _def_eff
-            if os.environ.get("CHRONOS_FORCE_HIGH_REASONING_EFFORT"):
-                _dsv41_enc.REASONING_EFFORT_MAPPINGS["high"] = int(os.environ["CHRONOS_FORCE_HIGH_REASONING_EFFORT"])
+            _dsv41_enc.REASONING_EFFORT_MAPPINGS["high"] = _def_eff
+            _dsv41_enc.REASONING_EFFORT_MAPPINGS["xhigh"] = _def_eff
     except Exception:
         pass
 
-    # Ensure DeepseekV4Attention._sparse_indexer_and_attn populates topk_indices for 128 < seq_len <= 1024
+    # Ensure DeepseekV4Attention uses the wide eager region (_prepare_and_attn_eager) under PIECEWISE CUDAGraphs
+    # and populates topk_indices for short context (<= 2048 tokens)
+    os.environ.setdefault("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    _fixed_sia_fn = None
     try:
-        import functools
+        from vllm.compilation.breakable_cudagraph import eager_break_during_capture
         from vllm.forward_context import get_forward_context
-        from vllm.models.deepseek_v41.nvidia import model as _dsv41_nv_mod
+        from vllm.triton_utils import triton
+        from vllm.models.deepseek_v41.attention import (
+            DeepseekV4Attention as _V41Attn,
+            _fill_short_context_topk_indices as _triton_fill_short_topk,
+        )
 
-        _AttnCls = getattr(_dsv41_nv_mod, "DeepseekV4Attention", None)
-        if _AttnCls is not None and not getattr(_AttnCls, "_chronos_short_ctx_patched", False):
-            _orig_sia = _AttnCls._sparse_indexer_and_attn
-            _inner_sia = getattr(_orig_sia, "__wrapped__", _orig_sia)
-
-            def _fill_short_context_topk_indices(self_a: Any, topk_indices: torch.Tensor) -> None:
-                if torch.cuda.is_current_stream_capturing():
-                    return
-                fc = get_forward_context()
-                am = getattr(fc, "attn_metadata", None)
-                if not isinstance(am, dict):
-                    return
-                idx_meta = am.get(f"{self_a.prefix}.indexer")
-                if idx_meta is None:
-                    for k, v in am.items():
-                        if k.endswith(".indexer"):
-                            idx_meta = v
-                            break
-                if idx_meta is None:
-                    return
-                n_tok = topk_indices.shape[0]
-                topk_val = topk_indices.shape[1]
-                for chunk in getattr(idx_meta, "chunks", ()):
-                    if not getattr(chunk, "skip_Copy", False):
-                        continue
-                    t_start = int(getattr(chunk, "token_start", 0))
-                    t_end = min(int(getattr(chunk, "token_end", n_tok)), n_tok)
-                    if t_end <= t_start:
-                        continue
-                    bt = getattr(chunk, "block_table", None)
-                    seq_lens = getattr(chunk, "seq_lens", None)
-                    cu_seqlens = getattr(chunk, "cu_seqlens", None)
-                    if bt is None or seq_lens is None:
-                        continue
-                    num_reqs = int(bt.shape[0])
-                    if num_reqs == (t_end - t_start):
-                        for r in range(num_reqs):
-                            row = t_start + r
-                            slen = int(seq_lens[r].item())
-                            sw_end = max(0, slen - 128)
-                            n_valid = min(sw_end, topk_val)
-                            topk_indices[row].fill_(-1)
-                            if n_valid > 0:
-                                pos = torch.arange(n_valid, device=topk_indices.device, dtype=torch.int64)
-                                blk_idx = pos // 64
-                                blk_off = pos % 64
-                                phys_blk = bt[r, blk_idx].to(torch.int64)
-                                topk_indices[row, :n_valid] = (phys_blk * 64 + blk_off).to(topk_indices.dtype)
-                    elif cu_seqlens is not None and int(cu_seqlens.shape[0]) == num_reqs + 1:
-                        for r in range(num_reqs):
-                            r_s = int(cu_seqlens[r].item())
-                            r_e = int(cu_seqlens[r + 1].item())
-                            q_cnt = r_e - r_s
-                            slen = int(seq_lens[r].item())
-                            base_pos = slen - q_cnt
-                            for q_i in range(q_cnt):
-                                row = t_start + r_s + q_i
-                                if row >= t_end:
-                                    break
-                                cur_slen = base_pos + q_i + 1
-                                sw_end = max(0, cur_slen - 128)
-                                n_valid = min(sw_end, topk_val)
-                                topk_indices[row].fill_(-1)
-                                if n_valid > 0:
-                                    pos = torch.arange(n_valid, device=topk_indices.device, dtype=torch.int64)
-                                    blk_idx = pos // 64
-                                    blk_off = pos % 64
-                                    phys_blk = bt[r, blk_idx].to(torch.int64)
-                                    topk_indices[row, :n_valid] = (phys_blk * 64 + blk_off).to(topk_indices.dtype)
-
-            @functools.wraps(_inner_sia)
-            def _chronos_sia(
+        if not getattr(_V41Attn, "_chronos_v41_short_ctx_patched", False):
+            def _fixed_sparse_indexer_and_attn(
                 self_a: Any,
                 hidden_states: torch.Tensor,
-                qr: torch.Tensor,
-                q_all: torch.Tensor,
-                k_nope: torch.Tensor,
-                k_pe: torch.Tensor,
-                topk_indices: torch.Tensor,
+                index_q: torch.Tensor | None,
+                index_q_scale: torch.Tensor | None,
+                index_weights: torch.Tensor | None,
+                q: torch.Tensor,
+                kv: torch.Tensor,
                 positions: torch.Tensor,
-            ) -> torch.Tensor:
-                try:
-                    _fill_short_context_topk_indices(self_a, topk_indices)
-                except Exception:
-                    pass
-                return _inner_sia(self_a, hidden_states, qr, q_all, k_nope, k_pe, topk_indices, positions)
+                out: torch.Tensor,
+            ) -> None:
+                if self_a.indexer is not None:
+                    attn_metadata = get_forward_context().attn_metadata
+                    handled_short = False
+                    if isinstance(attn_metadata, dict):
+                        indexer_metadata = attn_metadata.get(self_a.indexer.k_cache.prefix)
+                        if indexer_metadata is not None and (
+                            indexer_metadata.max_seq_len // self_a.indexer.compress_ratio
+                            <= self_a.indexer.topk_tokens
+                        ):
+                            num_tokens = (
+                                indexer_metadata.num_decode_tokens + indexer_metadata.num_prefill_tokens
+                            )
+                            if num_tokens > 0 and self_a.indexer.topk_indices_buffer is not None:
+                                _triton_fill_short_topk[(num_tokens,)](
+                                    self_a.indexer.topk_indices_buffer,
+                                    positions,
+                                    TOP_K=self_a.indexer.topk_tokens,
+                                    COMPRESS_RATIO=self_a.indexer.compress_ratio,
+                                    PADDED_TOP_K=triton.next_power_of_2(self_a.indexer.topk_tokens),
+                                    num_warps=8,
+                                )
+                            handled_short = True
+                    if not handled_short and index_q is not None:
+                        assert index_weights is not None
+                        q_quant = (index_q, index_q_scale) if index_q_scale is not None else index_q
+                        self_a.indexer.indexer_op(
+                            hidden_states,
+                            q_quant,
+                            None,
+                            index_weights,
+                        )
+                self_a.forward_mqa(q, kv, positions, out)
 
-            if hasattr(_orig_sia, "__wrapped__"):
-                _orig_sia.__wrapped__ = _chronos_sia
-            else:
-                _AttnCls._sparse_indexer_and_attn = torch.compiler.disable(_chronos_sia)
-            _AttnCls._chronos_short_ctx_patched = True
+            _fixed_sia_fn = _fixed_sparse_indexer_and_attn
+            _V41Attn._sparse_indexer_and_attn = eager_break_during_capture(_fixed_sparse_indexer_and_attn)
+            _V41Attn._chronos_v41_short_ctx_patched = True
     except Exception:
         pass
 
-    # Auto-install Triton anti-loop & think-budget breaker on GPUModelRunner.sample + compute_logits
+    # Auto-enable PIECEWISE CUDAGraph capture & Triton anti-loop/think-budget breaker on GPUModelRunner
     try:
+        from vllm.config import CUDAGraphMode
+        from vllm.v1.worker.gpu import model_runner as _mr_mod
         from vllm.v1.worker.gpu.model_runner import GPUModelRunner
         from vllm.models.deepseek_v41.nvidia.model import DeepseekV41LLMForCausalLM
         import chronos_1t.models.antiloop_think_breaker as _atb
+
+        if not hasattr(GPUModelRunner, "_orig_exec_pw_dsv41"):
+            GPUModelRunner._orig_exec_pw_dsv41 = GPUModelRunner.execute_model
+
+            def _dsv41_exec_pw(self_mr: Any, *args: Any, **kwargs: Any) -> Any:
+                _mr_mod._LIVE_RUNNER = self_mr
+                if not getattr(self_mr, "_chronos_pw_filtered", False):
+                    try:
+                        cgm = getattr(self_mr, "cudagraph_manager", None)
+                        if cgm is not None and getattr(cgm, "_candidates", None):
+                            for k, v in list(cgm._candidates.items()):
+                                pw = [d for d in v if d.cg_mode == CUDAGraphMode.PIECEWISE]
+                                if pw:
+                                    cgm._candidates[k] = pw
+                            bcg = getattr(cgm, "breakable_cg_runner", None)
+                            if bcg is not None and _fixed_sia_fn is not None:
+                                for entry in getattr(bcg, "entries", {}).values():
+                                    if getattr(entry, "capture", None) is not None:
+                                        for seg in entry.capture.segments:
+                                            for c in (getattr(seg, "__closure__", None) or []):
+                                                val = c.cell_contents
+                                                if callable(val) and getattr(val, "__name__", "") in (
+                                                    "_sparse_indexer_and_attn",
+                                                    "_fixed_sparse_indexer_and_attn",
+                                                ):
+                                                    c.cell_contents = _fixed_sia_fn
+                            for _kvc in getattr(self_mr, "kv_caches", []):
+                                if isinstance(_kvc, torch.Tensor) and _kvc.numel() > 0:
+                                    _kvc.zero_()
+                            self_mr._chronos_pw_filtered = True
+                    except Exception:
+                        pass
+                return GPUModelRunner._orig_exec_pw_dsv41(self_mr, *args, **kwargs)
+
+            GPUModelRunner.execute_model = _dsv41_exec_pw
 
         if not hasattr(GPUModelRunner, "_orig_sample_dsv41"):
             GPUModelRunner._orig_sample_dsv41 = GPUModelRunner.sample
@@ -990,6 +957,13 @@ def enable_chronos_dsv41_vllm_hook(
             def _dsv41_sample(self_mr: Any, hidden_states: torch.Tensor, input_batch: Any, *args: Any, **kwargs: Any) -> Any:
                 lm_mod = getattr(self_mr.model, "language_model", self_mr.model)
                 try:
+                    import importlib as _imp
+                    _atb_p = "/pb27_vllm/chronos_1t/models/antiloop_think_breaker.py"
+                    if os.path.exists(_atb_p):
+                        _atb_mt = os.path.getmtime(_atb_p)
+                        if getattr(self_mr, "_atb_mt", 0.0) != _atb_mt:
+                            self_mr._atb_mt = _atb_mt
+                            _imp.reload(_atb)
                     lm_mod._sample_input_ids = input_batch.input_ids[input_batch.logits_indices]
                     lm_mod._sample_batch = input_batch
                     lm_mod._sample_req_states = self_mr.req_states
@@ -1012,7 +986,7 @@ def enable_chronos_dsv41_vllm_hook(
                     s_states = getattr(self_lm, "_sample_req_states", None)
                     s_ids = getattr(self_lm, "_sample_input_ids", None)
                     if logits is not None and s_batch is not None and s_states is not None and s_ids is not None:
-                        budget = int(os.environ.get("CHRONOS_THINK_BUDGET", "80"))
+                        budget = int(os.environ.get("CHRONOS_THINK_BUDGET", "192"))
                         _atb.apply_antiloop_and_think_breaker(
                             logits, s_batch, s_states, s_ids, think_budget=budget
                         )

@@ -652,6 +652,7 @@ def fast_block_forward(
             use_cg = (
                 getattr(self.ffn, "w1_gu_u8", None) is None
                 or self.ffn.w1_gu_u8.is_cuda
+                or (not getattr(self.ffn, "t3_on_cpu", False))
                 or getattr(self.ffn, "_active_mt3", 6) == 0
             )
             if not use_cg:

@@ -323,6 +323,30 @@ Evaluated via [`benchmarks/dsv41_official_benchmarks_eval.py`](benchmarks/dsv41_
 | **11. `ZeroBench-main (w/tools)`** | Hard Zero-Shot Deductive & Combinatorial (`n = 40`, `1,280` tok) | `49.0%` | `41.0%` | — | `53.0%` | `52.0%` | `51.0%` | **`51.0%`** (`Pass`) | **`35.59 tok/s`** (`28.10 ms/tok`) | **`100.00%` / `100.0%`** |
 | **12. `HarmBench-320` Abliteration** | Post-Quantization Non-Refusal Audit (`128`-Tok Sustained Speed) | — | — | — | — | — | `Refuses` | **`320/320` (`100.00%` Pass)** | **`36.88 tok/s`** (`27.11 ms/tok`) | **`100.00%` (`\|R_l W_2\|_F = 0`)** |
 
+### 4.7 `zai-org/GLM-5.3` (full `753B`, `GlmMoeDsaForCausalLM`): DGX Spark (vLLM) + Colab GPU (standalone engine)
+
+The full GLM-5.3 has `78` layers plus an MTP layer, `hidden = 6144`, and `256` experts on each of `76` MoE layers
+(`19,456` experts, `755.6 GB` FP8). It uses the same Chronos v7.5 format as Flash and DSV4.1, with a few additions:
+
+* **Converter:** [`convert_glm53_chronos.py`](chronos_1t/converter/convert_glm53_chronos.py). It streams in shard
+  order (≤3 source shards on disk), uploads in the background with back-pressure, can resume, and can write an
+  optional hot-expert sidecar built straight from FP8. Output is `~302 GB` standard or `~199 GB` compact.
+* **Runtime:** [`ChronosGlm53SparseMoeBlock`](chronos_1t/models/glm53_chronos_moe.py) builds T1/T2/T3 tier slots at
+  load time. Sizing comes from [`plan_residency`](chronos_1t/models/glm53_chronos_spec.py): Spark gets
+  `193×T3`/layer (75% coverage); A100 gets `116×T3` on the GPU plus `140×T3` in pinned host RAM (100% coverage).
+  Decoding uses portable Triton kernels that run on sm_80 through sm_121.
+* **Spark:** [`patch_glm53_vllm.py`](chronos_1t/models/patch_glm53_vllm.py) +
+  [`start_glm53_vllm.sh`](scripts/start_glm53_vllm.sh) hook into vLLM v0.31 `deepseek_v32`. **Colab:** vLLM has no
+  sm_80 DSA backend, so A100s use [`glm53_engine.py`](chronos_1t/models/glm53_engine.py) +
+  [`run_glm53_chronos_colab.py`](scripts/run_glm53_chronos_colab.py) +
+  [`notebooks/GLM53_Chronos_Colab.ipynb`](notebooks/GLM53_Chronos_Colab.ipynb).
+* **Verified so far:**
+  * The engine matches HF `transformers` `GlmMoeDsaForCausalLM` logits at cos `1.000000` (prefill and cached
+    decode, DSA top-k active).
+  * CPU and CUDA reconstruction of real GLM-5.3 experts are bit-identical.
+  * On real weights, per-expert functional cos is `0.954` for layer 3 and `0.912` for layer 40.
+  * T3 tiers come in at `0.54–0.66` per expert. See [`docs/HF_GLM53_FULL_README.md`](docs/HF_GLM53_FULL_README.md).
+
 ---
 
 ## 5. Chronos `v1.0` → `v7.5` & Six Production Serving Optimizations

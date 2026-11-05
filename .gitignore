@@ -18,3 +18,7 @@ __pycache__/
 venv/
 .env
 Chimera-LSA/
+
+# GLM-5.3 Chronos test work dirs (synthetic checkpoints / downloaded source shards)
+.glm53_synth/
+.glm53_real_layer/

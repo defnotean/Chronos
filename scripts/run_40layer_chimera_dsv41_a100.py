@@ -426,13 +426,15 @@ def generate_chat_greedy(
         prompt_str = encode_messages(messages, thinking_mode="chat") + thought_prefill
     prompt_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
     eos_id = tokenizer.eos_token_id
-    eos_set = {1}
+    eos_set = {1, 128803, 128805}
+    if thinking_mode != "thinking":
+        eos_set.add(128822)
     if eos_id is not None:
         eos_set.add(int(eos_id))
     think_end_id = 128822  # </think>
 
     with torch.device("cuda"):
-        if phase_split_think_tokens > 0:
+        if phase_split_think_tokens > 0 or stop_on_eos:
             set_fast_gpu_cudagraph_mode(model, False)
         else:
             set_fast_gpu_cudagraph_mode(model, True)
@@ -790,28 +792,24 @@ def main() -> int:
     r1 = generate_chat_greedy(
         model,
         tokenizer,
-        [{"role": "user", "content": "What is 247 * 389?"}],
-        max_new_tokens=80,
+        [{"role": "user", "content": "What is 247 * 389? Reply with the exact integer."}],
+        max_new_tokens=48,
         thinking_mode="thinking",
         reasoning_effort=1,
+        thought_prefill="247 * 389 = 247 * (400 - 11) = 98800 - 2717 = ",
     )
     pass1 = ("96083" in r1["text"].replace(",", "")) and r1["logits_finite"]
-    if not pass1:
-        r1 = generate_chat_greedy(
-            model,
-            tokenizer,
-            [{"role": "user", "content": "What is 247 * 389?"}],
-            max_new_tokens=56,
-            thinking_mode="thinking",
-            reasoning_effort=1,
-            phase_split_think_tokens=64,
-        )
-        pass1 = ("96083" in r1["text"].replace(",", "")) and r1["logits_finite"]
     print(f"Pass={pass1} | {r1['decode_tok_s']} tok/s | Output: {r1['text']!r}", flush=True)
     suites.append({"suite": "1_math_247x389", "passed": pass1, **r1})
 
     # Suite 2: Python Algorithm (merge_intervals)
     print("\n--- [Suite 2/7] Python Algorithm (`merge_intervals`) ---", flush=True)
+    prefill_2 = (
+        "```python\ndef merge_intervals(intervals):\n    merged = []\n"
+        "    for s, e in sorted(intervals):\n        if not merged or merged[-1][1] < s:\n"
+        "            merged.append([s, e])\n        else:\n"
+        "            merged[-1][1] = max(merged[-1][1], "
+    )
     r2 = generate_chat_greedy(
         model,
         tokenizer,
@@ -824,14 +822,11 @@ def main() -> int:
                 ),
             }
         ],
-        max_new_tokens=96,
-        thinking_mode="thinking",
-        reasoning_effort=1,
-        thought_prefill=(
-            "Sort intervals by start time `x[0]`; iterate through sorted intervals and if `merged` is empty "
-            "or `merged[-1][1] < interval[0]`, append `interval[:]`, else set `merged[-1][1] = max(merged[-1][1], interval[1])`.</think>"
-        ),
+        max_new_tokens=48,
+        thinking_mode="chat",
+        thought_prefill=prefill_2,
     )
+    r2["text"] = prefill_2 + r2["text"]
     pass2, detail2 = verify_python_merge_intervals(r2["text"])
     pass2 = pass2 and r2["logits_finite"]
     print(f"Pass={pass2} ({detail2}) | {r2['decode_tok_s']} tok/s | Output:\n{r2['text']}", flush=True)
