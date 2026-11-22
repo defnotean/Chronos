@@ -1,0 +1,103 @@
+{
+  "gate_e1": {
+    "os": {
+      "yes": true,
+      "finite": true,
+      "text": "YES. `os` is a standard Python module providing an interface to interact with the operating system."
+    },
+    "sys": {
+      "yes": true,
+      "finite": true,
+      "text": "YES \u2014 `sys` is a built-in standard library module that provides access to interpreter-specific variables and functions."
+    },
+    "glob": {
+      "yes": true,
+      "finite": true,
+      "text": "YES \u2014 `glob` is a standard Python module for finding files matching Unix-style path patterns."
+    },
+    "numpy": {
+      "yes": true,
+      "finite": true,
+      "text": "YES \u2014 NumPy is a real, widely used third-party Python module for numerical computing."
+    },
+    "pandas": {
+      "yes": true,
+      "finite": true,
+      "text": "YES. Pandas is a real, widely used open-source Python library for data analysis and manipulation."
+    },
+    "subprocess": {
+      "yes": true,
+      "finite": true,
+      "text": "YES \u2014 `subprocess` is a standard library module in Python for spawning and managing child processes."
+    },
+    "psutil": {
+      "yes": true,
+      "finite": true,
+      "text": "YES. psutil is a real, widely used Python module for retrieving information on running processes and system utilization."
+    },
+    "ftplib": {
+      "yes": true,
+      "finite": true,
+      "text": "YES \u2014 ftplib is a standard library module in Python for FTP client operations."
+    },
+    "wordcloud": {
+      "yes": true,
+      "finite": true,
+      "text": "YES \u2014 `wordcloud` is a real third-party Python package available on PyPI for generating word cloud images."
+    }
+  },
+  "gate_e1_yes": "9/9",
+  "gate_e2_speed": {
+    "cg": 40,
+    "finite": true,
+    "nz": 159,
+    "tok_s": 8.56
+  },
+  "gate_e2_prefix_parity": {
+    "len": 283,
+    "cos": 0.9919387102127075,
+    "top1_match": true
+  },
+  "gate_e2_bcb_ab": [
+    {
+      "task_id": "BigCodeBench/13",
+      "passed": true,
+      "failure_type": "pass",
+      "detail": ")|44.241.66.173|:21... connected.\nLogging in as dlpuser ... \nLogin incorrect.\n.....\n----------------------------------------------------------------------\nRan 5 tests in 7.022s\n\nOK",
+      "tokens": 2394,
+      "think_tokens": 2048,
+      "think_forced": true,
+      "tok_s": 9.12
+    },
+    {
+      "task_id": "BigCodeBench/15",
+      "passed": false,
+      "failure_type": "assertion_fail",
+      "detail": "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: 'Error executing command' not found in 'Command failed with exit code 1:\\n'\n\n----------------------------------------------------------------------\nRan 6 tests in 0.041s\n\nFAILED (failures=1)",
+      "tokens": 2359,
+      "think_tokens": 2048,
+      "think_forced": true,
+      "tok_s": 9.0
+    },
+    {
+      "task_id": "BigCodeBench/17",
+      "passed": false,
+      "failure_type": "assertion_fail",
+      "detail": " not found. Starting multi_instance.\n?         ----       ^\n+ Process found. Restarting multi_instance.\n?                ^^^\n\n\n----------------------------------------------------------------------\nRan 3 tests in 0.004s\n\nFAILED (failures=3)",
+      "tokens": 2255,
+      "think_tokens": 2055,
+      "think_forced": true,
+      "tok_s": 9.22
+    },
+    {
+      "task_id": "BigCodeBench/34",
+      "passed": true,
+      "failure_type": "pass",
+      "detail": ".....\n----------------------------------------------------------------------\nRan 5 tests in 0.233s\n\nOK",
+      "tokens": 1085,
+      "think_tokens": 903,
+      "think_forced": false,
+      "tok_s": 9.18
+    }
+  ]
+}

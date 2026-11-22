@@ -17,12 +17,18 @@ import importlib
 import os
 from pathlib import Path
 import shutil
-import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
-os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+import requests
+
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+if os.environ.get("CHRONOS_DISABLE_HF_TOKEN") == "1":
+    os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+else:
+    os.environ.pop("HF_HUB_DISABLE_IMPLICIT_TOKEN", None)
 
 import torch
 import torch.nn as nn
@@ -65,6 +71,23 @@ def _drop_page_cache(path: Path) -> None:
             pass
 
 
+def _resolve_hf_token() -> str | None:
+    if os.environ.get("CHRONOS_DISABLE_HF_TOKEN") == "1":
+        return None
+    env_tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if env_tok and env_tok.strip():
+        return env_tok.strip()
+    for cand in (Path("/root/.cache/huggingface/token"), Path.home() / ".cache" / "huggingface" / "token"):
+        try:
+            if cand.is_file():
+                txt = cand.read_text(encoding="utf-8").strip()
+                if txt:
+                    return txt
+        except OSError:
+            pass
+    return None
+
+
 def _download_stock_shard(repo_id: str, filename: str, stream_dir: Path) -> Path:
     stream_dir.mkdir(parents=True, exist_ok=True)
     dest = stream_dir / filename
@@ -73,27 +96,135 @@ def _download_stock_shard(repo_id: str, filename: str, stream_dir: Path) -> Path
     tmp_part = stream_dir / f"{filename}.part"
     if tmp_part.exists():
         tmp_part.unlink(missing_ok=True)
-    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
-    cmd = [
-        "curl",
-        "-fSL",
-        "--retry",
-        "6",
-        "--retry-delay",
-        "3",
-        "--connect-timeout",
-        "20",
-        "-o",
-        str(tmp_part),
-        url,
-    ]
-    res = subprocess.run(cmd, check=False)
-    if res.returncode == 0 and tmp_part.exists() and tmp_part.stat().st_size > 1024 * 1024:
-        tmp_part.replace(dest)
-        return dest
-    tmp_part.unlink(missing_ok=True)
-    p = Path(hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(stream_dir)))
-    return p
+    tok = _resolve_hf_token()
+    src_url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+
+    def _resolve_cdn() -> tuple[str, int]:
+        hdrs = {"Range": "bytes=0-0"}
+        if tok:
+            hdrs["Authorization"] = f"Bearer {tok}"
+        with requests.get(src_url, headers=hdrs, allow_redirects=True, timeout=30) as resp:
+            if resp.status_code not in (200, 206):
+                resp.raise_for_status()
+            cr = str(resp.headers.get("Content-Range", ""))
+            if "/" in cr and cr.split("/")[-1].strip().isdigit():
+                tot = int(cr.split("/")[-1].strip())
+            else:
+                tot = int(resp.headers["Content-Length"])
+            return str(resp.url), tot
+
+    cdn_url, total_bytes = _resolve_cdn()
+    if total_bytes <= 0:
+        raise RuntimeError(f"Invalid content size {total_bytes} for {repo_id}/{filename}")
+
+    url_lock = threading.Lock()
+    cdn_state: list[Any] = [cdn_url, time.monotonic()]
+    tls = threading.local()
+    sessions: list[requests.Session] = []
+    sess_lock = threading.Lock()
+
+    def _get_session() -> requests.Session:
+        sess = getattr(tls, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            tls.session = sess
+            with sess_lock:
+                sessions.append(sess)
+        return sess
+
+    def _refresh_cdn(failed_url: str) -> str:
+        with url_lock:
+            now = time.monotonic()
+            if cdn_state[0] == failed_url or (now - float(cdn_state[1])) > 5.0:
+                new_url, _ = _resolve_cdn()
+                cdn_state[0] = new_url
+                cdn_state[1] = time.monotonic()
+            return str(cdn_state[0])
+
+    chunk_size = 32 * 1024 * 1024
+    spans = [(s, min(s + chunk_size - 1, total_bytes - 1)) for s in range(0, total_bytes, chunk_size)]
+    can_fadvise = hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED")
+    fd = os.open(str(tmp_part), os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+    fd_closed = False
+    ok = False
+    try:
+        os.ftruncate(fd, total_bytes)
+
+        def _fetch_span(span: tuple[int, int]) -> None:
+            start, end_incl = span
+            expected = end_incl - start + 1
+            last_err: Exception | None = None
+            for attempt in range(8):
+                with url_lock:
+                    url = str(cdn_state[0])
+                try:
+                    resp = _get_session().get(
+                        url,
+                        headers={"Range": f"bytes={start}-{end_incl}"},
+                        timeout=45,
+                    )
+                    if resp.status_code in (401, 403, 410, 429):
+                        last_err = RuntimeError(f"HTTP {resp.status_code} for {filename} [{start}..{end_incl}]")
+                        _refresh_cdn(url)
+                        time.sleep(min(12.0, 0.5 * (2**attempt)))
+                        continue
+                    if resp.status_code not in (200, 206):
+                        resp.raise_for_status()
+                    content = resp.content
+                    if len(content) != expected:
+                        raise IOError(f"Short chunk {len(content)} != {expected} for {filename} [{start}..{end_incl}]")
+                    mv = memoryview(content)
+                    off = 0
+                    while off < expected:
+                        w = os.pwrite(fd, mv[off:], start + off)
+                        if w <= 0:
+                            raise OSError(f"Short pwrite at {start + off}")
+                        off += w
+                    if can_fadvise:
+                        try:
+                            os.posix_fadvise(fd, start, expected, os.POSIX_FADV_DONTNEED)
+                        except OSError:
+                            pass
+                    return
+                except Exception as exc:
+                    last_err = exc
+                    if attempt >= 2:
+                        try:
+                            _refresh_cdn(url)
+                        except Exception:
+                            pass
+                    time.sleep(min(12.0, 0.5 * (2**attempt)))
+            raise RuntimeError(f"Failed downloading {filename} [{start}..{end_incl}] after 8 attempts: {last_err}")
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = [pool.submit(_fetch_span, sp) for sp in spans]
+            for fut in futs:
+                fut.result()
+
+        os.fsync(fd)
+        if can_fadvise:
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            except OSError:
+                pass
+        ok = True
+    finally:
+        if not fd_closed:
+            os.close(fd)
+            fd_closed = True
+        for s in sessions:
+            try:
+                s.close()
+            except Exception:
+                pass
+        if not ok:
+            tmp_part.unlink(missing_ok=True)
+
+    assert tmp_part.stat().st_size == total_bytes, (
+        f"Size mismatch for {filename}: {tmp_part.stat().st_size} != {total_bytes}"
+    )
+    tmp_part.replace(dest)
+    return dest
 
 
 def _free_existing_resident_model() -> None:
@@ -196,7 +327,7 @@ def main() -> int:
     for fname in ("tokenizer.json", "tokenizer_config.json", "config.json"):
         dst = tok_dir / fname
         if not dst.is_file() or dst.stat().st_size == 0:
-            hf_hub_download(repo_id=repo_id, filename=fname, local_dir=str(tok_dir))
+            hf_hub_download(repo_id=repo_id, filename=fname, local_dir=str(tok_dir), token=_resolve_hf_token())
     tokenizer = AutoTokenizer.from_pretrained(str(tok_dir), trust_remote_code=True)
     print(f"[Init] Tokenizer loaded from {tok_dir} (vocab={len(tokenizer)})", flush=True)
 

@@ -490,7 +490,7 @@ def main() -> int:
             ev["failure_type"] = "truncated_code"
 
         rec = {
-            "model": "chronos_v8_calibrated_3tier",
+            "model": str(getattr(builtins, "GLOBAL_DSV41_VERSION", "chronos_v8_calibrated_3tier")),
             "task_id": tid,
             "idx": int(item["idx"]),
             "passed": bool(ev["passed"]),
