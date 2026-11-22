@@ -1,0 +1,82 @@
+{
+  "row_bytes": 144,
+  "n_parts": 3,
+  "layers": {
+    "layer_1": {
+      "layer_id": 1,
+      "filename": "engram_l1_int4.bin",
+      "total_rows": 384006168,
+      "total_bytes": 55296888192,
+      "meta_path_in_repo": "engram/engram_l1_int4.bin.meta.json",
+      "proj_path_in_repo": "engram/engram_proj_l1.pt",
+      "reassemble_cmd": "cat engram/engram_l1_int4.bin.part0 engram/engram_l1_int4.bin.part1 engram/engram_l1_int4.bin.part2 > engram_l1_int4.bin",
+      "parts": [
+        {
+          "path_in_repo": "engram/engram_l1_int4.bin.part0",
+          "part_index": 0,
+          "row_start": 0,
+          "row_end": 128002056,
+          "byte_offset": 0,
+          "bytes": 18432296064,
+          "sha256": "dd666abde1f40a8e34a10c7abc9dce9807001e0056733f1df9c6c61dd3cd1efc"
+        },
+        {
+          "path_in_repo": "engram/engram_l1_int4.bin.part1",
+          "part_index": 1,
+          "row_start": 128002056,
+          "row_end": 256004112,
+          "byte_offset": 18432296064,
+          "bytes": 18432296064,
+          "sha256": "377a1a5f7fee72a57ce2307de7dee385c408e30f336b4bb934c6a7bc0838fdca"
+        },
+        {
+          "path_in_repo": "engram/engram_l1_int4.bin.part2",
+          "part_index": 2,
+          "row_start": 256004112,
+          "row_end": 384006168,
+          "byte_offset": 36864592128,
+          "bytes": 18432296064,
+          "sha256": "c263e9424bcb60f3e9e31a0ddc64cfd529abdab31872724b3adbd425c27eb135"
+        }
+      ]
+    },
+    "layer_14": {
+      "layer_id": 14,
+      "filename": "engram_l14_int4.bin",
+      "total_rows": 384016682,
+      "total_bytes": 55298402208,
+      "meta_path_in_repo": "engram/engram_l14_int4.bin.meta.json",
+      "proj_path_in_repo": "engram/engram_proj_l14.pt",
+      "reassemble_cmd": "cat engram/engram_l14_int4.bin.part0 engram/engram_l14_int4.bin.part1 engram/engram_l14_int4.bin.part2 > engram_l14_int4.bin",
+      "parts": [
+        {
+          "path_in_repo": "engram/engram_l14_int4.bin.part0",
+          "part_index": 0,
+          "row_start": 0,
+          "row_end": 128005560,
+          "byte_offset": 0,
+          "bytes": 18432800640,
+          "sha256": "7e98564a01055ce6a4ff77c30a491178a19c912f8f4299a9adaf950ab99f708e"
+        },
+        {
+          "path_in_repo": "engram/engram_l14_int4.bin.part1",
+          "part_index": 1,
+          "row_start": 128005560,
+          "row_end": 256011121,
+          "byte_offset": 18432800640,
+          "bytes": 18432800784,
+          "sha256": "2452d9ede7c5db2a8b00ed04f976300bfc0ab2430fd1ce3dede8fc0c6a2e2d8e"
+        },
+        {
+          "path_in_repo": "engram/engram_l14_int4.bin.part2",
+          "part_index": 2,
+          "row_start": 256011121,
+          "row_end": 384016682,
+          "byte_offset": 36865601424,
+          "bytes": 18432800784,
+          "sha256": "f3fa43f0bd4887ec8bb224dfa000dbff52e80d9b420438751219abb71c738f22"
+        }
+      ]
+    }
+  }
+}

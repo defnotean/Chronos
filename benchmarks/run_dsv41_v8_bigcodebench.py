@@ -346,7 +346,10 @@ def summarize_bcb_report(
         failures[ft] = failures.get(ft, 0) + 1
     rep = {
         "benchmark": "bigcode/bigcodebench-hard (v0.1.4 Instruct)",
-        "model_version": "chronos_v8_calibrated_3tier",
+        "model_version": str(
+            (recs[-1].get("model") if recs else None)
+            or getattr(builtins, "GLOBAL_DSV41_VERSION", "chronos_v8_calibrated_3tier")
+        ),
         "source_repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         "status": "COMPLETE" if n >= total_target else "IN_PROGRESS",

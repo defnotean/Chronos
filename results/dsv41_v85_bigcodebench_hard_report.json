@@ -1,0 +1,50 @@
+{
+  "benchmark": "bigcode/bigcodebench-hard (v0.1.4 Instruct)",
+  "model_version": "v8.5_748b_nvme_engram",
+  "source_repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "updated_at_utc": "2026-11-22T19:50:13.220422+00:00",
+  "status": "IN_PROGRESS",
+  "settings": {
+    "target_n": 148,
+    "max_new_tokens": 6144,
+    "think_ceiling": 3072,
+    "reasoning_effort": "high",
+    "ablate_guards": true,
+    "temperature": 0.0,
+    "use_speculative": false,
+    "max_seq_len": 131072
+  },
+  "n": 20,
+  "total_target": 148,
+  "passed": 7,
+  "pass_at_1_pct": 35.0,
+  "wilson_ci_95_pct": [
+    18.12,
+    56.71
+  ],
+  "mean_tokens": 3215.8,
+  "mean_think_tokens": 2769.8,
+  "mean_decode_tok_s": 9.41,
+  "think_forced_pct": 70.0,
+  "think_unclosed_pct": 0.0,
+  "routing": {
+    "prefill_t1_pct": 53.4,
+    "prefill_t2_pct": 32.33,
+    "prefill_t3_pct": 14.28,
+    "prefill_4bit_pct": 85.72,
+    "decode_t1_pct": 39.34,
+    "decode_t2_pct": 36.1,
+    "decode_t3_pct": 24.56,
+    "decode_4bit_pct": 75.44,
+    "all_t1_pct": 40.34,
+    "all_t2_pct": 35.83,
+    "all_t3_pct": 23.83,
+    "all_4bit_pct": 76.17
+  },
+  "failure_breakdown": {
+    "assertion_fail": 11,
+    "pass": 7,
+    "timeout": 1,
+    "truncated_code": 1
+  }
+}
