@@ -1,0 +1,94 @@
+{
+  "arm": "A2",
+  "config": {
+    "description": "Decoding guards off inside <think> on top of A0 baseline (CHRONOS_ABLATE_GUARDS=1)",
+    "kv_limit": 2048,
+    "ablate_guards": "1",
+    "think_ceiling": "",
+    "log_routing": "0",
+    "suites": {
+      "mmlu": {
+        "thinking_mode": "chat",
+        "max_new_tokens": 12,
+        "max_think_tokens": 0
+      },
+      "mmlu_pro": {
+        "thinking_mode": "thinking",
+        "max_new_tokens": 768,
+        "max_think_tokens": 0
+      },
+      "gsm8k": {
+        "thinking_mode": "thinking",
+        "max_new_tokens": 768,
+        "max_think_tokens": 0
+      }
+    }
+  },
+  "status": "COMPLETE",
+  "elapsed_s": 956.37,
+  "total_n": 600,
+  "total_passed": 510,
+  "micro_pass_rate_pct": 85.0,
+  "micro_wilson_ci_95_pct": [
+    81.92,
+    87.63
+  ],
+  "macro_pass_rate_pct": 86.11,
+  "overall_mean_tokens": 133.85,
+  "overall_mean_think_tokens": 90.25,
+  "overall_think_forced_pct": 9.0,
+  "overall_think_unclosed_pct": 0.0,
+  "suites": {
+    "mmlu": {
+      "n": 300,
+      "passed": 245,
+      "pass_rate_pct": 81.67,
+      "wilson_ci_95_pct": [
+        76.9,
+        85.64
+      ],
+      "mean_tokens": 1.04,
+      "mean_think_tokens": 0.0,
+      "think_forced_count": 0,
+      "think_forced_pct": 0.0,
+      "think_forced_among_thinking_pct": 0.0,
+      "think_unclosed_count": 0,
+      "think_unclosed_pct": 0.0,
+      "mean_decode_tok_s": 16.47
+    },
+    "mmlu_pro": {
+      "n": 150,
+      "passed": 122,
+      "pass_rate_pct": 81.33,
+      "wilson_ci_95_pct": [
+        74.34,
+        86.76
+      ],
+      "mean_tokens": 262.07,
+      "mean_think_tokens": 207.65,
+      "think_forced_count": 43,
+      "think_forced_pct": 28.67,
+      "think_forced_among_thinking_pct": 28.67,
+      "think_unclosed_count": 0,
+      "think_unclosed_pct": 0.0,
+      "mean_decode_tok_s": 14.8
+    },
+    "gsm8k": {
+      "n": 150,
+      "passed": 143,
+      "pass_rate_pct": 95.33,
+      "wilson_ci_95_pct": [
+        90.68,
+        97.72
+      ],
+      "mean_tokens": 271.25,
+      "mean_think_tokens": 153.33,
+      "think_forced_count": 11,
+      "think_forced_pct": 7.33,
+      "think_forced_among_thinking_pct": 7.33,
+      "think_unclosed_count": 0,
+      "think_unclosed_pct": 0.0,
+      "mean_decode_tok_s": 15.26
+    }
+  }
+}

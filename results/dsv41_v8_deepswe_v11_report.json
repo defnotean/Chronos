@@ -1,0 +1,70 @@
+{
+  "benchmark": "datacurve-ai/deep-swe v1.1 (Harbor)",
+  "model_version": "v8_calibrated_3tier",
+  "source_repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "updated_at_utc": "2026-11-22T10:39:00.901386+00:00",
+  "settings": {
+    "max_new_tokens_per_turn": 4096,
+    "think_ceiling": 2048,
+    "reasoning_effort": "max",
+    "ablate_guards": true,
+    "temperature": 0.0,
+    "top_p": 0.95,
+    "step_limit": 120,
+    "max_context": 124000,
+    "max_seq_len": 131072,
+    "use_speculative": false,
+    "offline_isolation_mode": "unshare_r_net"
+  },
+  "offline_isolation_modes": [
+    "unshare_r_net"
+  ],
+  "total_scheduled": 113,
+  "completed": 2,
+  "passed": 1,
+  "pass_rate_pct": 50.0,
+  "wilson_ci_95_pct": [
+    9.45,
+    90.55
+  ],
+  "milestone25_completed": 2,
+  "milestone25_passed": 1,
+  "milestone25_pass_rate_pct": 50.0,
+  "milestone25_wilson_ci_95_pct": [
+    9.45,
+    90.55
+  ],
+  "mean_steps": 84.5,
+  "mean_elapsed_s": 4961.13,
+  "mean_decode_tok_s": 10.4,
+  "decode_nonzero_rows": 61969,
+  "spec_drafted": 0,
+  "spec_accepted": 0,
+  "spec_accept_rate": 0.0,
+  "routing": {
+    "prefill_t1_pct": 43.18,
+    "prefill_t2_pct": 32.47,
+    "prefill_t3_pct": 24.35,
+    "prefill_4bit_pct": 75.65,
+    "decode_t1_pct": 38.68,
+    "decode_t2_pct": 34.59,
+    "decode_t3_pct": 26.73,
+    "decode_4bit_pct": 73.27,
+    "all_t1_pct": 42.27,
+    "all_t2_pct": 32.9,
+    "all_t3_pct": 24.83,
+    "all_4bit_pct": 75.17
+  },
+  "submitted_count": 1,
+  "by_language": {
+    "go": {
+      "n": 2,
+      "passed": 1,
+      "pass_rate_pct": 50.0,
+      "wilson_ci_95_pct": [
+        9.45,
+        90.55
+      ]
+    }
+  }
+}

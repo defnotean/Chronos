@@ -1,0 +1,7 @@
+{
+  "env_CHRONOS_RUNTIME_R_BASIS": "0",
+  "resident_r_basis_active_layers": 0,
+  "num_layers": 40,
+  "can_toggle_abliteration_without_reconverting": false,
+  "reason": "CHRONOS_RUNTIME_R_BASIS defaults to '0' and r_basis is None on all 40/40 resident layers. Refusal orthogonalization (dealignai/OBLITERATUS projection) is permanently baked offline into the safetensors weights of attention wo_b, shared_experts.w2, upgrade2 hot96 w2, and holographic banks/healers, and raw un-ablated delta projections are not recoverable from the converted checkpoint."
+}

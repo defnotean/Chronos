@@ -16,11 +16,14 @@ Implements runtime execution for converted `DeepSeek-V4.1-Flash-1017` (`Deepseek
 """
 from __future__ import annotations
 
+import builtins
+import ctypes
 import gc
 import os
 from pathlib import Path
 import re
 from typing import Any, Iterable
+import weakref
 
 import torch
 from torch import nn
@@ -942,6 +945,7 @@ try:
         Active_slots_ptr,
         Gates_ptr,
         Tier_cfg_ptr,
+        Top_ids_ptr,
         routed_scaling_factor,
         SHARED_SLOT: tl.constexpr,
         K_ACT: tl.constexpr,
@@ -990,6 +994,7 @@ try:
             tslot = tl.load(Tier_slot_map_ptr + best_idx, mask=in_bounds, other=-1).to(tl.int32)
             t3_cnt += tl.where(tslot >= 2048, 1, 0)
             tl.store(Active_slots_ptr + k, tslot)
+            tl.store(Top_ids_ptr + k, best_idx.to(tl.int16))
             m_k = tl.where(
                 tslot < 0,
                 0.0,
@@ -1024,6 +1029,9 @@ try:
         Gates_ptr,
         Tier_cfg_ptr,
         Act_out_ptr,
+        U_healer_fp8_ptr,
+        H_mid_ptr,
+        Active_healer_slots_ptr,
         swiglu_limit,
         N_INTER: tl.constexpr,
         N_BLOCKS_K4: tl.constexpr,
@@ -1034,6 +1042,9 @@ try:
         HAS_TIER2: tl.constexpr = False,
         HAS_TIER3: tl.constexpr = False,
         TIER2_TERNARY: tl.constexpr = True,
+        HAS_HEALER: tl.constexpr = False,
+        EXPLICIT_HEALER_SLOT: tl.constexpr = False,
+        T3_IS_FP4_BOUNCE: tl.constexpr = False,
     ):
         pid_n = tl.program_id(0)
         e_idx = tl.program_id(1)
@@ -1118,65 +1129,104 @@ try:
             gu_mult_t2 = tl.load(Tier_cfg_ptr + 8).to(tl.float32)
             acc1 = acc1 * gu_mult_t2
             acc3 = acc3 * gu_mult_t2
+            if HAS_HEALER:
+                h_slot = (
+                    tl.load(Active_healer_slots_ptr + e_idx).to(tl.int64)
+                    if EXPLICIT_HEALER_SLOT
+                    else slot2
+                )
+                offs_r = tl.arange(0, 64)
+                h_mid = tl.load(H_mid_ptr + e_idx * 64 + offs_r).to(tl.float32)
+                u_base = U_healer_fp8_ptr + h_slot * (2 * N_INTER * 64)
+                u1_tile = tl.load(u_base + offs_n[:, None] * 64 + offs_r[None, :]).to(tl.float32)
+                u3_tile = tl.load(u_base + (offs_n[:, None] + N_INTER) * 64 + offs_r[None, :]).to(tl.float32)
+                acc1 += tl.sum(u1_tile * h_mid[None, :], axis=1)
+                acc3 += tl.sum(u3_tile * h_mid[None, :], axis=1)
         else:
-            slot1 = tslot - 2048
-            BYTES_PER_ITER1: tl.constexpr = sub_groups_k2 * 8
-            offs_b1 = tl.arange(0, BYTES_PER_ITER1)
-            offs_sg1 = offs_b1 // 8
-            offs_in8 = offs_b1 & 7
-            w_stride1 = 2 * N_INTER * (N_GROUPS_K2 * 8)
-            s_stride1 = 2 * N_INTER * N_GROUPS_K2
-            w1_base1 = W1_gu_u8_ptr + slot1 * w_stride1 + offs_n[:, None] * (N_GROUPS_K2 * 8)
-            w3_base1 = W1_gu_u8_ptr + slot1 * w_stride1 + (offs_n[:, None] + N_INTER) * (N_GROUPS_K2 * 8)
-            s1_base1 = S1_gu_fp8_ptr + slot1 * s_stride1 + offs_n[:, None] * N_GROUPS_K2
-            s3_base1 = S1_gu_fp8_ptr + slot1 * s_stride1 + (offs_n[:, None] + N_INTER) * N_GROUPS_K2
+            if T3_IS_FP4_BOUNCE:
+                slot4 = tslot - 2048
+                BYTES_PER_ITER4: tl.constexpr = sub_blocks_k4 * 16
+                offs_b4 = tl.arange(0, BYTES_PER_ITER4)
+                offs_sb4 = offs_b4 // 16
+                w_stride4 = 2 * N_INTER * (N_BLOCKS_K4 * 16)
+                s_stride4 = 2 * N_INTER * N_BLOCKS_K4
+                w1_base4 = W1_gu_u8_ptr + slot4 * w_stride4 + offs_n[:, None] * (N_BLOCKS_K4 * 16)
+                w3_base4 = W1_gu_u8_ptr + slot4 * w_stride4 + (offs_n[:, None] + N_INTER) * (N_BLOCKS_K4 * 16)
+                s1_base4 = S1_gu_fp8_ptr + slot4 * s_stride4 + offs_n[:, None] * N_BLOCKS_K4
+                s3_base4 = S1_gu_fp8_ptr + slot4 * s_stride4 + (offs_n[:, None] + N_INTER) * N_BLOCKS_K4
 
-            for sg_start in range(0, N_GROUPS_K2, sub_groups_k2):
-                b_idx = sg_start * 8 + offs_b1
-                sg_idx = sg_start + offs_sg1
-                x_base_idx = sg_idx * 64 + offs_in8
-                x0 = tl.load(X_ptr + x_base_idx + 0).to(tl.float32)
-                x1 = tl.load(X_ptr + x_base_idx + 8).to(tl.float32)
-                x2 = tl.load(X_ptr + x_base_idx + 16).to(tl.float32)
-                x3 = tl.load(X_ptr + x_base_idx + 24).to(tl.float32)
-                x4 = tl.load(X_ptr + x_base_idx + 32).to(tl.float32)
-                x5 = tl.load(X_ptr + x_base_idx + 40).to(tl.float32)
-                x6 = tl.load(X_ptr + x_base_idx + 48).to(tl.float32)
-                x7 = tl.load(X_ptr + x_base_idx + 56).to(tl.float32)
-                x_half_sum = (x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7) * 0.5
+                for sb_start in range(0, N_BLOCKS_K4, sub_blocks_k4):
+                    b_idx = sb_start * 16 + offs_b4
+                    sb_idx = sb_start + offs_sb4
+                    x_even = tl.load(X_ptr + b_idx * 2).to(tl.float32)
+                    x_odd = tl.load(X_ptr + b_idx * 2 + 1).to(tl.float32)
+                    w1_b = tl.load(w1_base4 + b_idx[None, :])
+                    s1_f = tl.load(s1_base4 + sb_idx[None, :]).to(tl.float32)
+                    v1 = (_decode_e2m1_x4(w1_b & 0x0F) * x_even[None, :] + _decode_e2m1_x4(w1_b >> 4) * x_odd[None, :]) * s1_f
+                    acc1 += tl.sum(v1, axis=1)
+                    w3_b = tl.load(w3_base4 + b_idx[None, :])
+                    s3_f = tl.load(s3_base4 + sb_idx[None, :]).to(tl.float32)
+                    v3 = (_decode_e2m1_x4(w3_b & 0x0F) * x_even[None, :] + _decode_e2m1_x4(w3_b >> 4) * x_odd[None, :]) * s3_f
+                    acc3 += tl.sum(v3, axis=1)
+            else:
+                slot1 = tslot - 2048
+                BYTES_PER_ITER1: tl.constexpr = sub_groups_k2 * 8
+                offs_b1 = tl.arange(0, BYTES_PER_ITER1)
+                offs_sg1 = offs_b1 // 8
+                offs_in8 = offs_b1 & 7
+                w_stride1 = 2 * N_INTER * (N_GROUPS_K2 * 8)
+                s_stride1 = 2 * N_INTER * N_GROUPS_K2
+                w1_base1 = W1_gu_u8_ptr + slot1 * w_stride1 + offs_n[:, None] * (N_GROUPS_K2 * 8)
+                w3_base1 = W1_gu_u8_ptr + slot1 * w_stride1 + (offs_n[:, None] + N_INTER) * (N_GROUPS_K2 * 8)
+                s1_base1 = S1_gu_fp8_ptr + slot1 * s_stride1 + offs_n[:, None] * N_GROUPS_K2
+                s3_base1 = S1_gu_fp8_ptr + slot1 * s_stride1 + (offs_n[:, None] + N_INTER) * N_GROUPS_K2
 
-                w1_b = tl.load(w1_base1 + b_idx[None, :])
-                s1_f2 = _decode_ufp8_e5m3(tl.load(s1_base1 + sg_idx[None, :])) * 2.0
-                v1 = (
-                    (w1_b & 1).to(tl.float32) * x0[None, :]
-                    + ((w1_b >> 1) & 1).to(tl.float32) * x1[None, :]
-                    + ((w1_b >> 2) & 1).to(tl.float32) * x2[None, :]
-                    + ((w1_b >> 3) & 1).to(tl.float32) * x3[None, :]
-                    + ((w1_b >> 4) & 1).to(tl.float32) * x4[None, :]
-                    + ((w1_b >> 5) & 1).to(tl.float32) * x5[None, :]
-                    + ((w1_b >> 6) & 1).to(tl.float32) * x6[None, :]
-                    + (w1_b >> 7).to(tl.float32) * x7[None, :]
-                    - x_half_sum[None, :]
-                ) * s1_f2
-                acc1 += tl.sum(v1, axis=1)
+                for sg_start in range(0, N_GROUPS_K2, sub_groups_k2):
+                    b_idx = sg_start * 8 + offs_b1
+                    sg_idx = sg_start + offs_sg1
+                    x_base_idx = sg_idx * 64 + offs_in8
+                    x0 = tl.load(X_ptr + x_base_idx + 0).to(tl.float32)
+                    x1 = tl.load(X_ptr + x_base_idx + 8).to(tl.float32)
+                    x2 = tl.load(X_ptr + x_base_idx + 16).to(tl.float32)
+                    x3 = tl.load(X_ptr + x_base_idx + 24).to(tl.float32)
+                    x4 = tl.load(X_ptr + x_base_idx + 32).to(tl.float32)
+                    x5 = tl.load(X_ptr + x_base_idx + 40).to(tl.float32)
+                    x6 = tl.load(X_ptr + x_base_idx + 48).to(tl.float32)
+                    x7 = tl.load(X_ptr + x_base_idx + 56).to(tl.float32)
+                    x_half_sum = (x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7) * 0.5
 
-                w3_b = tl.load(w3_base1 + b_idx[None, :])
-                s3_f2 = _decode_ufp8_e5m3(tl.load(s3_base1 + sg_idx[None, :])) * 2.0
-                v3 = (
-                    (w3_b & 1).to(tl.float32) * x0[None, :]
-                    + ((w3_b >> 1) & 1).to(tl.float32) * x1[None, :]
-                    + ((w3_b >> 2) & 1).to(tl.float32) * x2[None, :]
-                    + ((w3_b >> 3) & 1).to(tl.float32) * x3[None, :]
-                    + ((w3_b >> 4) & 1).to(tl.float32) * x4[None, :]
-                    + ((w3_b >> 5) & 1).to(tl.float32) * x5[None, :]
-                    + ((w3_b >> 6) & 1).to(tl.float32) * x6[None, :]
-                    + (w3_b >> 7).to(tl.float32) * x7[None, :]
-                    - x_half_sum[None, :]
-                ) * s3_f2
-                acc3 += tl.sum(v3, axis=1)
-            gu_mult_t3 = tl.load(Tier_cfg_ptr + 9).to(tl.float32)
-            acc1 = acc1 * gu_mult_t3
-            acc3 = acc3 * gu_mult_t3
+                    w1_b = tl.load(w1_base1 + b_idx[None, :])
+                    s1_f2 = _decode_ufp8_e5m3(tl.load(s1_base1 + sg_idx[None, :])) * 2.0
+                    v1 = (
+                        (w1_b & 1).to(tl.float32) * x0[None, :]
+                        + ((w1_b >> 1) & 1).to(tl.float32) * x1[None, :]
+                        + ((w1_b >> 2) & 1).to(tl.float32) * x2[None, :]
+                        + ((w1_b >> 3) & 1).to(tl.float32) * x3[None, :]
+                        + ((w1_b >> 4) & 1).to(tl.float32) * x4[None, :]
+                        + ((w1_b >> 5) & 1).to(tl.float32) * x5[None, :]
+                        + ((w1_b >> 6) & 1).to(tl.float32) * x6[None, :]
+                        + (w1_b >> 7).to(tl.float32) * x7[None, :]
+                        - x_half_sum[None, :]
+                    ) * s1_f2
+                    acc1 += tl.sum(v1, axis=1)
+
+                    w3_b = tl.load(w3_base1 + b_idx[None, :])
+                    s3_f2 = _decode_ufp8_e5m3(tl.load(s3_base1 + sg_idx[None, :])) * 2.0
+                    v3 = (
+                        (w3_b & 1).to(tl.float32) * x0[None, :]
+                        + ((w3_b >> 1) & 1).to(tl.float32) * x1[None, :]
+                        + ((w3_b >> 2) & 1).to(tl.float32) * x2[None, :]
+                        + ((w3_b >> 3) & 1).to(tl.float32) * x3[None, :]
+                        + ((w3_b >> 4) & 1).to(tl.float32) * x4[None, :]
+                        + ((w3_b >> 5) & 1).to(tl.float32) * x5[None, :]
+                        + ((w3_b >> 6) & 1).to(tl.float32) * x6[None, :]
+                        + (w3_b >> 7).to(tl.float32) * x7[None, :]
+                        - x_half_sum[None, :]
+                    ) * s3_f2
+                    acc3 += tl.sum(v3, axis=1)
+                gu_mult_t3 = tl.load(Tier_cfg_ptr + 9).to(tl.float32)
+                acc1 = acc1 * gu_mult_t3
+                acc3 = acc3 * gu_mult_t3
 
         gate_scale = tl.load(Gates_ptr + e_idx).to(tl.float32)
         g = tl.minimum(acc1, swiglu_limit)
@@ -1195,6 +1245,9 @@ try:
         S1_d_fp8_ptr,
         Active_slots_ptr,
         Y_partial_ptr,
+        U_healer_fp8_ptr,
+        H_mid_ptr,
+        Active_healer_slots_ptr,
         D_OUT: tl.constexpr,
         N_BLOCKS_K4: tl.constexpr,
         N_GROUPS_K2: tl.constexpr,
@@ -1204,6 +1257,9 @@ try:
         HAS_TIER2: tl.constexpr = False,
         HAS_TIER3: tl.constexpr = False,
         TIER2_TERNARY: tl.constexpr = True,
+        HAS_HEALER: tl.constexpr = False,
+        EXPLICIT_HEALER_SLOT: tl.constexpr = False,
+        T3_IS_FP4_BOUNCE: tl.constexpr = False,
     ):
         pid_d = tl.program_id(0)
         e_idx = tl.program_id(1)
@@ -1265,46 +1321,388 @@ try:
                     - a_sum[None, :]
                 ) * sd_f
                 acc += tl.sum(vd, axis=1)
+            if HAS_HEALER:
+                h_slot = (
+                    tl.load(Active_healer_slots_ptr + e_idx).to(tl.int64)
+                    if EXPLICIT_HEALER_SLOT
+                    else slot2
+                )
+                offs_r = tl.arange(0, 64)
+                h_d_mid = tl.load(H_mid_ptr + e_idx * 64 + offs_r).to(tl.float32)
+                ud_tile = tl.load(
+                    U_healer_fp8_ptr + h_slot * (D_OUT * 64) + offs_d[:, None] * 64 + offs_r[None, :]
+                ).to(tl.float32)
+                acc += tl.sum(ud_tile * h_d_mid[None, :], axis=1)
         else:
-            slot1 = tslot - 2048
-            BYTES_PER_ITER1: tl.constexpr = sub_groups_k2 * 8
-            offs_b1 = tl.arange(0, BYTES_PER_ITER1)
-            offs_sg1 = offs_b1 // 8
-            offs_in8 = offs_b1 & 7
-            w_stride1 = D_OUT * (N_GROUPS_K2 * 8)
-            s_stride1 = D_OUT * N_GROUPS_K2
-            wd_base1 = W1_d_u8_ptr + slot1 * w_stride1 + offs_d[:, None] * (N_GROUPS_K2 * 8)
-            sd_base1 = S1_d_fp8_ptr + slot1 * s_stride1 + offs_d[:, None] * N_GROUPS_K2
+            if T3_IS_FP4_BOUNCE:
+                slot4 = tslot - 2048
+                BYTES_PER_ITER4: tl.constexpr = sub_blocks_k4 * 16
+                offs_b4 = tl.arange(0, BYTES_PER_ITER4)
+                offs_sb4 = offs_b4 // 16
+                w_stride4 = D_OUT * (N_BLOCKS_K4 * 16)
+                s_stride4 = D_OUT * N_BLOCKS_K4
+                wd_base4 = W1_d_u8_ptr + slot4 * w_stride4 + offs_d[:, None] * (N_BLOCKS_K4 * 16)
+                sd_base4 = S1_d_fp8_ptr + slot4 * s_stride4 + offs_d[:, None] * N_BLOCKS_K4
 
-            for sg_start in range(0, N_GROUPS_K2, sub_groups_k2):
-                b_idx = sg_start * 8 + offs_b1
-                sg_idx = sg_start + offs_sg1
-                a_base_idx = sg_idx * 64 + offs_in8
-                a0 = tl.load(act_base + a_base_idx + 0).to(tl.float32)
-                a1 = tl.load(act_base + a_base_idx + 8).to(tl.float32)
-                a2 = tl.load(act_base + a_base_idx + 16).to(tl.float32)
-                a3 = tl.load(act_base + a_base_idx + 24).to(tl.float32)
-                a4 = tl.load(act_base + a_base_idx + 32).to(tl.float32)
-                a5 = tl.load(act_base + a_base_idx + 40).to(tl.float32)
-                a6 = tl.load(act_base + a_base_idx + 48).to(tl.float32)
-                a7 = tl.load(act_base + a_base_idx + 56).to(tl.float32)
-                a_half_sum = (a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7) * 0.5
-                wd_b = tl.load(wd_base1 + b_idx[None, :])
-                sd_f2 = _decode_ufp8_e5m3(tl.load(sd_base1 + sg_idx[None, :])) * 2.0
-                vd = (
-                    (wd_b & 1).to(tl.float32) * a0[None, :]
-                    + ((wd_b >> 1) & 1).to(tl.float32) * a1[None, :]
-                    + ((wd_b >> 2) & 1).to(tl.float32) * a2[None, :]
-                    + ((wd_b >> 3) & 1).to(tl.float32) * a3[None, :]
-                    + ((wd_b >> 4) & 1).to(tl.float32) * a4[None, :]
-                    + ((wd_b >> 5) & 1).to(tl.float32) * a5[None, :]
-                    + ((wd_b >> 6) & 1).to(tl.float32) * a6[None, :]
-                    + (wd_b >> 7).to(tl.float32) * a7[None, :]
-                    - a_half_sum[None, :]
-                ) * sd_f2
-                acc += tl.sum(vd, axis=1)
+                for sb_start in range(0, N_BLOCKS_K4, sub_blocks_k4):
+                    b_idx = sb_start * 16 + offs_b4
+                    sb_idx = sb_start + offs_sb4
+                    a_even = tl.load(act_base + b_idx * 2).to(tl.float32)
+                    a_odd = tl.load(act_base + b_idx * 2 + 1).to(tl.float32)
+                    wd_b = tl.load(wd_base4 + b_idx[None, :])
+                    sd_f = tl.load(sd_base4 + sb_idx[None, :]).to(tl.float32)
+                    vd = (_decode_e2m1_x4(wd_b & 0x0F) * a_even[None, :] + _decode_e2m1_x4(wd_b >> 4) * a_odd[None, :]) * sd_f
+                    acc += tl.sum(vd, axis=1)
+            else:
+                slot1 = tslot - 2048
+                BYTES_PER_ITER1: tl.constexpr = sub_groups_k2 * 8
+                offs_b1 = tl.arange(0, BYTES_PER_ITER1)
+                offs_sg1 = offs_b1 // 8
+                offs_in8 = offs_b1 & 7
+                w_stride1 = D_OUT * (N_GROUPS_K2 * 8)
+                s_stride1 = D_OUT * N_GROUPS_K2
+                wd_base1 = W1_d_u8_ptr + slot1 * w_stride1 + offs_d[:, None] * (N_GROUPS_K2 * 8)
+                sd_base1 = S1_d_fp8_ptr + slot1 * s_stride1 + offs_d[:, None] * N_GROUPS_K2
+
+                for sg_start in range(0, N_GROUPS_K2, sub_groups_k2):
+                    b_idx = sg_start * 8 + offs_b1
+                    sg_idx = sg_start + offs_sg1
+                    a_base_idx = sg_idx * 64 + offs_in8
+                    a0 = tl.load(act_base + a_base_idx + 0).to(tl.float32)
+                    a1 = tl.load(act_base + a_base_idx + 8).to(tl.float32)
+                    a2 = tl.load(act_base + a_base_idx + 16).to(tl.float32)
+                    a3 = tl.load(act_base + a_base_idx + 24).to(tl.float32)
+                    a4 = tl.load(act_base + a_base_idx + 32).to(tl.float32)
+                    a5 = tl.load(act_base + a_base_idx + 40).to(tl.float32)
+                    a6 = tl.load(act_base + a_base_idx + 48).to(tl.float32)
+                    a7 = tl.load(act_base + a_base_idx + 56).to(tl.float32)
+                    a_half_sum = (a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7) * 0.5
+                    wd_b = tl.load(wd_base1 + b_idx[None, :])
+                    sd_f2 = _decode_ufp8_e5m3(tl.load(sd_base1 + sg_idx[None, :])) * 2.0
+                    vd = (
+                        (wd_b & 1).to(tl.float32) * a0[None, :]
+                        + ((wd_b >> 1) & 1).to(tl.float32) * a1[None, :]
+                        + ((wd_b >> 2) & 1).to(tl.float32) * a2[None, :]
+                        + ((wd_b >> 3) & 1).to(tl.float32) * a3[None, :]
+                        + ((wd_b >> 4) & 1).to(tl.float32) * a4[None, :]
+                        + ((wd_b >> 5) & 1).to(tl.float32) * a5[None, :]
+                        + ((wd_b >> 6) & 1).to(tl.float32) * a6[None, :]
+                        + (wd_b >> 7).to(tl.float32) * a7[None, :]
+                        - a_half_sum[None, :]
+                    ) * sd_f2
+                    acc += tl.sum(vd, axis=1)
 
         tl.store(Y_partial_ptr + e_idx * D_OUT + offs_d, acc)
+
+    @triton.jit
+    def _triton_dsv41_t2_healer_v_kernel(
+        X_in_ptr,
+        V_fp8_ptr,
+        Active_slots_ptr,
+        Active_healer_slots_ptr,
+        H_mid_out_ptr,
+        D_IN: tl.constexpr,
+        X_STRIDE_E: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        EXPLICIT_HEALER_SLOT: tl.constexpr = False,
+    ):
+        pid_r = tl.program_id(0)
+        e_idx = tl.program_id(1)
+        tslot = tl.load(Active_slots_ptr + e_idx).to(tl.int64)
+        if tslot < 1024 or tslot >= 2048:
+            return
+        h_slot = (
+            tl.load(Active_healer_slots_ptr + e_idx).to(tl.int64)
+            if EXPLICIT_HEALER_SLOT
+            else (tslot - 1024)
+        )
+        offs_r = pid_r * 16 + tl.arange(0, 16)
+        offs_k = tl.arange(0, BLOCK_K)
+        x_base = X_in_ptr + e_idx * X_STRIDE_E
+        v_base = V_fp8_ptr + h_slot * (64 * D_IN) + offs_r[:, None] * D_IN
+        acc = tl.zeros((16,), dtype=tl.float32)
+        for k_start in range(0, D_IN, BLOCK_K):
+            k_idx = k_start + offs_k
+            x_k = tl.load(x_base + k_idx).to(tl.float32)
+            v_tile = tl.load(v_base + k_idx[None, :]).to(tl.float32)
+            acc += tl.sum(v_tile * x_k[None, :], axis=1)
+        tl.store(H_mid_out_ptr + e_idx * 64 + offs_r, acc)
+
+    @triton.jit
+    def _triton_dsv41_pair_fp4_gu_swiglu_kernel(
+        X_ptr,
+        W4_gu_u8_ptr,
+        S4_gu_bf16_ptr,
+        Pair_tok_ptr,
+        Pair_slot_ptr,
+        Pair_gate_ptr,
+        Act_out_ptr,
+        swiglu_limit,
+        N_INTER: tl.constexpr,
+        N_BLOCKS_K4: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        sub_blocks_k4: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        p_idx = tl.program_id(1)
+        tok_i = tl.load(Pair_tok_ptr + p_idx).to(tl.int64)
+        slot4 = tl.load(Pair_slot_ptr + p_idx).to(tl.int64)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        BYTES_PER_ITER4: tl.constexpr = sub_blocks_k4 * 16
+        offs_b4 = tl.arange(0, BYTES_PER_ITER4)
+        offs_sb4 = offs_b4 // 16
+        x_base = X_ptr + tok_i * (N_BLOCKS_K4 * 32)
+        w_stride4 = 2 * N_INTER * (N_BLOCKS_K4 * 16)
+        s_stride4 = 2 * N_INTER * N_BLOCKS_K4
+        w1_base4 = W4_gu_u8_ptr + slot4 * w_stride4 + offs_n[:, None] * (N_BLOCKS_K4 * 16)
+        w3_base4 = W4_gu_u8_ptr + slot4 * w_stride4 + (offs_n[:, None] + N_INTER) * (N_BLOCKS_K4 * 16)
+        s1_base4 = S4_gu_bf16_ptr + slot4 * s_stride4 + offs_n[:, None] * N_BLOCKS_K4
+        s3_base4 = S4_gu_bf16_ptr + slot4 * s_stride4 + (offs_n[:, None] + N_INTER) * N_BLOCKS_K4
+
+        acc1 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        acc3 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        for sb_start in range(0, N_BLOCKS_K4, sub_blocks_k4):
+            b_idx = sb_start * 16 + offs_b4
+            sb_idx = sb_start + offs_sb4
+            x_even = tl.load(x_base + b_idx * 2).to(tl.float32)
+            x_odd = tl.load(x_base + b_idx * 2 + 1).to(tl.float32)
+            w1_b = tl.load(w1_base4 + b_idx[None, :])
+            s1_f = tl.load(s1_base4 + sb_idx[None, :]).to(tl.float32)
+            v1 = (_decode_e2m1_x4(w1_b & 0x0F) * x_even[None, :] + _decode_e2m1_x4(w1_b >> 4) * x_odd[None, :]) * s1_f
+            acc1 += tl.sum(v1, axis=1)
+            w3_b = tl.load(w3_base4 + b_idx[None, :])
+            s3_f = tl.load(s3_base4 + sb_idx[None, :]).to(tl.float32)
+            v3 = (_decode_e2m1_x4(w3_b & 0x0F) * x_even[None, :] + _decode_e2m1_x4(w3_b >> 4) * x_odd[None, :]) * s3_f
+            acc3 += tl.sum(v3, axis=1)
+
+        gate_scale = tl.load(Pair_gate_ptr + p_idx).to(tl.float32)
+        g = tl.minimum(acc1, swiglu_limit)
+        u = tl.maximum(tl.minimum(acc3, swiglu_limit), -swiglu_limit)
+        act = (g * tl.sigmoid(g)) * u * gate_scale
+        tl.store(Act_out_ptr + p_idx.to(tl.int64) * N_INTER + offs_n, act.to(tl.bfloat16))
+
+    @triton.jit
+    def _triton_dsv41_pair_fp4_down_kernel(
+        Act_ptr,
+        W4_d_u8_ptr,
+        S4_d_bf16_ptr,
+        Pair_slot_ptr,
+        Y_out_f32_ptr,
+        D_OUT: tl.constexpr,
+        N_BLOCKS_K4: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        sub_blocks_k4: tl.constexpr,
+    ):
+        pid_d = tl.program_id(0)
+        p_idx = tl.program_id(1)
+        slot4 = tl.load(Pair_slot_ptr + p_idx).to(tl.int64)
+        offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+
+        BYTES_PER_ITER4: tl.constexpr = sub_blocks_k4 * 16
+        offs_b4 = tl.arange(0, BYTES_PER_ITER4)
+        offs_sb4 = offs_b4 // 16
+        act_base = Act_ptr + p_idx.to(tl.int64) * (N_BLOCKS_K4 * 32)
+        w_stride4 = D_OUT * (N_BLOCKS_K4 * 16)
+        s_stride4 = D_OUT * N_BLOCKS_K4
+        wd_base4 = W4_d_u8_ptr + slot4 * w_stride4 + offs_d[:, None] * (N_BLOCKS_K4 * 16)
+        sd_base4 = S4_d_bf16_ptr + slot4 * s_stride4 + offs_d[:, None] * N_BLOCKS_K4
+
+        acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        for sb_start in range(0, N_BLOCKS_K4, sub_blocks_k4):
+            b_idx = sb_start * 16 + offs_b4
+            sb_idx = sb_start + offs_sb4
+            a_even = tl.load(act_base + b_idx * 2).to(tl.float32)
+            a_odd = tl.load(act_base + b_idx * 2 + 1).to(tl.float32)
+            wd_b = tl.load(wd_base4 + b_idx[None, :])
+            sd_f = tl.load(sd_base4 + sb_idx[None, :]).to(tl.float32)
+            vd = (_decode_e2m1_x4(wd_b & 0x0F) * a_even[None, :] + _decode_e2m1_x4(wd_b >> 4) * a_odd[None, :]) * sd_f
+            acc += tl.sum(vd, axis=1)
+
+        tl.store(Y_out_f32_ptr + p_idx.to(tl.int64) * D_OUT + offs_d, acc)
+
+    @triton.jit
+    def _triton_dsv41_pair_healer_v_kernel(
+        X_ptr,
+        V_fp8_ptr,
+        Pair_tok_ptr,
+        Pair_hslot_ptr,
+        H_mid_out_ptr,
+        D_IN: tl.constexpr,
+        X_BY_PAIR: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_r = tl.program_id(0)
+        p_idx = tl.program_id(1)
+        h_slot = tl.load(Pair_hslot_ptr + p_idx).to(tl.int64)
+        offs_r = pid_r * 16 + tl.arange(0, 16)
+        offs_k = tl.arange(0, BLOCK_K)
+        x_row = p_idx.to(tl.int64) if X_BY_PAIR else tl.load(Pair_tok_ptr + p_idx).to(tl.int64)
+        x_base = X_ptr + x_row * D_IN
+        v_base = V_fp8_ptr + h_slot * (64 * D_IN) + offs_r[:, None] * D_IN
+        acc = tl.zeros((16,), dtype=tl.float32)
+        for k_start in range(0, D_IN, BLOCK_K):
+            k_idx = k_start + offs_k
+            x_k = tl.load(x_base + k_idx).to(tl.float32)
+            v_tile = tl.load(v_base + k_idx[None, :]).to(tl.float32)
+            acc += tl.sum(v_tile * x_k[None, :], axis=1)
+        tl.store(H_mid_out_ptr + p_idx.to(tl.int64) * 64 + offs_r, acc)
+
+    @triton.jit
+    def _triton_dsv41_pair_t2_gu_swiglu_kernel(
+        X_ptr,
+        W2_gu_u8_ptr,
+        S2_gu_fp8_ptr,
+        Pair_tok_ptr,
+        Pair_slot2_ptr,
+        Pair_gate_ptr,
+        Tier_cfg_ptr,
+        U_gu_fp8_ptr,
+        H_mid_ptr,
+        Pair_hslot_ptr,
+        Act_out_ptr,
+        swiglu_limit,
+        N_INTER: tl.constexpr,
+        N_GROUPS_K2: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        sub_groups_k2: tl.constexpr,
+        TIER2_TERNARY: tl.constexpr = False,
+        HAS_HEALER: tl.constexpr = True,
+    ):
+        pid_n = tl.program_id(0)
+        p_idx = tl.program_id(1)
+        tok_i = tl.load(Pair_tok_ptr + p_idx).to(tl.int64)
+        slot2 = tl.load(Pair_slot2_ptr + p_idx).to(tl.int64)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        BYTES_PER_ITER2: tl.constexpr = sub_groups_k2 * 16
+        offs_b2 = tl.arange(0, BYTES_PER_ITER2)
+        offs_sg2 = offs_b2 // 16
+        offs_in16 = offs_b2 & 15
+        x_base = X_ptr + tok_i * (N_GROUPS_K2 * 64)
+        w_stride2 = 2 * N_INTER * (N_GROUPS_K2 * 16)
+        s_stride2 = 2 * N_INTER * N_GROUPS_K2
+        w1_base2 = W2_gu_u8_ptr + slot2 * w_stride2 + offs_n[:, None] * (N_GROUPS_K2 * 16)
+        w3_base2 = W2_gu_u8_ptr + slot2 * w_stride2 + (offs_n[:, None] + N_INTER) * (N_GROUPS_K2 * 16)
+        s1_base2 = S2_gu_fp8_ptr + slot2 * s_stride2 + offs_n[:, None] * N_GROUPS_K2
+        s3_base2 = S2_gu_fp8_ptr + slot2 * s_stride2 + (offs_n[:, None] + N_INTER) * N_GROUPS_K2
+
+        acc1 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        acc3 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        for sg_start in range(0, N_GROUPS_K2, sub_groups_k2):
+            b_idx = sg_start * 16 + offs_b2
+            sg_idx = sg_start + offs_sg2
+            x_base_idx = sg_idx * 64 + offs_in16
+            x0 = tl.load(x_base + x_base_idx + 0).to(tl.float32)
+            x1 = tl.load(x_base + x_base_idx + 16).to(tl.float32)
+            x2 = tl.load(x_base + x_base_idx + 32).to(tl.float32)
+            x3 = tl.load(x_base + x_base_idx + 48).to(tl.float32)
+            x_sum = (x0 + x1 + x2 + x3) if TIER2_TERNARY else (x0 + x1 + x2 + x3) * 1.5
+
+            w1_b = tl.load(w1_base2 + b_idx[None, :])
+            s1_f = _decode_ufp8_e5m3(tl.load(s1_base2 + sg_idx[None, :]))
+            v1 = (
+                (w1_b & 3).to(tl.float32) * x0[None, :]
+                + ((w1_b >> 2) & 3).to(tl.float32) * x1[None, :]
+                + ((w1_b >> 4) & 3).to(tl.float32) * x2[None, :]
+                + (w1_b >> 6).to(tl.float32) * x3[None, :]
+                - x_sum[None, :]
+            ) * s1_f
+            acc1 += tl.sum(v1, axis=1)
+
+            w3_b = tl.load(w3_base2 + b_idx[None, :])
+            s3_f = _decode_ufp8_e5m3(tl.load(s3_base2 + sg_idx[None, :]))
+            v3 = (
+                (w3_b & 3).to(tl.float32) * x0[None, :]
+                + ((w3_b >> 2) & 3).to(tl.float32) * x1[None, :]
+                + ((w3_b >> 4) & 3).to(tl.float32) * x2[None, :]
+                + (w3_b >> 6).to(tl.float32) * x3[None, :]
+                - x_sum[None, :]
+            ) * s3_f
+            acc3 += tl.sum(v3, axis=1)
+
+        gu_mult_t2 = tl.load(Tier_cfg_ptr + 8).to(tl.float32)
+        acc1 = acc1 * gu_mult_t2
+        acc3 = acc3 * gu_mult_t2
+        if HAS_HEALER:
+            h_slot = tl.load(Pair_hslot_ptr + p_idx).to(tl.int64)
+            offs_r = tl.arange(0, 64)
+            h_mid = tl.load(H_mid_ptr + p_idx.to(tl.int64) * 64 + offs_r).to(tl.float32)
+            u_base = U_gu_fp8_ptr + h_slot * (2 * N_INTER * 64)
+            u1_tile = tl.load(u_base + offs_n[:, None] * 64 + offs_r[None, :]).to(tl.float32)
+            u3_tile = tl.load(u_base + (offs_n[:, None] + N_INTER) * 64 + offs_r[None, :]).to(tl.float32)
+            acc1 += tl.sum(u1_tile * h_mid[None, :], axis=1)
+            acc3 += tl.sum(u3_tile * h_mid[None, :], axis=1)
+
+        gate_scale = tl.load(Pair_gate_ptr + p_idx).to(tl.float32)
+        g = tl.minimum(acc1, swiglu_limit)
+        u = tl.maximum(tl.minimum(acc3, swiglu_limit), -swiglu_limit)
+        act = (g * tl.sigmoid(g)) * u * gate_scale
+        tl.store(Act_out_ptr + p_idx.to(tl.int64) * N_INTER + offs_n, act.to(tl.bfloat16))
+
+    @triton.jit
+    def _triton_dsv41_pair_t2_down_kernel(
+        Act_ptr,
+        W2_d_u8_ptr,
+        S2_d_fp8_ptr,
+        Pair_slot2_ptr,
+        U_d_fp8_ptr,
+        H_mid_ptr,
+        Pair_hslot_ptr,
+        Y_out_f32_ptr,
+        D_OUT: tl.constexpr,
+        N_GROUPS_K2: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        sub_groups_k2: tl.constexpr,
+        TIER2_TERNARY: tl.constexpr = False,
+        HAS_HEALER: tl.constexpr = True,
+    ):
+        pid_d = tl.program_id(0)
+        p_idx = tl.program_id(1)
+        slot2 = tl.load(Pair_slot2_ptr + p_idx).to(tl.int64)
+        offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+
+        BYTES_PER_ITER2: tl.constexpr = sub_groups_k2 * 16
+        offs_b2 = tl.arange(0, BYTES_PER_ITER2)
+        offs_sg2 = offs_b2 // 16
+        offs_in16 = offs_b2 & 15
+        act_base = Act_ptr + p_idx.to(tl.int64) * (N_GROUPS_K2 * 64)
+        w_stride2 = D_OUT * (N_GROUPS_K2 * 16)
+        s_stride2 = D_OUT * N_GROUPS_K2
+        wd_base2 = W2_d_u8_ptr + slot2 * w_stride2 + offs_d[:, None] * (N_GROUPS_K2 * 16)
+        sd_base2 = S2_d_fp8_ptr + slot2 * s_stride2 + offs_d[:, None] * N_GROUPS_K2
+
+        acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        for sg_start in range(0, N_GROUPS_K2, sub_groups_k2):
+            b_idx = sg_start * 16 + offs_b2
+            sg_idx = sg_start + offs_sg2
+            a_base_idx = sg_idx * 64 + offs_in16
+            a0 = tl.load(act_base + a_base_idx + 0).to(tl.float32)
+            a1 = tl.load(act_base + a_base_idx + 16).to(tl.float32)
+            a2 = tl.load(act_base + a_base_idx + 32).to(tl.float32)
+            a3 = tl.load(act_base + a_base_idx + 48).to(tl.float32)
+            a_sum = (a0 + a1 + a2 + a3) if TIER2_TERNARY else (a0 + a1 + a2 + a3) * 1.5
+            wd_b = tl.load(wd_base2 + b_idx[None, :])
+            sd_f = _decode_ufp8_e5m3(tl.load(sd_base2 + sg_idx[None, :]))
+            vd = (
+                (wd_b & 3).to(tl.float32) * a0[None, :]
+                + ((wd_b >> 2) & 3).to(tl.float32) * a1[None, :]
+                + ((wd_b >> 4) & 3).to(tl.float32) * a2[None, :]
+                + (wd_b >> 6).to(tl.float32) * a3[None, :]
+                - a_sum[None, :]
+            ) * sd_f
+            acc += tl.sum(vd, axis=1)
+
+        if HAS_HEALER:
+            h_slot = tl.load(Pair_hslot_ptr + p_idx).to(tl.int64)
+            offs_r = tl.arange(0, 64)
+            h_d_mid = tl.load(H_mid_ptr + p_idx.to(tl.int64) * 64 + offs_r).to(tl.float32)
+            ud_tile = tl.load(
+                U_d_fp8_ptr + h_slot * (D_OUT * 64) + offs_d[:, None] * 64 + offs_r[None, :]
+            ).to(tl.float32)
+            acc += tl.sum(ud_tile * h_d_mid[None, :], axis=1)
+
+        tl.store(Y_out_f32_ptr + p_idx.to(tl.int64) * D_OUT + offs_d, acc)
 
     _triton_moe_w2_grouped_gemm_m1_kernel = _triton_dsv41_tiered_gu_swiglu_kernel
     _triton_moe_w2_down_gemm_m1_kernel = _triton_dsv41_tiered_down_kernel
@@ -1379,6 +1777,219 @@ try:
             if s_val >= 2048:
                 tl.store(Active_slots_ptr + k, 2048 + b_idx)
                 b_idx += 1
+
+    @triton.jit
+    def _triton_stage_t2_dma_kernel(
+        Active_slots_ptr,
+        Active_healer_slots_ptr,
+        W2_gu_dst_ptr,
+        W2_gu_src_ptr,
+        S2_gu_dst_ptr,
+        S2_gu_src_ptr,
+        W2_d_dst_ptr,
+        W2_d_src_ptr,
+        S2_d_dst_ptr,
+        S2_d_src_ptr,
+        U_gu_dst_ptr,
+        U_gu_src_ptr,
+        V_gu_dst_ptr,
+        V_gu_src_ptr,
+        U_d_dst_ptr,
+        U_d_src_ptr,
+        V_d_dst_ptr,
+        V_d_src_ptr,
+        K_ACT: tl.constexpr,
+        BLOCK_BYTES: tl.constexpr,
+        HAS_CPU_HEALER: tl.constexpr = False,
+    ):
+        pid = tl.program_id(0)
+        num_pids = tl.num_programs(0)
+        b_idx = 0
+        for k in range(0, K_ACT):
+            s_val = tl.load(Active_slots_ptr + k)
+            if (s_val >= 1024) & (s_val < 2048):
+                s2 = (s_val - 1024).to(tl.int64)
+                dst_slot = b_idx
+                gu_bytes = 4608 * 1280
+                for off in range(pid * BLOCK_BYTES, gu_bytes, num_pids * BLOCK_BYTES):
+                    cols = (off + tl.arange(0, BLOCK_BYTES)).to(tl.int64)
+                    m = cols < gu_bytes
+                    v = tl.load(W2_gu_src_ptr + s2 * gu_bytes + cols, mask=m)
+                    tl.store(W2_gu_dst_ptr + dst_slot * gu_bytes + cols, v, mask=m)
+                dn_bytes = 5120 * 576
+                for off in range(pid * BLOCK_BYTES, dn_bytes, num_pids * BLOCK_BYTES):
+                    cols = (off + tl.arange(0, BLOCK_BYTES)).to(tl.int64)
+                    m = cols < dn_bytes
+                    v = tl.load(W2_d_src_ptr + s2 * dn_bytes + cols, mask=m)
+                    tl.store(W2_d_dst_ptr + dst_slot * dn_bytes + cols, v, mask=m)
+                sgu_bytes = 4608 * 80
+                for off in range(pid * BLOCK_BYTES, sgu_bytes, num_pids * BLOCK_BYTES):
+                    cols = (off + tl.arange(0, BLOCK_BYTES)).to(tl.int64)
+                    m = cols < sgu_bytes
+                    v = tl.load(S2_gu_src_ptr + s2 * sgu_bytes + cols, mask=m)
+                    tl.store(S2_gu_dst_ptr + dst_slot * sgu_bytes + cols, v, mask=m)
+                sdn_bytes = 5120 * 36
+                for off in range(pid * BLOCK_BYTES, sdn_bytes, num_pids * BLOCK_BYTES):
+                    cols = (off + tl.arange(0, BLOCK_BYTES)).to(tl.int64)
+                    m = cols < sdn_bytes
+                    v = tl.load(S2_d_src_ptr + s2 * sdn_bytes + cols, mask=m)
+                    tl.store(S2_d_dst_ptr + dst_slot * sdn_bytes + cols, v, mask=m)
+                if HAS_CPU_HEALER:
+                    ugu_b = 4608 * 64
+                    for off in range(pid * BLOCK_BYTES, ugu_b, num_pids * BLOCK_BYTES):
+                        cols = (off + tl.arange(0, BLOCK_BYTES)).to(tl.int64)
+                        m = cols < ugu_b
+                        v = tl.load(U_gu_src_ptr + s2 * ugu_b + cols, mask=m)
+                        tl.store(U_gu_dst_ptr + dst_slot * ugu_b + cols, v, mask=m)
+                    vgu_b = 64 * 5120
+                    for off in range(pid * BLOCK_BYTES, vgu_b, num_pids * BLOCK_BYTES):
+                        cols = (off + tl.arange(0, BLOCK_BYTES)).to(tl.int64)
+                        m = cols < vgu_b
+                        v = tl.load(V_gu_src_ptr + s2 * vgu_b + cols, mask=m)
+                        tl.store(V_gu_dst_ptr + dst_slot * vgu_b + cols, v, mask=m)
+                    ud_b = 5120 * 64
+                    for off in range(pid * BLOCK_BYTES, ud_b, num_pids * BLOCK_BYTES):
+                        cols = (off + tl.arange(0, BLOCK_BYTES)).to(tl.int64)
+                        m = cols < ud_b
+                        v = tl.load(U_d_src_ptr + s2 * ud_b + cols, mask=m)
+                        tl.store(U_d_dst_ptr + dst_slot * ud_b + cols, v, mask=m)
+                    vd_b = 64 * 2304
+                    for off in range(pid * BLOCK_BYTES, vd_b, num_pids * BLOCK_BYTES):
+                        cols = (off + tl.arange(0, BLOCK_BYTES)).to(tl.int64)
+                        m = cols < vd_b
+                        v = tl.load(V_d_src_ptr + s2 * vd_b + cols, mask=m)
+                        tl.store(V_d_dst_ptr + dst_slot * vd_b + cols, v, mask=m)
+                b_idx += 1
+
+    @triton.jit
+    def _triton_remap_t2_slots_kernel(
+        Active_slots_ptr,
+        Active_healer_slots_ptr,
+        K_ACT: tl.constexpr,
+        HAS_CPU_HEALER: tl.constexpr = False,
+    ):
+        b_idx = 0
+        for k in range(0, K_ACT):
+            s_val = tl.load(Active_slots_ptr + k)
+            if (s_val >= 1024) & (s_val < 2048):
+                s2 = s_val - 1024
+                tl.store(Active_healer_slots_ptr + k, b_idx if HAS_CPU_HEALER else s2)
+                tl.store(Active_slots_ptr + k, 1024 + b_idx)
+                b_idx += 1
+
+    @triton.jit
+    def _uva_copy_slot_bytes(
+        Dst_ptr,
+        dst_slot,
+        Src_ptr,
+        src_slot,
+        N_BYTES: tl.constexpr,
+        pid,
+        num_pids,
+        BLOCK_BYTES: tl.constexpr,
+    ):
+        for off in range(pid * BLOCK_BYTES, N_BYTES, num_pids * BLOCK_BYTES):
+            cols = (off + tl.arange(0, BLOCK_BYTES)).to(tl.int64)
+            m = cols < N_BYTES
+            v = tl.load(Src_ptr + src_slot * N_BYTES + cols, mask=m)
+            tl.store(Dst_ptr + dst_slot * N_BYTES + cols, v, mask=m)
+
+    @triton.jit
+    def _uva_copy_e8m0_to_bf16_i16(
+        Dst_i16_ptr,
+        dst_slot,
+        Src_u8_ptr,
+        src_slot,
+        N_ELEMS: tl.constexpr,
+        pid,
+        num_pids,
+        BLOCK_ELEMS: tl.constexpr,
+    ):
+        for off in range(pid * BLOCK_ELEMS, N_ELEMS, num_pids * BLOCK_ELEMS):
+            cols = (off + tl.arange(0, BLOCK_ELEMS)).to(tl.int64)
+            m = cols < N_ELEMS
+            u = tl.load(Src_u8_ptr + src_slot * N_ELEMS + cols, mask=m).to(tl.int16)
+            e = tl.minimum(tl.maximum(u - 2, 1), 254)
+            tl.store(Dst_i16_ptr + dst_slot * N_ELEMS + cols, (e << 7).to(tl.int16), mask=m)
+
+    @triton.jit
+    def _triton_stage_v8_cpu_fp4_dma_kernel(
+        Active_slots_ptr,
+        W4_b_gu_ptr,
+        W4_cpu_gu_ptr,
+        S4_b_gu_i16_ptr,
+        S4_cpu_gu_ptr,
+        W4_b_d_ptr,
+        W4_cpu_d_ptr,
+        S4_b_d_i16_ptr,
+        S4_cpu_d_ptr,
+        K_ACT: tl.constexpr,
+        BLOCK_BYTES: tl.constexpr,
+        BLOCK_SCALES: tl.constexpr,
+    ):
+        """Stage CPU-resident Tier-2 MXFP4 experts (tslot >= 2048) into shared GPU bounce slots and convert E8M0->BF16."""
+        pid = tl.program_id(0)
+        num_pids = tl.num_programs(0)
+        b_idx = 0
+        for k in range(0, K_ACT):
+            s_val = tl.load(Active_slots_ptr + k)
+            if s_val >= 2048:
+                s_cpu = (s_val - 2048).to(tl.int64)
+                dst_slot = b_idx
+                _uva_copy_slot_bytes(W4_b_gu_ptr, dst_slot, W4_cpu_gu_ptr, s_cpu, 4608 * 2560, pid, num_pids, BLOCK_BYTES)
+                _uva_copy_slot_bytes(W4_b_d_ptr, dst_slot, W4_cpu_d_ptr, s_cpu, 5120 * 1152, pid, num_pids, BLOCK_BYTES)
+                _uva_copy_e8m0_to_bf16_i16(S4_b_gu_i16_ptr, dst_slot, S4_cpu_gu_ptr, s_cpu, 4608 * 160, pid, num_pids, BLOCK_SCALES)
+                _uva_copy_e8m0_to_bf16_i16(S4_b_d_i16_ptr, dst_slot, S4_cpu_d_ptr, s_cpu, 5120 * 72, pid, num_pids, BLOCK_SCALES)
+                b_idx += 1
+
+    @triton.jit
+    def _triton_gather_v8_cpu_fp4_kernel(
+        Unique_slots_ptr,
+        n_slots,
+        W4_b_gu_ptr,
+        W4_cpu_gu_ptr,
+        S4_b_gu_i16_ptr,
+        S4_cpu_gu_ptr,
+        W4_b_d_ptr,
+        W4_cpu_d_ptr,
+        S4_b_d_i16_ptr,
+        S4_cpu_d_ptr,
+        BLOCK_BYTES: tl.constexpr,
+        BLOCK_SCALES: tl.constexpr,
+    ):
+        """Gather unique CPU Tier-2 MXFP4 experts into prefill bounce slots with fused E8M0->BF16 conversion."""
+        pid = tl.program_id(0)
+        num_pids = tl.num_programs(0)
+        for c_i in range(0, n_slots):
+            s_cpu = tl.load(Unique_slots_ptr + c_i).to(tl.int64)
+            _uva_copy_slot_bytes(W4_b_gu_ptr, c_i, W4_cpu_gu_ptr, s_cpu, 4608 * 2560, pid, num_pids, BLOCK_BYTES)
+            _uva_copy_slot_bytes(W4_b_d_ptr, c_i, W4_cpu_d_ptr, s_cpu, 5120 * 1152, pid, num_pids, BLOCK_BYTES)
+            _uva_copy_e8m0_to_bf16_i16(S4_b_gu_i16_ptr, c_i, S4_cpu_gu_ptr, s_cpu, 4608 * 160, pid, num_pids, BLOCK_SCALES)
+            _uva_copy_e8m0_to_bf16_i16(S4_b_d_i16_ptr, c_i, S4_cpu_d_ptr, s_cpu, 5120 * 72, pid, num_pids, BLOCK_SCALES)
+
+    @triton.jit
+    def _triton_gather_v8_cpu_t2_kernel(
+        Unique_slots_ptr,
+        n_slots,
+        W2_b_gu_ptr,
+        W2_cpu_gu_ptr,
+        S2_b_gu_ptr,
+        S2_cpu_gu_ptr,
+        W2_b_d_ptr,
+        W2_cpu_d_ptr,
+        S2_b_d_ptr,
+        S2_cpu_d_ptr,
+        BLOCK_BYTES: tl.constexpr,
+    ):
+        """Gather unique CPU 2-bit experts directly from pinned UVA slab into prefill bounce slots."""
+        pid = tl.program_id(0)
+        num_pids = tl.num_programs(0)
+        for c_i in range(0, n_slots):
+            s2 = tl.load(Unique_slots_ptr + c_i).to(tl.int64)
+            _uva_copy_slot_bytes(W2_b_gu_ptr, c_i, W2_cpu_gu_ptr, s2, 4608 * 1280, pid, num_pids, BLOCK_BYTES)
+            _uva_copy_slot_bytes(W2_b_d_ptr, c_i, W2_cpu_d_ptr, s2, 5120 * 576, pid, num_pids, BLOCK_BYTES)
+            _uva_copy_slot_bytes(S2_b_gu_ptr, c_i, S2_cpu_gu_ptr, s2, 4608 * 80, pid, num_pids, BLOCK_BYTES)
+            _uva_copy_slot_bytes(S2_b_d_ptr, c_i, S2_cpu_d_ptr, s2, 5120 * 36, pid, num_pids, BLOCK_BYTES)
 
     @triton.jit
     def _triton_inv_rope_m1_kernel(
@@ -1672,6 +2283,11 @@ try:
 except Exception:
     _HAS_TRITON = False
     _triton_bmm_mxfp8_m1_kernel = None
+    _triton_stage_t3_dma_kernel = None
+    _triton_stage_t2_dma_kernel = None
+    _triton_stage_v8_cpu_fp4_dma_kernel = None
+    _triton_gather_v8_cpu_fp4_kernel = None
+    _triton_gather_v8_cpu_t2_kernel = None
 
 from chronos_1t.models.chronos_moe_block import (
     NVFP4_LUT,
@@ -1970,6 +2586,7 @@ class ChronosDsv41HolographicExpertGroup(nn.Module):
         include_tail: bool = True,
         healer_slices: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         tail_slices: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        include_healer: bool = True,
     ) -> None:
         """Zero-temp-allocation in-place slot reconstruction (`v7.5`) with post-quantization refusal projection."""
         if s_gu_cached is None or s_dn_cached is None:
@@ -1977,9 +2594,10 @@ class ChronosDsv41HolographicExpertGroup(nn.Module):
         else:
             s_gu, s_dn = s_gu_cached, s_dn_cached
 
-        u_gu_r, v_gu_r, u_dn_r, v_dn_r = (
-            healer_slices if healer_slices is not None else self._fetch_healer_slices(local_m)
-        )
+        if include_healer:
+            u_gu_r, v_gu_r, u_dn_r, v_dn_r = (
+                healer_slices if healer_slices is not None else self._fetch_healer_slices(local_m)
+            )
         r_s1, _, r_inv, r_s2, c_s1, _, c_inv, c_s2 = generate_expert_1d_keys(
             4608, 5120, local_m, seed_base=101 + self.group_idx * 8, device=self.device
         )
@@ -2019,7 +2637,8 @@ class ChronosDsv41HolographicExpertGroup(nn.Module):
                 num_warps=4,
             )
             del x1_gu, x2_gu
-            slot_gu.addmm_(u_gu_r.to(torch.bfloat16), v_gu_r.to(torch.bfloat16))
+            if include_healer:
+                slot_gu.addmm_(u_gu_r.to(torch.bfloat16), v_gu_r.to(torch.bfloat16))
 
             x1_dn = torch.matmul(h, (s_dn * dr_s2.to(torch.bfloat16).unsqueeze(1)).view(40, 128, 2304)).view(5120, 2304)
             _triton_row_perm_scale_kernel[(5120, 2304 // 256)](
@@ -2041,7 +2660,8 @@ class ChronosDsv41HolographicExpertGroup(nn.Module):
                 num_warps=4,
             )
             del x1_dn, x2_dn
-            slot_dn.addmm_(u_dn_r.to(torch.bfloat16), v_dn_r.to(torch.bfloat16))
+            if include_healer:
+                slot_dn.addmm_(u_dn_r.to(torch.bfloat16), v_dn_r.to(torch.bfloat16))
         else:
             h_gu = unbind_2d_permuted_hadamard(s_gu, r_s1, r_inv, r_s2, c_s1, c_inv, c_s2, self.h128)
             if include_tail:
@@ -2055,7 +2675,8 @@ class ChronosDsv41HolographicExpertGroup(nn.Module):
                 slot_gu.add_(h_gu * self.beta_gu[local_m])
             else:
                 slot_gu.copy_(h_gu * self.beta_gu[local_m])
-            slot_gu.addmm_(u_gu_r.to(torch.bfloat16), v_gu_r.to(torch.bfloat16))
+            if include_healer:
+                slot_gu.addmm_(u_gu_r.to(torch.bfloat16), v_gu_r.to(torch.bfloat16))
 
             h_dn = unbind_2d_permuted_hadamard(s_dn, dr_s1, dr_inv, dr_s2, dc_s1, dc_inv, dc_s2, self.h128)
             if include_tail:
@@ -2066,7 +2687,8 @@ class ChronosDsv41HolographicExpertGroup(nn.Module):
                 slot_dn.add_(h_dn * self.beta_down[local_m])
             else:
                 slot_dn.copy_(h_dn * self.beta_down[local_m])
-            slot_dn.addmm_(u_dn_r.to(torch.bfloat16), v_dn_r.to(torch.bfloat16))
+            if include_healer:
+                slot_dn.addmm_(u_dn_r.to(torch.bfloat16), v_dn_r.to(torch.bfloat16))
 
         if self.r_basis is not None:
             rb = self.r_basis.to(torch.bfloat16)
@@ -2086,6 +2708,221 @@ class _ChronosDummyExperts(nn.Module):
 _SHARED_SCRATCH_GU_BF16: dict[torch.device, torch.Tensor] = {}
 _SHARED_SCRATCH_D_BF16: dict[torch.device, torch.Tensor] = {}
 _SHARED_384_KEYS: dict[torch.device, dict[str, torch.Tensor]] = {}
+_SHARED_PREFILL_T2_BUFS: dict[torch.device, dict[str, torch.Tensor]] | None = getattr(
+    builtins, "_CHRONOS_SHARED_PREFILL_T2_BUFS", None
+)
+if _SHARED_PREFILL_T2_BUFS is None:
+    _SHARED_PREFILL_T2_BUFS = {}
+    builtins._CHRONOS_SHARED_PREFILL_T2_BUFS = _SHARED_PREFILL_T2_BUFS
+
+_V8_DECODE_BOUNCE_BUFS: dict[torch.device, dict[str, torch.Tensor]] | None = getattr(
+    builtins, "_CHRONOS_V8_DECODE_BOUNCE_BUFS", None
+)
+if _V8_DECODE_BOUNCE_BUFS is None:
+    _V8_DECODE_BOUNCE_BUFS = {}
+    builtins._CHRONOS_V8_DECODE_BOUNCE_BUFS = _V8_DECODE_BOUNCE_BUFS
+
+_V8_PREFILL_FP4_BUFS: dict[torch.device, dict[str, torch.Tensor]] | None = getattr(
+    builtins, "_CHRONOS_V8_PREFILL_FP4_BUFS", None
+)
+if _V8_PREFILL_FP4_BUFS is None:
+    _V8_PREFILL_FP4_BUFS = {}
+    builtins._CHRONOS_V8_PREFILL_FP4_BUFS = _V8_PREFILL_FP4_BUFS
+
+_V8_T3_QUANT_SCRATCH: dict[torch.device, dict[str, torch.Tensor]] = {}
+_CUDART_LIB: Any = None
+
+
+def _get_cudart() -> Any | None:
+    global _CUDART_LIB
+    if _CUDART_LIB is None:
+        try:
+            lib = ctypes.CDLL("libcudart.so")
+            lib.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+            lib.cudaHostRegister.restype = ctypes.c_int
+            lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
+            lib.cudaHostUnregister.restype = ctypes.c_int
+            _CUDART_LIB = lib
+        except Exception:
+            _CUDART_LIB = False
+    return _CUDART_LIB if _CUDART_LIB is not False else None
+
+
+def _unregister_host_ptr(ptr: int, _storage_ref: Any) -> None:
+    lib = _get_cudart()
+    if lib is not None and ptr:
+        try:
+            lib.cudaHostUnregister(ctypes.c_void_p(ptr))
+        except Exception:
+            pass
+
+
+class _PinnedHostSlab:
+    """Zero-waste page-locked CPU slab backed by a single `cudaHostRegister` allocation."""
+
+    def __init__(self, specs: list[tuple[str, tuple[int, ...], torch.dtype]], align: int = 4096) -> None:
+        self.slices: dict[str, torch.Tensor] = {}
+        layout: list[tuple[str, tuple[int, ...], torch.dtype, int, int]] = []
+        cursor = 0
+        for name, shape, dtype in specs:
+            n_elem = 1
+            for dim in shape:
+                n_elem *= int(dim)
+            elem_sz = torch.empty((), dtype=dtype).element_size()
+            nbytes = n_elem * elem_sz
+            layout.append((name, tuple(int(d) for d in shape), dtype, cursor, nbytes))
+            cursor = ((cursor + nbytes + align - 1) // align) * align
+        self.total_bytes = cursor
+        self.buffer = torch.empty((max(1, self.total_bytes),), dtype=torch.uint8, device="cpu")
+        self.ptr = int(self.buffer.data_ptr())
+        self.is_pinned = False
+        self._finalizer: weakref.finalize | None = None
+        lib = _get_cudart()
+        if lib is not None and self.total_bytes > 0:
+            rc = int(
+                lib.cudaHostRegister(
+                    ctypes.c_void_p(self.ptr), ctypes.c_size_t(self.total_bytes), ctypes.c_uint(0)
+                )
+            )
+            if rc == 0:
+                self.is_pinned = True
+                self._finalizer = weakref.finalize(
+                    self, _unregister_host_ptr, self.ptr, self.buffer.untyped_storage()
+                )
+            else:
+                print(
+                    f"[Chronos-v8 WARNING] cudaHostRegister failed rc={rc} for "
+                    f"{self.total_bytes / (1024.0**3):.3f} GiB slab; using unpinned host RAM.",
+                    flush=True,
+                )
+        for name, shape, dtype, off, nb in layout:
+            self.slices[name] = self.buffer[off : off + nb].view(dtype).reshape(shape)
+
+    def unregister(self) -> None:
+        if self._finalizer is not None and self._finalizer.alive:
+            self._finalizer()
+        self.is_pinned = False
+        self.slices.clear()
+        self.buffer = None
+
+
+def _e8m0_scale_to_bf16(scale_u8: torch.Tensor) -> torch.Tensor:
+    """Convert OCP F8_E8M0 byte scale (`2^(u - 127)`) to BF16 (`2^(u - 129)`) compensating `_decode_e2m1_x4` 4x factor."""
+    return ((scale_u8.view(torch.uint8).to(torch.int16) - 2).clamp(1, 254) << 7).view(torch.bfloat16)
+
+
+def _get_v8_decode_bounce_bufs(device: torch.device, top_k: int = 6) -> dict[str, torch.Tensor]:
+    """Return process-wide shared 6-slot GPU decode bounce buffers (0.164 GiB total across all 40 layers)."""
+    cached = _V8_DECODE_BOUNCE_BUFS.get(device)
+    if cached is not None and not cached["w4_gu_u8"].is_inference():
+        return cached
+    with torch.inference_mode(False):
+        bufs: dict[str, torch.Tensor] = {
+            "w4_gu_u8": torch.empty((top_k, 4608, 2560), dtype=torch.uint8, device=device),
+            "s4_gu_bf16": torch.empty((top_k, 4608, 160), dtype=torch.bfloat16, device=device),
+            "w4_d_u8": torch.empty((top_k, 5120, 1152), dtype=torch.uint8, device=device),
+            "s4_d_bf16": torch.empty((top_k, 5120, 72), dtype=torch.bfloat16, device=device),
+            "w2_gu_u8": torch.empty((top_k, 4608, 1280), dtype=torch.uint8, device=device),
+            "s2_gu_fp8": torch.empty((top_k, 4608, 80), dtype=torch.uint8, device=device),
+            "w2_d_u8": torch.empty((top_k, 5120, 576), dtype=torch.uint8, device=device),
+            "s2_d_fp8": torch.empty((top_k, 5120, 36), dtype=torch.uint8, device=device),
+        }
+        _V8_DECODE_BOUNCE_BUFS[device] = bufs
+    return bufs
+
+
+def _get_v8_prefill_fp4_bufs(device: torch.device, max_slots: int = 32) -> dict[str, torch.Tensor]:
+    """Return process-wide shared 32-slot GPU prefill bounce buffers (0.593 GiB) for Tier-2 CPU MXFP4."""
+    cached = _V8_PREFILL_FP4_BUFS.get(device)
+    if cached is not None and not cached["w4_gu_u8"].is_inference():
+        return cached
+    with torch.inference_mode(False):
+        bufs: dict[str, torch.Tensor] = {
+            "w4_gu_u8": torch.empty((max_slots, 4608, 2560), dtype=torch.uint8, device=device),
+            "s4_gu_bf16": torch.empty((max_slots, 4608, 160), dtype=torch.bfloat16, device=device),
+            "w4_d_u8": torch.empty((max_slots, 5120, 1152), dtype=torch.uint8, device=device),
+            "s4_d_bf16": torch.empty((max_slots, 5120, 72), dtype=torch.bfloat16, device=device),
+        }
+        _V8_PREFILL_FP4_BUFS[device] = bufs
+    return bufs
+
+
+def _get_v8_t3_quant_scratch(device: torch.device) -> dict[str, torch.Tensor]:
+    """Return temporary reusable GPU buffers (~19 MB) for quantizing Tier-3 2-bit experts during shard load."""
+    cached = _V8_T3_QUANT_SCRATCH.get(device)
+    if cached is not None:
+        return cached
+    bufs = {
+        "w1_w": torch.empty((2304, 2560), dtype=torch.uint8, device=device),
+        "w1_s": torch.empty((2304, 160), dtype=torch.uint8, device=device),
+        "w3_w": torch.empty((2304, 2560), dtype=torch.uint8, device=device),
+        "w3_s": torch.empty((2304, 160), dtype=torch.uint8, device=device),
+        "w2_w": torch.empty((5120, 1152), dtype=torch.uint8, device=device),
+        "w2_s": torch.empty((5120, 72), dtype=torch.uint8, device=device),
+    }
+    _V8_T3_QUANT_SCRATCH[device] = bufs
+    return bufs
+
+
+def get_routing_step_buffer(device: torch.device) -> torch.Tensor:
+    """Return process-wide static (40, 6) int16 buffer storing each layer's latest routed expert IDs."""
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+    buf = getattr(builtins, "_CHRONOS_ROUTING_STEP_BUF", None)
+    if buf is None or buf.device != dev or buf.is_inference():
+        with torch.inference_mode(False):
+            buf = torch.zeros((40, 6), dtype=torch.int16, device=dev)
+            builtins._CHRONOS_ROUTING_STEP_BUF = buf
+    return buf
+
+
+def _get_prefill_t2_bufs(device: torch.device, max_slots: int = 32, max_pairs: int = 1024) -> dict[str, torch.Tensor]:
+    """Lazily allocate shared 32-slot GPU + pinned CPU staging bounce buffers (~0.31 GiB) for batch-coalesced prefill."""
+    cached = _SHARED_PREFILL_T2_BUFS.get(device)
+    if cached is not None:
+        return cached
+    bufs: dict[str, torch.Tensor] = {
+        "w2_gu_u8": torch.empty((max_slots, 4608, 1280), dtype=torch.uint8, device=device),
+        "s2_gu_fp8": torch.empty((max_slots, 4608, 80), dtype=torch.uint8, device=device),
+        "w2_d_u8": torch.empty((max_slots, 5120, 576), dtype=torch.uint8, device=device),
+        "s2_d_fp8": torch.empty((max_slots, 5120, 36), dtype=torch.uint8, device=device),
+        "healer_u_gu": torch.empty((max_slots, 4608, 64), dtype=torch.float8_e4m3fn, device=device),
+        "healer_v_gu": torch.empty((max_slots, 64, 5120), dtype=torch.float8_e4m3fn, device=device),
+        "healer_u_d": torch.empty((max_slots, 5120, 64), dtype=torch.float8_e4m3fn, device=device),
+        "healer_v_d": torch.empty((max_slots, 64, 2304), dtype=torch.float8_e4m3fn, device=device),
+        "act_inter": torch.empty((max_pairs, 2304), dtype=torch.bfloat16, device=device),
+        "y_pair_f32": torch.empty((max_pairs, 5120), dtype=torch.float32, device=device),
+        "h_mid": torch.empty((max_pairs, 64), dtype=torch.float32, device=device),
+    }
+    try:
+        bufs.update(
+            {
+                "cpu_w2_gu": torch.empty((max_slots, 4608, 1280), dtype=torch.uint8, device="cpu", pin_memory=True),
+                "cpu_s2_gu": torch.empty((max_slots, 4608, 80), dtype=torch.uint8, device="cpu", pin_memory=True),
+                "cpu_w2_d": torch.empty((max_slots, 5120, 576), dtype=torch.uint8, device="cpu", pin_memory=True),
+                "cpu_s2_d": torch.empty((max_slots, 5120, 36), dtype=torch.uint8, device="cpu", pin_memory=True),
+                "cpu_h_u_gu": torch.empty((max_slots, 4608, 64), dtype=torch.float8_e4m3fn, device="cpu", pin_memory=True),
+                "cpu_h_v_gu": torch.empty((max_slots, 64, 5120), dtype=torch.float8_e4m3fn, device="cpu", pin_memory=True),
+                "cpu_h_u_d": torch.empty((max_slots, 5120, 64), dtype=torch.float8_e4m3fn, device="cpu", pin_memory=True),
+                "cpu_h_v_d": torch.empty((max_slots, 64, 2304), dtype=torch.float8_e4m3fn, device="cpu", pin_memory=True),
+            }
+        )
+    except Exception:
+        bufs.update(
+            {
+                "cpu_w2_gu": torch.empty((max_slots, 4608, 1280), dtype=torch.uint8, device="cpu"),
+                "cpu_s2_gu": torch.empty((max_slots, 4608, 80), dtype=torch.uint8, device="cpu"),
+                "cpu_w2_d": torch.empty((max_slots, 5120, 576), dtype=torch.uint8, device="cpu"),
+                "cpu_s2_d": torch.empty((max_slots, 5120, 36), dtype=torch.uint8, device="cpu"),
+                "cpu_h_u_gu": torch.empty((max_slots, 4608, 64), dtype=torch.float8_e4m3fn, device="cpu"),
+                "cpu_h_v_gu": torch.empty((max_slots, 64, 5120), dtype=torch.float8_e4m3fn, device="cpu"),
+                "cpu_h_u_d": torch.empty((max_slots, 5120, 64), dtype=torch.float8_e4m3fn, device="cpu"),
+                "cpu_h_v_d": torch.empty((max_slots, 64, 2304), dtype=torch.float8_e4m3fn, device="cpu"),
+            }
+        )
+    _SHARED_PREFILL_T2_BUFS[device] = bufs
+    return bufs
 
 
 def _get_shared_384_keys(device: torch.device) -> dict[str, torch.Tensor]:
@@ -2372,11 +3209,21 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         default_dec_k = str(self.top_k)
         self.decode_top_k = max(1, min(self.top_k, int(os.environ.get("CHRONOS_DECODE_TOP_K", default_dec_k))))
         self.n4_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "96"))
-        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "0"))
-        default_n1 = 0 if (self.n4_slots == 96 and self.n2_slots == 0) else min(216, max(0, 384 - self.n4_slots - self.n2_slots))
+        self.n2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "288"))
+        default_n1 = 0 if (self.n4_slots + self.n2_slots >= 384) else min(216, max(0, 384 - self.n4_slots - self.n2_slots))
         self.n1_slots = int(os.environ.get("CHRONOS_TIER3_1BIT_SLOTS", str(default_n1)))
-        default_ternary = "1" if self.n4_slots >= 48 else "0"
-        self.tier2_ternary = os.environ.get("CHRONOS_TIER2_TERNARY", default_ternary).strip() not in ("0", "false", "False")
+        self.tier2_ternary = os.environ.get("CHRONOS_TIER2_TERNARY", "0").strip() not in ("0", "false", "False")
+        self.v8_cpu_fp4_mode = False
+        self.n4_cpu_slots = 0
+        self._host_slab: _PinnedHostSlab | None = None
+        self.w4_cpu_gu_u8: torch.Tensor | None = None
+        self.s4_cpu_gu_u8: torch.Tensor | None = None
+        self.w4_cpu_d_u8: torch.Tensor | None = None
+        self.s4_cpu_d_u8: torch.Tensor | None = None
+        self.w4_bounce_gu_u8: torch.Tensor | None = None
+        self.s4_bounce_gu_bf16: torch.Tensor | None = None
+        self.w4_bounce_d_u8: torch.Tensor | None = None
+        self.s4_bounce_d_bf16: torch.Tensor | None = None
 
         if self.use_fp4_slot_cache:
             self._keys_384 = None
@@ -2412,16 +3259,70 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self.cache_d_u8 = self.w4_d_u8
             self.cache_d_s_bf16 = self.s4_d_bf16
 
-            if self.n2_slots > 0:
-                self.w2_gu_u8 = torch.empty((self.n2_slots, 4608, 1280), dtype=torch.uint8, device=device)
-                self.s2_gu_fp8 = torch.empty((self.n2_slots, 4608, 80), dtype=torch.uint8, device=device)
-                self.w2_d_u8 = torch.empty((self.n2_slots, 5120, 576), dtype=torch.uint8, device=device)
-                self.s2_d_fp8 = torch.empty((self.n2_slots, 4608, 36), dtype=torch.uint8, device=device) if False else torch.empty((self.n2_slots, 5120, 36), dtype=torch.uint8, device=device)
+            t2_cpu_from = int(os.environ.get("CHRONOS_T2_CPU_FROM_LAYER", "0"))
+            t2_cpu_to = int(os.environ.get("CHRONOS_T2_CPU_TO_LAYER", "40"))
+            self.t2_on_cpu = bool(self.n2_slots > 0 and (t2_cpu_from <= layer_idx < t2_cpu_to))
+            if self.t2_on_cpu:
+                self.w2_gu_cpu = torch.empty((self.n2_slots, 4608, 1280), dtype=torch.uint8, device="cpu")
+                self.s2_gu_cpu = torch.empty((self.n2_slots, 4608, 80), dtype=torch.uint8, device="cpu")
+                self.w2_d_cpu = torch.empty((self.n2_slots, 5120, 576), dtype=torch.uint8, device="cpu")
+                self.s2_d_cpu = torch.empty((self.n2_slots, 5120, 36), dtype=torch.uint8, device="cpu")
+                n2_gpu_alloc = max(1, self.top_k)
+            else:
+                self.w2_gu_cpu = None
+                self.s2_gu_cpu = None
+                self.w2_d_cpu = None
+                self.s2_d_cpu = None
+                n2_gpu_alloc = self.n2_slots
+
+            if n2_gpu_alloc > 0:
+                self.w2_gu_u8 = torch.empty((n2_gpu_alloc, 4608, 1280), dtype=torch.uint8, device=device)
+                self.s2_gu_fp8 = torch.empty((n2_gpu_alloc, 4608, 80), dtype=torch.uint8, device=device)
+                self.w2_d_u8 = torch.empty((n2_gpu_alloc, 5120, 576), dtype=torch.uint8, device=device)
+                self.s2_d_fp8 = torch.empty((n2_gpu_alloc, 5120, 36), dtype=torch.uint8, device=device)
             else:
                 self.w2_gu_u8 = self.w4_gu_u8
                 self.s2_gu_fp8 = self.w4_gu_u8
                 self.w2_d_u8 = self.w4_d_u8
                 self.s2_d_fp8 = self.w4_d_u8
+
+            self.keep_cold_healer = bool(
+                self.n2_slots > 0 and os.environ.get("CHRONOS_KEEP_COLD_SVD_HEALER", "1") != "0"
+            )
+            healer_cpu_from = int(os.environ.get("CHRONOS_HEALER_CPU_FROM_LAYER", "6"))
+            self.healer_on_cpu = bool(self.keep_cold_healer and (layer_idx >= healer_cpu_from))
+            if self.keep_cold_healer and not self.healer_on_cpu and device.type == "cuda":
+                try:
+                    free_b, _ = torch.cuda.mem_get_info(device)
+                    cached_b = max(0, torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device))
+                    need_b = (40 - layer_idx) * int(1.90 * (1024**3)) + int(3.5 * (1024**3))
+                    if (free_b + cached_b) < need_b:
+                        self.healer_on_cpu = True
+                except Exception:
+                    pass
+
+            if self.keep_cold_healer:
+                if self.healer_on_cpu:
+                    self.healer_u_gu_cpu = torch.empty((self.n2_slots, 4608, 64), dtype=torch.float8_e4m3fn, device="cpu")
+                    self.healer_v_gu_cpu = torch.empty((self.n2_slots, 64, 5120), dtype=torch.float8_e4m3fn, device="cpu")
+                    self.healer_u_d_cpu = torch.empty((self.n2_slots, 5120, 64), dtype=torch.float8_e4m3fn, device="cpu")
+                    self.healer_v_d_cpu = torch.empty((self.n2_slots, 64, 2304), dtype=torch.float8_e4m3fn, device="cpu")
+                    h_gpu_alloc = max(1, self.top_k)
+                else:
+                    self.healer_u_gu_cpu = None
+                    self.healer_v_gu_cpu = None
+                    self.healer_u_d_cpu = None
+                    self.healer_v_d_cpu = None
+                    h_gpu_alloc = self.n2_slots
+                self.healer_u_gu = torch.empty((h_gpu_alloc, 4608, 64), dtype=torch.float8_e4m3fn, device=device)
+                self.healer_v_gu = torch.empty((h_gpu_alloc, 64, 5120), dtype=torch.float8_e4m3fn, device=device)
+                self.healer_u_d = torch.empty((h_gpu_alloc, 5120, 64), dtype=torch.float8_e4m3fn, device=device)
+                self.healer_v_d = torch.empty((h_gpu_alloc, 64, 2304), dtype=torch.float8_e4m3fn, device=device)
+            else:
+                self.healer_u_gu_cpu = None
+                self.healer_v_gu_cpu = None
+                self.healer_u_d_cpu = None
+                self.healer_v_d_cpu = None
 
             t3_cpu_from = int(os.environ.get("CHRONOS_T3_CPU_FROM_LAYER", "40"))
             t3_cpu_to = int(os.environ.get("CHRONOS_T3_CPU_TO_LAYER", "40"))
@@ -2492,6 +3393,17 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self.healer_v_gu = None
             self.healer_u_d = None
             self.healer_v_d = None
+            self.healer_u_gu_cpu = None
+            self.healer_v_gu_cpu = None
+            self.healer_u_d_cpu = None
+            self.healer_v_d_cpu = None
+            self.keep_cold_healer = False
+            self.healer_on_cpu = False
+            self.t2_on_cpu = False
+            self.w2_gu_cpu = None
+            self.s2_gu_cpu = None
+            self.w2_d_cpu = None
+            self.s2_d_cpu = None
             self.cold_scale_gu_f32 = None
             self.cold_scale_d_f32 = None
             self.w4_gu_u8 = None
@@ -2568,31 +3480,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             self.slot_gu = [self.cache_gu_buf[s] for s in range(self.hot_cache_size)]
             self.slot_d = [self.cache_d_buf[s] for s in range(self.hot_cache_size)]
 
-        self.expert_to_slot: list[int] = [-1] * 384
-        self.expert_to_slot_gpu = torch.full((384,), -1, dtype=torch.int32, device=device)
-        self.slot_to_expert: list[int] = [-1] * (self.n4_slots if self.use_fp4_slot_cache else self.hot_cache_size)
-        self.ring_cursor = 0
-        self.cache_hits = 0
-        self.cache_misses = 0
-
-        self._top_ids_buf = torch.zeros((self.top_k,), dtype=torch.int32, device=device)
-        self._active_slots_buf = torch.empty((self.top_k + 1,), dtype=torch.int32, device=device)
-        self._active_slots_buf[self.top_k] = self.shared_slot
-        self._active_gates_buf = torch.ones((self.top_k + 1,), dtype=torch.float32, device=device)
-        # [0]=m_t1, [1]=m_t2, [2]=m_t3, [3]=t2_bias, [4]=t3_bias, [5]=max_t3,
-        # [6]=norm_blend, [7]=allow_unmapped, [8]=gu_mult_t2, [9]=gu_mult_t3, [10]=m_shared, [11]=renorm_mult
-        default_tier_cfg = [1.0, 0.85, 0.45, 0.0, -0.02, 3.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
-        env_tier_cfg = os.environ.get("CHRONOS_DSV41_TIER_CFG", "").strip()
-        if env_tier_cfg:
-            parts = [float(v) for v in env_tier_cfg.split(",") if v.strip()]
-            for i_c, v_c in enumerate(parts[:16]):
-                default_tier_cfg[i_c] = v_c
-        self._tier_cfg_gpu = torch.tensor(default_tier_cfg, dtype=torch.float32, device=device)
-        _LIVE_MOE_BLOCKS[layer_idx] = self
-        self._act_inter_buf = torch.empty((self.top_k + 1, 2304), dtype=torch.bfloat16, device=device)
-        self._y_partial_buf = torch.empty((self.top_k + 1, 5120), dtype=torch.float32, device=device)
-        if self.use_fp4_slot_cache:
-            self._y_final_buf = torch.empty((1, 5120), dtype=torch.bfloat16, device=device)
+        self._init_decode_work_bufs(layer_idx, device)
 
         self.pinned_slots = 0
         with torch.no_grad():
@@ -2857,6 +3745,7 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                             include_tail=True,
                             healer_slices=(u_gu_g[m_loc], v_gu_g[m_loc], u_dn_g[m_loc], v_dn_g[m_loc]),
                             tail_slices=(gu_p_g[m_loc], gu_s_g[m_loc], dn_p_g[m_loc], dn_s_g[m_loc]),
+                            include_healer=(tier_id != 2 or not self.keep_cold_healer),
                         )
                         if tier_id == 1:
                             _triton_quantize_mse_fp4_32_kernel[(4608, 160)](
@@ -2866,17 +3755,45 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                                 scr_d, self.w4_d_u8[slot_i], self.s4_d_bf16[slot_i], N_BLOCKS_C=72, num_warps=1
                             )
                         elif tier_id == 2:
+                            if self.keep_cold_healer:
+                                u_gu_fp8 = u_gu_g[m_loc].to(torch.float8_e4m3fn)
+                                v_gu_fp8 = v_gu_g[m_loc].to(torch.float8_e4m3fn)
+                                u_dn_fp8 = u_dn_g[m_loc].to(torch.float8_e4m3fn)
+                                v_dn_fp8 = v_dn_g[m_loc].to(torch.float8_e4m3fn)
+                                if self.healer_on_cpu and self.healer_u_gu_cpu is not None:
+                                    self.healer_u_gu_cpu[slot_i].copy_(u_gu_fp8, non_blocking=False)
+                                    self.healer_v_gu_cpu[slot_i].copy_(v_gu_fp8, non_blocking=False)
+                                    self.healer_u_d_cpu[slot_i].copy_(u_dn_fp8, non_blocking=False)
+                                    self.healer_v_d_cpu[slot_i].copy_(v_dn_fp8, non_blocking=False)
+                                else:
+                                    assert self.healer_u_gu is not None
+                                    self.healer_u_gu[slot_i].copy_(u_gu_fp8)
+                                    self.healer_v_gu[slot_i].copy_(v_gu_fp8)
+                                    self.healer_u_d[slot_i].copy_(u_dn_fp8)
+                                    self.healer_v_d[slot_i].copy_(v_dn_fp8)
                             q2_kern = (
                                 _triton_quantize_ternary_2bit_g64_kernel
                                 if self.tier2_ternary
                                 else _triton_quantize_2bit_g64_kernel
                             )
-                            q2_kern[(4608, 80)](
-                                scr_gu, self.w2_gu_u8[slot_i], self.s2_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
-                            )
-                            q2_kern[(5120, 36)](
-                                scr_d, self.w2_d_u8[slot_i], self.s2_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
-                            )
+                            if self.t2_on_cpu and self.w2_gu_cpu is not None:
+                                q2_kern[(4608, 80)](
+                                    scr_gu, self.w2_gu_u8[0], self.s2_gu_fp8[0], N_GROUPS_C=80, num_warps=1
+                                )
+                                q2_kern[(5120, 36)](
+                                    scr_d, self.w2_d_u8[0], self.s2_d_fp8[0], N_GROUPS_C=36, num_warps=1
+                                )
+                                self.w2_gu_cpu[slot_i].copy_(self.w2_gu_u8[0], non_blocking=False)
+                                self.s2_gu_cpu[slot_i].copy_(self.s2_gu_fp8[0], non_blocking=False)
+                                self.w2_d_cpu[slot_i].copy_(self.w2_d_u8[0], non_blocking=False)
+                                self.s2_d_cpu[slot_i].copy_(self.s2_d_fp8[0], non_blocking=False)
+                            else:
+                                q2_kern[(4608, 80)](
+                                    scr_gu, self.w2_gu_u8[slot_i], self.s2_gu_fp8[slot_i], N_GROUPS_C=80, num_warps=1
+                                )
+                                q2_kern[(5120, 36)](
+                                    scr_d, self.w2_d_u8[slot_i], self.s2_d_fp8[slot_i], N_GROUPS_C=36, num_warps=1
+                                )
                         elif self.t3_on_cpu:
                             _triton_quantize_1bit_g64_kernel[(4608, 80)](
                                 scr_gu, self.w1_gu_u8[0], self.s1_gu_fp8[0], N_GROUPS_C=80, num_warps=1
@@ -2983,6 +3900,357 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
             num_warps=1,
         )
         del sh_d
+
+    def _init_decode_work_bufs(self, layer_idx: int, device: torch.device) -> None:
+        self.expert_to_slot = [-1] * 384
+        self.expert_to_slot_gpu = torch.full((384,), -1, dtype=torch.int32, device=device)
+        self.slot_to_expert = [-1] * (self.n4_slots if self.use_fp4_slot_cache else self.hot_cache_size)
+        self.ring_cursor = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+        self._top_ids_buf = torch.zeros((self.top_k,), dtype=torch.int32, device=device)
+        self._active_slots_buf = torch.empty((self.top_k + 1,), dtype=torch.int32, device=device)
+        self._active_slots_buf[self.top_k] = self.shared_slot
+        self._active_gates_buf = torch.ones((self.top_k + 1,), dtype=torch.float32, device=device)
+        # [0]=m_t1, [1]=m_t2, [2]=m_t3, [3]=t2_bias, [4]=t3_bias, [5]=max_t3,
+        # [6]=norm_blend, [7]=allow_unmapped, [8]=gu_mult_t2, [9]=gu_mult_t3, [10]=m_shared, [11]=renorm_mult
+        default_tier_cfg = [1.0, 1.0, 1.0, 0.0, 0.0, 6.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+        env_tier_cfg = os.environ.get("CHRONOS_DSV41_TIER_CFG", "").strip()
+        if env_tier_cfg:
+            parts = [float(v) for v in env_tier_cfg.split(",") if v.strip()]
+            for i_c, v_c in enumerate(parts[:16]):
+                default_tier_cfg[i_c] = v_c
+        self._tier_cfg_gpu = torch.tensor(default_tier_cfg, dtype=torch.float32, device=device)
+        _LIVE_MOE_BLOCKS[layer_idx] = self
+        self._act_inter_buf = torch.empty((self.top_k + 1, 2304), dtype=torch.bfloat16, device=device)
+        self._y_partial_buf = torch.empty((self.top_k + 1, 5120), dtype=torch.float32, device=device)
+        self._active_healer_slots_buf = torch.zeros((self.top_k + 1,), dtype=torch.int32, device=device)
+        self._h_gu_mid_buf = torch.empty((self.top_k + 1, 64), dtype=torch.float32, device=device)
+        self._h_d_mid_buf = torch.empty((self.top_k + 1, 64), dtype=torch.float32, device=device)
+        if self.use_fp4_slot_cache:
+            self._y_final_buf = torch.empty((1, 5120), dtype=torch.bfloat16, device=device)
+
+    def close(self) -> None:
+        """Release page-locked host slab registration and open file handles cleanly."""
+        if _LIVE_MOE_BLOCKS.get(self.layer_idx) is self:
+            _LIVE_MOE_BLOCKS.pop(self.layer_idx, None)
+        slab = getattr(self, "_host_slab", None)
+        if slab is not None:
+            slab.unregister()
+            self._host_slab = None
+        self.w4_cpu_gu_u8 = self.s4_cpu_gu_u8 = self.w4_cpu_d_u8 = self.s4_cpu_d_u8 = None
+        self.w2_gu_cpu = self.s2_gu_cpu = self.w2_d_cpu = self.s2_d_cpu = None
+        self.w4_gu_u8 = self.s4_gu_bf16 = self.w4_d_u8 = self.s4_d_bf16 = None
+        self.cache_gu_u8 = self.cache_gu_s_bf16 = self.cache_d_u8 = self.cache_d_s_bf16 = None
+        self.w1_gu_u8 = self.s1_gu_fp8 = self.w1_d_u8 = self.s1_d_fp8 = None
+        self._mmap_handle = None
+        self._hot_handle = None
+
+    @classmethod
+    @torch.no_grad()
+    def from_v8_stock_shard(
+        cls,
+        layer_idx: int,
+        stock_shard_path: str | Path,
+        ranked_expert_ids: list[int] | torch.Tensor,
+        n_t1: int = 96,
+        n_t2_fp4: int = 128,
+        n_t3_2bit: int = 160,
+        device: torch.device | str = "cuda",
+        top_k: int = 6,
+        routed_scaling_factor: float = 1.5,
+        swiglu_limit: float = 10.0,
+        sf_handle: Any = None,
+    ) -> "ChronosDsv41SparseMoeBlock":
+        """Build a Chronos v8 calibrated 3-tier MoE block directly from an unmodified DeepSeek-V4.1 stock shard.
+
+        Tiers (out-of-sample calibrated):
+          - Tier 1 (`n_t1` on GPU VRAM, `tslot 0..n_t1-1`): native stock 4-bit MXFP4.
+          - Tier 2 (`n_t2_fp4` in pinned host slab, `tslot >= 2048`): native stock 4-bit MXFP4 staged via shared bounce buffer.
+          - Tier 3 (`n_t3_2bit` in pinned host slab, `tslot 1024..`): direct 2-bit Lloyd-Max g64 (no holographic error/healer).
+        """
+        if isinstance(device, str):
+            device = torch.device(device)
+        ranked = [
+            int(e)
+            for e in (ranked_expert_ids.tolist() if isinstance(ranked_expert_ids, torch.Tensor) else ranked_expert_ids)
+        ]
+        if len(ranked) != 384 or len(set(ranked)) != 384:
+            raise ValueError(f"ranked_expert_ids must be a permutation of 0..383, got len={len(ranked)} uniq={len(set(ranked))}")
+        if n_t1 + n_t2_fp4 + n_t3_2bit != 384 or min(n_t1, n_t2_fp4, n_t3_2bit) < 0:
+            raise ValueError(f"Tier counts must sum to 384, got {n_t1}+{n_t2_fp4}+{n_t3_2bit}")
+
+        self = cls.__new__(cls)
+        nn.Module.__init__(self)
+        self.layer_idx = layer_idx
+        self.device = device
+        self.top_k = top_k
+        self.decode_top_k = top_k
+        self.routed_scaling_factor = routed_scaling_factor
+        self.swiglu_limit = swiglu_limit
+        self.hot_cache_size = max(top_k, n_t1)
+        self.offload_tail_to_cpu = True
+        self.mmap_zero_ram = True
+        self.use_fp4_slot_cache = True
+        self.use_fused_moe = False
+        self.shard_path_str = str(stock_shard_path)
+        self.v8_cpu_fp4_mode = True
+        self.n4_slots = n_t1
+        self.n4_cpu_slots = n_t2_fp4
+        self.n2_slots = n_t3_2bit
+        self.n1_slots = 0
+        self.tier2_ternary = False
+        self.keep_cold_healer = False
+        self.healer_on_cpu = False
+        self.t2_on_cpu = bool(n_t3_2bit > 0)
+        self.t3_on_cpu = False
+        self.use_mega_moe = False
+        self.n_logical_experts = 384
+        self.n_physical_experts = 384
+        self.n_local_physical_experts = 384
+        self.n_routed_experts = 384
+        self.n_shared_experts = 1
+        self.n_redundant_experts = 0
+        self.experts = _ChronosDummyExperts()
+        self.hot_expert_to_idx = [-1] * 384
+        self.hot_expert_ids_list = []
+        self.num_hot_mxfp4_experts = 0
+        self._hot_tensors = None
+        self._hot_handle = None
+        self._mmap_handle = None
+        self._hot_tp = f"layers.{layer_idx}.ffn.hot_experts."
+        self._hot_shard_cand = Path(self.shard_path_str)
+        self.groups = nn.ModuleList()
+        self._keys_384 = None
+        self.group_gu_u8 = self.group_gu_s_fp8 = self.group_d_u8 = self.group_d_s_fp8 = None
+        self.healer_u_gu = self.healer_v_gu = self.healer_u_d = self.healer_v_d = None
+        self.healer_u_gu_cpu = self.healer_v_gu_cpu = self.healer_u_d_cpu = self.healer_v_d_cpu = None
+        self.cold_scale_gu_f32 = self.cold_scale_d_f32 = None
+        self.w1_gu_cpu = self.s1_gu_cpu = self.w1_d_cpu = self.s1_d_cpu = None
+        self.r_basis = None
+        self.r_basis_f32 = None
+        self.sh_down_base_cpu = None
+        self.opt_a_alpha = 0.0
+        self.sh_gu_fp8 = self.sh_gu_s = self.sh_d_fp8 = self.sh_d_s = None
+        self.sh_gu = self.sh_down = None
+        self.cache_gu_buf = self.cache_d_buf = None
+        self.slot_gu = []
+        self.slot_d = []
+        self.shared_slot = n_t1
+        self.pinned_slots = n_t1
+
+        self.w4_gu_u8 = torch.empty((n_t1 + 1, 4608, 2560), dtype=torch.uint8, device=device)
+        self.s4_gu_bf16 = torch.empty((n_t1 + 1, 4608, 160), dtype=torch.bfloat16, device=device)
+        self.w4_d_u8 = torch.empty((n_t1 + 1, 5120, 1152), dtype=torch.uint8, device=device)
+        self.s4_d_bf16 = torch.empty((n_t1 + 1, 5120, 72), dtype=torch.bfloat16, device=device)
+        self.cache_gu_u8 = self.w4_gu_u8
+        self.cache_gu_s_bf16 = self.s4_gu_bf16
+        self.cache_d_u8 = self.w4_d_u8
+        self.cache_d_s_bf16 = self.s4_d_bf16
+        self.w1_gu_u8 = self.w4_gu_u8
+        self.s1_gu_fp8 = self.w4_gu_u8
+        self.w1_d_u8 = self.w4_d_u8
+        self.s1_d_fp8 = self.w4_d_u8
+
+        bounce = _get_v8_decode_bounce_bufs(device, top_k=top_k)
+        self.w4_bounce_gu_u8 = bounce["w4_gu_u8"]
+        self.s4_bounce_gu_bf16 = bounce["s4_gu_bf16"]
+        self.w4_bounce_d_u8 = bounce["w4_d_u8"]
+        self.s4_bounce_d_bf16 = bounce["s4_d_bf16"]
+        self.w2_gu_u8 = bounce["w2_gu_u8"]
+        self.s2_gu_fp8 = bounce["s2_gu_fp8"]
+        self.w2_d_u8 = bounce["w2_d_u8"]
+        self.s2_d_fp8 = bounce["s2_d_fp8"]
+
+        slab_specs: list[tuple[str, tuple[int, ...], torch.dtype]] = []
+        if n_t2_fp4 > 0:
+            slab_specs.extend(
+                [
+                    ("w4_cpu_gu_u8", (n_t2_fp4, 4608, 2560), torch.uint8),
+                    ("s4_cpu_gu_u8", (n_t2_fp4, 4608, 160), torch.uint8),
+                    ("w4_cpu_d_u8", (n_t2_fp4, 5120, 1152), torch.uint8),
+                    ("s4_cpu_d_u8", (n_t2_fp4, 5120, 72), torch.uint8),
+                ]
+            )
+        if n_t3_2bit > 0:
+            slab_specs.extend(
+                [
+                    ("w2_gu_cpu", (n_t3_2bit, 4608, 1280), torch.uint8),
+                    ("s2_gu_cpu", (n_t3_2bit, 4608, 80), torch.uint8),
+                    ("w2_d_cpu", (n_t3_2bit, 5120, 576), torch.uint8),
+                    ("s2_d_cpu", (n_t3_2bit, 5120, 36), torch.uint8),
+                ]
+            )
+        self._host_slab = _PinnedHostSlab(slab_specs) if slab_specs else None
+        sl = self._host_slab.slices if self._host_slab is not None else {}
+        self.w4_cpu_gu_u8 = sl.get("w4_cpu_gu_u8")
+        self.s4_cpu_gu_u8 = sl.get("s4_cpu_gu_u8")
+        self.w4_cpu_d_u8 = sl.get("w4_cpu_d_u8")
+        self.s4_cpu_d_u8 = sl.get("s4_cpu_d_u8")
+        self.w2_gu_cpu = sl.get("w2_gu_cpu")
+        self.s2_gu_cpu = sl.get("s2_gu_cpu")
+        self.w2_d_cpu = sl.get("w2_d_cpu")
+        self.s2_d_cpu = sl.get("s2_d_cpu")
+
+        self.tier_slot_map_gpu = torch.full((384,), -1, dtype=torch.int32, device=device)
+        self._init_decode_work_bufs(layer_idx, device)
+
+        tier1_eids = ranked[:n_t1]
+        tier2_eids = ranked[n_t1 : n_t1 + n_t2_fp4]
+        tier3_eids = ranked[n_t1 + n_t2_fp4 : 384]
+
+        tier_map_cpu = [-1] * 384
+        for s4, eid in enumerate(tier1_eids):
+            tier_map_cpu[eid] = s4
+            self.expert_to_slot[eid] = s4
+            self.slot_to_expert[s4] = eid
+        for s_cpu, eid in enumerate(tier2_eids):
+            tier_map_cpu[eid] = 2048 + s_cpu
+        for s2, eid in enumerate(tier3_eids):
+            tier_map_cpu[eid] = 1024 + s2
+        self.tier_slot_map_gpu.copy_(torch.tensor(tier_map_cpu, dtype=torch.int32, device=device))
+        self.expert_to_slot_gpu.copy_(self.tier_slot_map_gpu)
+
+        def _populate(sf: Any) -> None:
+            all_keys = set(sf.keys())
+            tp = f"layers.{layer_idx}.ffn"
+            if f"{tp}.gate.weight" not in all_keys and f"model.{tp}.gate.weight" in all_keys:
+                tp = f"model.layers.{layer_idx}.ffn"
+            self.router_w = sf.get_tensor(f"{tp}.gate.weight").to(device=device, dtype=torch.bfloat16).contiguous()
+            bias_key = f"{tp}.gate.bias" if f"{tp}.gate.bias" in all_keys else f"{tp}.gate.e_score_correction_bias"
+            self.e_score_bias = sf.get_tensor(bias_key).to(device=device, dtype=torch.float32).contiguous()
+            self.bias_vl = (
+                sf.get_tensor(f"{tp}.gate.bias_vl").to(device=device, dtype=torch.float32).contiguous()
+                if f"{tp}.gate.bias_vl" in all_keys
+                else None
+            )
+
+            sh_w1 = dequantize_block_fp8_32(
+                sf.get_tensor(f"{tp}.shared_experts.w1.weight"),
+                sf.get_tensor(f"{tp}.shared_experts.w1.scale"),
+                device,
+            )
+            sh_w3 = dequantize_block_fp8_32(
+                sf.get_tensor(f"{tp}.shared_experts.w3.weight"),
+                sf.get_tensor(f"{tp}.shared_experts.w3.scale"),
+                device,
+            )
+            sh_gu_tmp = torch.cat([sh_w1, sh_w3], dim=0).contiguous()
+            sh_down_tmp = dequantize_block_fp8_32(
+                sf.get_tensor(f"{tp}.shared_experts.w2.weight"),
+                sf.get_tensor(f"{tp}.shared_experts.w2.scale"),
+                device,
+            ).contiguous()
+            _triton_quantize_mse_fp4_32_kernel[(4608, 160)](
+                sh_gu_tmp,
+                self.w4_gu_u8[self.shared_slot],
+                self.s4_gu_bf16[self.shared_slot],
+                N_BLOCKS_C=160,
+                num_warps=1,
+            )
+            _triton_quantize_mse_fp4_32_kernel[(5120, 72)](
+                sh_down_tmp,
+                self.w4_d_u8[self.shared_slot],
+                self.s4_d_bf16[self.shared_slot],
+                N_BLOCKS_C=72,
+                num_warps=1,
+            )
+            del sh_gu_tmp, sh_down_tmp, sh_w1, sh_w3
+
+            # Tier 1: unmodified stock MXFP4 directly on GPU VRAM
+            for s4, eid in enumerate(tier1_eids):
+                ep = f"{tp}.experts.{eid}"
+                self.w4_gu_u8[s4, :2304].copy_(
+                    _copy_via_pinned_dma(sf.get_tensor(f"{ep}.w1.weight").view(torch.uint8), device, 301),
+                    non_blocking=False,
+                )
+                self.w4_gu_u8[s4, 2304:].copy_(
+                    _copy_via_pinned_dma(sf.get_tensor(f"{ep}.w3.weight").view(torch.uint8), device, 302),
+                    non_blocking=False,
+                )
+                self.w4_d_u8[s4].copy_(
+                    _copy_via_pinned_dma(sf.get_tensor(f"{ep}.w2.weight").view(torch.uint8), device, 303),
+                    non_blocking=False,
+                )
+                self.s4_gu_bf16[s4, :2304].copy_(
+                    _e8m0_scale_to_bf16(
+                        _copy_via_pinned_dma(sf.get_tensor(f"{ep}.w1.scale").view(torch.uint8), device, 304)
+                    )
+                )
+                self.s4_gu_bf16[s4, 2304:].copy_(
+                    _e8m0_scale_to_bf16(
+                        _copy_via_pinned_dma(sf.get_tensor(f"{ep}.w3.scale").view(torch.uint8), device, 305)
+                    )
+                )
+                self.s4_d_bf16[s4].copy_(
+                    _e8m0_scale_to_bf16(
+                        _copy_via_pinned_dma(sf.get_tensor(f"{ep}.w2.scale").view(torch.uint8), device, 306)
+                    )
+                )
+
+            # Tier 2: unmodified stock MXFP4 in pinned CPU host slab (raw uint8 E8M0 scales)
+            if self.w4_cpu_gu_u8 is not None:
+                assert self.s4_cpu_gu_u8 is not None and self.w4_cpu_d_u8 is not None and self.s4_cpu_d_u8 is not None
+                for s_cpu, eid in enumerate(tier2_eids):
+                    ep = f"{tp}.experts.{eid}"
+                    self.w4_cpu_gu_u8[s_cpu, :2304].copy_(sf.get_tensor(f"{ep}.w1.weight").view(torch.uint8))
+                    self.w4_cpu_gu_u8[s_cpu, 2304:].copy_(sf.get_tensor(f"{ep}.w3.weight").view(torch.uint8))
+                    self.w4_cpu_d_u8[s_cpu].copy_(sf.get_tensor(f"{ep}.w2.weight").view(torch.uint8))
+                    self.s4_cpu_gu_u8[s_cpu, :2304].copy_(sf.get_tensor(f"{ep}.w1.scale").view(torch.uint8))
+                    self.s4_cpu_gu_u8[s_cpu, 2304:].copy_(sf.get_tensor(f"{ep}.w3.scale").view(torch.uint8))
+                    self.s4_cpu_d_u8[s_cpu].copy_(sf.get_tensor(f"{ep}.w2.scale").view(torch.uint8))
+
+            # Tier 3: direct 2-bit Lloyd-Max g64 quantized straight from exact stock MXFP4
+            if self.w2_gu_cpu is not None and tier3_eids:
+                assert self.s2_gu_cpu is not None and self.w2_d_cpu is not None and self.s2_d_cpu is not None
+                scr_gu, scr_d = _get_shared_bf16_scratch(device)
+                t3q = _get_v8_t3_quant_scratch(device)
+                for s2, eid in enumerate(tier3_eids):
+                    ep = f"{tp}.experts.{eid}"
+                    t3q["w1_w"].copy_(_copy_via_pinned_dma(sf.get_tensor(f"{ep}.w1.weight").view(torch.uint8), device, 301))
+                    t3q["w1_s"].copy_(_copy_via_pinned_dma(sf.get_tensor(f"{ep}.w1.scale").view(torch.uint8), device, 304))
+                    t3q["w3_w"].copy_(_copy_via_pinned_dma(sf.get_tensor(f"{ep}.w3.weight").view(torch.uint8), device, 302))
+                    t3q["w3_s"].copy_(_copy_via_pinned_dma(sf.get_tensor(f"{ep}.w3.scale").view(torch.uint8), device, 305))
+                    t3q["w2_w"].copy_(_copy_via_pinned_dma(sf.get_tensor(f"{ep}.w2.weight").view(torch.uint8), device, 303))
+                    t3q["w2_s"].copy_(_copy_via_pinned_dma(sf.get_tensor(f"{ep}.w2.scale").view(torch.uint8), device, 306))
+                    scr_gu[:2304].copy_(dequantize_mxfp4_32(t3q["w1_w"], t3q["w1_s"], device, dtype=torch.bfloat16))
+                    scr_gu[2304:].copy_(dequantize_mxfp4_32(t3q["w3_w"], t3q["w3_s"], device, dtype=torch.bfloat16))
+                    scr_d.copy_(dequantize_mxfp4_32(t3q["w2_w"], t3q["w2_s"], device, dtype=torch.bfloat16))
+                    _triton_quantize_2bit_g64_kernel[(4608, 80)](
+                        scr_gu, bounce["w2_gu_u8"][0], bounce["s2_gu_fp8"][0], N_GROUPS_C=80, num_warps=1
+                    )
+                    _triton_quantize_2bit_g64_kernel[(5120, 36)](
+                        scr_d, bounce["w2_d_u8"][0], bounce["s2_d_fp8"][0], N_GROUPS_C=36, num_warps=1
+                    )
+                    self.w2_gu_cpu[s2].copy_(bounce["w2_gu_u8"][0], non_blocking=False)
+                    self.s2_gu_cpu[s2].copy_(bounce["s2_gu_fp8"][0], non_blocking=False)
+                    self.w2_d_cpu[s2].copy_(bounce["w2_d_u8"][0], non_blocking=False)
+                    self.s2_d_cpu[s2].copy_(bounce["s2_d_fp8"][0], non_blocking=False)
+
+        if sf_handle is not None:
+            _populate(sf_handle)
+        else:
+            with safe_open(self.shard_path_str, framework="pt", device="cpu") as sf:
+                _populate(sf)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        if layer_idx == 39:
+            _PINNED_DMA_BUFS.clear()
+            _SHARED_SCRATCH_GU_BF16.clear()
+            _SHARED_SCRATCH_D_BF16.clear()
+            _V8_T3_QUANT_SCRATCH.clear()
+        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+            try:
+                _rp = os.path.realpath(self.shard_path_str)
+                if os.path.exists(_rp):
+                    fd = os.open(_rp, os.O_RDONLY)
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    os.close(fd)
+            except OSError:
+                pass
+        return self
 
     def _try_attach_hot_shard(self) -> bool:
         if self.num_hot_mxfp4_experts > 0:
@@ -3191,6 +4459,145 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         )
 
     @torch.no_grad()
+    def _stage_v8_cpu_fp4_bounce_slots(self, k_act: int) -> None:
+        if not getattr(self, "v8_cpu_fp4_mode", False) or self.w4_cpu_gu_u8 is None:
+            return
+        assert (
+            self.s4_cpu_gu_u8 is not None
+            and self.w4_cpu_d_u8 is not None
+            and self.s4_cpu_d_u8 is not None
+            and self.w4_bounce_gu_u8 is not None
+            and self.s4_bounce_gu_bf16 is not None
+            and self.w4_bounce_d_u8 is not None
+            and self.s4_bounce_d_bf16 is not None
+        )
+        if (
+            _HAS_TRITON
+            and _triton_stage_v8_cpu_fp4_dma_kernel is not None
+            and self.device.type == "cuda"
+            and self.w4_cpu_gu_u8.is_pinned()
+        ):
+            _triton_stage_v8_cpu_fp4_dma_kernel[(108,)](
+                self._active_slots_buf,
+                self.w4_bounce_gu_u8,
+                self.w4_cpu_gu_u8,
+                self.s4_bounce_gu_bf16.view(torch.int16),
+                self.s4_cpu_gu_u8,
+                self.w4_bounce_d_u8,
+                self.w4_cpu_d_u8,
+                self.s4_bounce_d_bf16.view(torch.int16),
+                self.s4_cpu_d_u8,
+                K_ACT=k_act,
+                BLOCK_BYTES=1024,
+                BLOCK_SCALES=512,
+                num_warps=4,
+            )
+            _triton_remap_t3_slots_kernel[(1,)](self._active_slots_buf, K_ACT=k_act, num_warps=1)
+            return
+
+        slots_list = self._active_slots_buf[:k_act].tolist()
+        if not any(s >= 2048 for s in slots_list):
+            return
+        b_idx = 0
+        for idx_k, s_val in enumerate(slots_list):
+            if s_val >= 2048:
+                s_cpu = s_val - 2048
+                self.w4_bounce_gu_u8[b_idx].copy_(self.w4_cpu_gu_u8[s_cpu], non_blocking=False)
+                self.w4_bounce_d_u8[b_idx].copy_(self.w4_cpu_d_u8[s_cpu], non_blocking=False)
+                self.s4_bounce_gu_bf16[b_idx].copy_(_e8m0_scale_to_bf16(self.s4_cpu_gu_u8[s_cpu].to(self.device)))
+                self.s4_bounce_d_bf16[b_idx].copy_(_e8m0_scale_to_bf16(self.s4_cpu_d_u8[s_cpu].to(self.device)))
+                slots_list[idx_k] = 2048 + b_idx
+                b_idx += 1
+        self._active_slots_buf[:k_act].copy_(torch.tensor(slots_list, dtype=torch.int32, device=self.device))
+
+    @torch.no_grad()
+    def _stage_t2_bounce_slots(self, k_act: int) -> None:
+        if not getattr(self, "t2_on_cpu", False) and not getattr(self, "healer_on_cpu", False):
+            return
+        t2_pinned_ok = (not self.t2_on_cpu) or (
+            self.w2_gu_cpu is not None and self.w2_gu_cpu.is_pinned()
+        )
+        hlr_pinned_ok = (not self.healer_on_cpu) or (
+            self.healer_u_gu_cpu is not None and self.healer_u_gu_cpu.is_pinned()
+        )
+        if (
+            _HAS_TRITON
+            and _triton_stage_t2_dma_kernel is not None
+            and self.device.type == "cuda"
+            and t2_pinned_ok
+            and hlr_pinned_ok
+            and self.t2_on_cpu
+            and self.w2_gu_cpu is not None
+        ):
+            has_cpu_hlr = bool(self.healer_on_cpu and self.healer_u_gu_cpu is not None)
+            _dmy = self.w2_gu_u8
+            _triton_stage_t2_dma_kernel[(108,)](
+                self._active_slots_buf,
+                self._active_healer_slots_buf,
+                self.w2_gu_u8,
+                self.w2_gu_cpu,
+                self.s2_gu_fp8,
+                self.s2_gu_cpu,
+                self.w2_d_u8,
+                self.w2_d_cpu,
+                self.s2_d_fp8,
+                self.s2_d_cpu,
+                self.healer_u_gu if has_cpu_hlr else _dmy,
+                self.healer_u_gu_cpu if has_cpu_hlr else _dmy,
+                self.healer_v_gu if has_cpu_hlr else _dmy,
+                self.healer_v_gu_cpu if has_cpu_hlr else _dmy,
+                self.healer_u_d if has_cpu_hlr else _dmy,
+                self.healer_u_d_cpu if has_cpu_hlr else _dmy,
+                self.healer_v_d if has_cpu_hlr else _dmy,
+                self.healer_v_d_cpu if has_cpu_hlr else _dmy,
+                K_ACT=k_act,
+                BLOCK_BYTES=1024,
+                HAS_CPU_HEALER=has_cpu_hlr,
+                num_warps=4,
+            )
+            _triton_remap_t2_slots_kernel[(1,)](
+                self._active_slots_buf,
+                self._active_healer_slots_buf,
+                K_ACT=k_act,
+                HAS_CPU_HEALER=has_cpu_hlr,
+                num_warps=1,
+            )
+            return
+
+        slots_list = self._active_slots_buf[:k_act].tolist()
+        if not any(1024 <= s < 2048 for s in slots_list):
+            return
+        h_slots = [0] * k_act
+        b_idx = 0
+        for idx_k, s_val in enumerate(slots_list):
+            if 1024 <= s_val < 2048:
+                s2 = s_val - 1024
+                if self.t2_on_cpu and self.w2_gu_cpu is not None:
+                    self.w2_gu_u8[b_idx].copy_(self.w2_gu_cpu[s2], non_blocking=False)
+                    self.s2_gu_fp8[b_idx].copy_(self.s2_gu_cpu[s2], non_blocking=False)
+                    self.w2_d_u8[b_idx].copy_(self.w2_d_cpu[s2], non_blocking=False)
+                    self.s2_d_fp8[b_idx].copy_(self.s2_d_cpu[s2], non_blocking=False)
+                    slots_list[idx_k] = 1024 + b_idx
+                if self.healer_on_cpu and self.healer_u_gu_cpu is not None:
+                    assert self.healer_u_gu is not None
+                    self.healer_u_gu[b_idx].copy_(self.healer_u_gu_cpu[s2], non_blocking=False)
+                    self.healer_v_gu[b_idx].copy_(self.healer_v_gu_cpu[s2], non_blocking=False)
+                    self.healer_u_d[b_idx].copy_(self.healer_u_d_cpu[s2], non_blocking=False)
+                    self.healer_v_d[b_idx].copy_(self.healer_v_d_cpu[s2], non_blocking=False)
+                    h_slots[idx_k] = b_idx
+                else:
+                    h_slots[idx_k] = s2
+                b_idx += 1
+        if self.t2_on_cpu:
+            self._active_slots_buf[:k_act].copy_(
+                torch.tensor(slots_list, dtype=torch.int32, device=self.device)
+            )
+        if getattr(self, "keep_cold_healer", False):
+            self._active_healer_slots_buf[:k_act].copy_(
+                torch.tensor(h_slots, dtype=torch.int32, device=self.device)
+            )
+
+    @torch.no_grad()
     def _get_slot_bf16(self, slot: int) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.use_fp4_slot_cache:
             return self.slot_gu[slot], self.slot_d[slot]
@@ -3202,6 +4609,71 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
         return scr_gu, scr_d
 
     @torch.no_grad()
+    def _run_fp4_pair_chunks(
+        self,
+        x: torch.Tensor,
+        w4_gu_u8: torch.Tensor,
+        s4_gu_bf16: torch.Tensor,
+        w4_d_u8: torch.Tensor,
+        s4_d_bf16: torch.Tensor,
+        all_tok: torch.Tensor,
+        all_slots: torch.Tensor,
+        all_gates: torch.Tensor,
+        act_inter_buf: torch.Tensor,
+        y_pair_buf: torch.Tensor,
+        out_y_f32: torch.Tensor,
+        max_pairs: int,
+        n_toks: int,
+    ) -> None:
+        n_pairs = all_tok.numel()
+        if n_pairs == 0:
+            return
+        order = torch.argsort(all_slots)
+        all_tok = all_tok[order].contiguous()
+        all_slots = all_slots[order].contiguous()
+        all_gates = all_gates[order].contiguous()
+        for p0 in range(0, n_pairs, max_pairs):
+            p1 = min(n_pairs, p0 + max_pairs)
+            m_len = p1 - p0
+            tok_p = all_tok[p0:p1]
+            slot_p = all_slots[p0:p1]
+            gate_p = all_gates[p0:p1]
+            _triton_dsv41_pair_fp4_gu_swiglu_kernel[(2304 // 8, m_len)](
+                x,
+                w4_gu_u8,
+                s4_gu_bf16,
+                tok_p,
+                slot_p,
+                gate_p,
+                act_inter_buf[:m_len],
+                float(self.swiglu_limit),
+                N_INTER=2304,
+                N_BLOCKS_K4=160,
+                BLOCK_N=8,
+                sub_blocks_k4=8,
+                num_warps=4,
+            )
+            _triton_dsv41_pair_fp4_down_kernel[(5120 // 8, m_len)](
+                act_inter_buf[:m_len],
+                w4_d_u8,
+                s4_d_bf16,
+                slot_p,
+                y_pair_buf[:m_len],
+                D_OUT=5120,
+                N_BLOCKS_K4=72,
+                BLOCK_D=8,
+                sub_blocks_k4=8,
+                num_warps=8,
+            )
+            if n_toks <= 64:
+                mask_f = (
+                    tok_p.unsqueeze(0) == torch.arange(n_toks, device=x.device, dtype=tok_p.dtype).unsqueeze(1)
+                ).to(torch.float32)
+                out_y_f32.addmm_(mask_f, y_pair_buf[:m_len])
+            else:
+                out_y_f32.index_add_(0, tok_p.long(), y_pair_buf[:m_len])
+
+    @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -3211,12 +4683,12 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         orig_shape = hidden_states.shape
         orig_dtype = hidden_states.dtype
-        x = hidden_states.view(-1, orig_shape[-1]).to(torch.bfloat16)
+        x = hidden_states.reshape(-1, orig_shape[-1]).to(torch.bfloat16).contiguous()
         n_toks = x.shape[0]
         if n_toks == 0:
             return hidden_states
 
-        # Zero-sync 100% GPU-Resident Fused Tiered (4-bit MXFP4 + 2-bit Group-64 + 1-bit Group-64) Triton Path
+        # Zero-sync 100% GPU/System-RAM Fused Tiered Triton Path (v7.5 & v8 Calibrated 3-Tier)
         if self.use_fp4_slot_cache and _HAS_TRITON and x.is_cuda:
             if image_mask is None and input_ids is not None:
                 if input_ids.dtype == torch.bool:
@@ -3226,8 +4698,24 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
 
             raw_logits = F.linear(x, self.router_w)
             mt3 = int(getattr(self, "_active_mt3", 6))
+            t3_is_fp4 = bool(getattr(self, "v8_cpu_fp4_mode", False) and getattr(self, "n4_cpu_slots", 0) > 0)
+            mt3_router = 6 if t3_is_fp4 else mt3
             has_t2 = self.n2_slots > 0
-            has_t3 = (self.n1_slots > 0) and (mt3 > 0)
+            has_t3 = ((self.n1_slots > 0) and (mt3 > 0)) or t3_is_fp4
+            has_healer = bool(has_t2 and getattr(self, "keep_cold_healer", False) and self.healer_u_gu is not None)
+            explicit_h_slot = bool(getattr(self, "t2_on_cpu", False) or getattr(self, "healer_on_cpu", False))
+            u_gu_ptr = self.healer_u_gu if has_healer else self.w4_gu_u8
+            u_d_ptr = self.healer_u_d if has_healer else self.w4_d_u8
+            t3_w_gu_ptr = self.w4_bounce_gu_u8 if (t3_is_fp4 and self.w4_bounce_gu_u8 is not None) else self.w1_gu_u8
+            t3_s_gu_ptr = self.s4_bounce_gu_bf16 if (t3_is_fp4 and self.s4_bounce_gu_bf16 is not None) else self.s1_gu_fp8
+            t3_w_d_ptr = self.w4_bounce_d_u8 if (t3_is_fp4 and self.w4_bounce_d_u8 is not None) else self.w1_d_u8
+            t3_s_d_ptr = self.s4_bounce_d_bf16 if (t3_is_fp4 and self.s4_bounce_d_bf16 is not None) else self.s1_d_fp8
+            r_step_row = getattr(self, "_routing_step_row_buf", None)
+            if r_step_row is None or r_step_row.device != x.device or r_step_row.is_inference():
+                l_idx = min(max(int(getattr(self, "layer_idx", 0)), 0), 39)
+                r_step_row = get_routing_step_buffer(x.device)[l_idx]
+                self._routing_step_row_buf = r_step_row
+
             if n_toks == 1:
                 out_y = getattr(self, "_out_y_buf", None)
                 if out_y is None or out_y.shape != x.shape or out_y.is_inference():
@@ -3246,26 +4734,47 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     self._active_slots_buf,
                     self._active_gates_buf,
                     self._tier_cfg_gpu,
+                    r_step_row,
                     float(self.routed_scaling_factor),
                     SHARED_SLOT=self.shared_slot,
                     K_ACT=k_act,
-                    MAX_T3=mt3,
+                    MAX_T3=mt3_router,
                     num_warps=4,
                 )
-                if self.t3_on_cpu and mt3 > 0:
+                if t3_is_fp4:
+                    self._stage_v8_cpu_fp4_bounce_slots(k_act)
+                elif self.t3_on_cpu and mt3 > 0:
                     self._stage_t3_bounce_slots(k_act)
+                if explicit_h_slot and has_t2:
+                    self._stage_t2_bounce_slots(k_act)
+                if has_healer and self.healer_v_gu is not None:
+                    _triton_dsv41_t2_healer_v_kernel[(4, k_act)](
+                        x,
+                        self.healer_v_gu,
+                        self._active_slots_buf,
+                        self._active_healer_slots_buf,
+                        self._h_gu_mid_buf,
+                        D_IN=5120,
+                        X_STRIDE_E=0,
+                        BLOCK_K=128,
+                        EXPLICIT_HEALER_SLOT=explicit_h_slot,
+                        num_warps=4,
+                    )
                 _triton_dsv41_tiered_gu_swiglu_kernel[(2304 // 8, n_active)](
                     x,
                     self.w4_gu_u8,
                     self.s4_gu_bf16,
                     self.w2_gu_u8,
                     self.s2_gu_fp8,
-                    self.w1_gu_u8,
-                    self.s1_gu_fp8,
+                    t3_w_gu_ptr,
+                    t3_s_gu_ptr,
                     self._active_slots_buf,
                     self._active_gates_buf,
                     self._tier_cfg_gpu,
                     self._act_inter_buf,
+                    u_gu_ptr,
+                    self._h_gu_mid_buf,
+                    self._active_healer_slots_buf,
                     float(self.swiglu_limit),
                     N_INTER=2304,
                     N_BLOCKS_K4=160,
@@ -3276,18 +4785,37 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     HAS_TIER2=has_t2,
                     HAS_TIER3=has_t3,
                     TIER2_TERNARY=self.tier2_ternary,
+                    HAS_HEALER=has_healer,
+                    EXPLICIT_HEALER_SLOT=explicit_h_slot,
+                    T3_IS_FP4_BOUNCE=t3_is_fp4,
                     num_warps=4,
                 )
+                if has_healer and self.healer_v_d is not None:
+                    _triton_dsv41_t2_healer_v_kernel[(4, k_act)](
+                        self._act_inter_buf,
+                        self.healer_v_d,
+                        self._active_slots_buf,
+                        self._active_healer_slots_buf,
+                        self._h_d_mid_buf,
+                        D_IN=2304,
+                        X_STRIDE_E=2304,
+                        BLOCK_K=128,
+                        EXPLICIT_HEALER_SLOT=explicit_h_slot,
+                        num_warps=4,
+                    )
                 _triton_dsv41_tiered_down_kernel[(5120 // 8, n_active)](
                     self._act_inter_buf,
                     self.w4_d_u8,
                     self.s4_d_bf16,
                     self.w2_d_u8,
                     self.s2_d_fp8,
-                    self.w1_d_u8,
-                    self.s1_d_fp8,
+                    t3_w_d_ptr,
+                    t3_s_d_ptr,
                     self._active_slots_buf,
                     self._y_partial_buf,
+                    u_d_ptr,
+                    self._h_d_mid_buf,
+                    self._active_healer_slots_buf,
                     D_OUT=5120,
                     N_BLOCKS_K4=72,
                     N_GROUPS_K2=36,
@@ -3297,6 +4825,9 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                     HAS_TIER2=has_t2,
                     HAS_TIER3=has_t3,
                     TIER2_TERNARY=self.tier2_ternary,
+                    HAS_HEALER=has_healer,
+                    EXPLICIT_HEALER_SLOT=explicit_h_slot,
+                    T3_IS_FP4_BOUNCE=t3_is_fp4,
                     num_warps=8,
                 )
                 _triton_dsv41_reduce_sum_bf16_kernel[(40,)](
@@ -3312,81 +4843,391 @@ class ChronosDsv41SparseMoeBlock(nn.Module):
                 out_y_v = out_y.view(orig_shape)
                 return out_y_v if orig_dtype == torch.bfloat16 else out_y_v.to(orig_dtype)
 
-            out_y = torch.empty_like(x)
+            # Batch-Coalesced Prompt Prefill (`n_toks > 1`): Full 384-Expert Evaluation (zero skipped cold doctors)
             k_act = self.decode_top_k if n_toks <= 4 else self.top_k
-            n_active = k_act + 1
             im_flat = image_mask.view(-1) if (image_mask is not None and image_mask.numel() == n_toks) else None
-            for t_i in range(n_toks):
-                bias_vec = self.e_score_bias
-                if im_flat is not None and self.bias_vl is not None:
-                    bias_vec = torch.where(im_flat[t_i : t_i + 1], self.bias_vl, self.e_score_bias)
-                _triton_dsv41_tiered_router_kernel[(1,)](
-                    raw_logits[t_i : t_i + 1],
-                    bias_vec,
-                    self.tier_slot_map_gpu,
-                    self._active_slots_buf,
-                    self._active_gates_buf,
-                    self._tier_cfg_gpu,
-                    float(self.routed_scaling_factor),
-                    SHARED_SLOT=self.shared_slot,
-                    K_ACT=k_act,
-                    MAX_T3=mt3,
-                    num_warps=4,
+
+            if self.n1_slots > 0:
+                out_y = torch.empty_like(x)
+                n_active = k_act + 1
+                for t_i in range(n_toks):
+                    mt3_t = (
+                        0
+                        if (self.t3_on_cpu and t_i < n_toks - 1 and os.environ.get("CHRONOS_PREFILL_MT3_FULL", "0") != "1")
+                        else mt3
+                    )
+                    has_t3_t = (self.n1_slots > 0) and (mt3_t > 0)
+                    bias_vec = self.e_score_bias
+                    if im_flat is not None and self.bias_vl is not None:
+                        bias_vec = torch.where(im_flat[t_i : t_i + 1], self.bias_vl, self.e_score_bias)
+                    _triton_dsv41_tiered_router_kernel[(1,)](
+                        raw_logits[t_i : t_i + 1],
+                        bias_vec,
+                        self.tier_slot_map_gpu,
+                        self._active_slots_buf,
+                        self._active_gates_buf,
+                        self._tier_cfg_gpu,
+                        r_step_row,
+                        float(self.routed_scaling_factor),
+                        SHARED_SLOT=self.shared_slot,
+                        K_ACT=k_act,
+                        MAX_T3=mt3_t,
+                        num_warps=4,
+                    )
+                    if self.t3_on_cpu and mt3_t > 0:
+                        self._stage_t3_bounce_slots(k_act)
+                    _triton_dsv41_tiered_gu_swiglu_kernel[(2304 // 8, n_active)](
+                        x[t_i : t_i + 1],
+                        self.w4_gu_u8,
+                        self.s4_gu_bf16,
+                        self.w2_gu_u8,
+                        self.s2_gu_fp8,
+                        self.w1_gu_u8,
+                        self.s1_gu_fp8,
+                        self._active_slots_buf,
+                        self._active_gates_buf,
+                        self._tier_cfg_gpu,
+                        self._act_inter_buf,
+                        u_gu_ptr,
+                        self._h_gu_mid_buf,
+                        self._active_healer_slots_buf,
+                        float(self.swiglu_limit),
+                        N_INTER=2304,
+                        N_BLOCKS_K4=160,
+                        N_GROUPS_K2=80,
+                        BLOCK_N=8,
+                        sub_blocks_k4=8,
+                        sub_groups_k2=4,
+                        HAS_TIER2=has_t2,
+                        HAS_TIER3=has_t3_t,
+                        TIER2_TERNARY=self.tier2_ternary,
+                        HAS_HEALER=False,
+                        EXPLICIT_HEALER_SLOT=False,
+                        num_warps=4,
+                    )
+                    _triton_dsv41_tiered_down_kernel[(5120 // 8, n_active)](
+                        self._act_inter_buf,
+                        self.w4_d_u8,
+                        self.s4_d_bf16,
+                        self.w2_d_u8,
+                        self.s2_d_fp8,
+                        self.w1_d_u8,
+                        self.s1_d_fp8,
+                        self._active_slots_buf,
+                        self._y_partial_buf,
+                        u_d_ptr,
+                        self._h_d_mid_buf,
+                        self._active_healer_slots_buf,
+                        D_OUT=5120,
+                        N_BLOCKS_K4=72,
+                        N_GROUPS_K2=36,
+                        BLOCK_D=8,
+                        sub_blocks_k4=8,
+                        sub_groups_k2=4,
+                        HAS_TIER2=has_t2,
+                        HAS_TIER3=has_t3_t,
+                        TIER2_TERNARY=self.tier2_ternary,
+                        HAS_HEALER=False,
+                        EXPLICIT_HEALER_SLOT=False,
+                        num_warps=8,
+                    )
+                    _triton_dsv41_reduce_sum_bf16_kernel[(40,)](
+                        self._y_partial_buf,
+                        out_y[t_i],
+                        N_ACT=n_active,
+                        D_OUT=5120,
+                        num_warps=2,
+                    )
+                if self.r_basis is not None:
+                    rb = self.r_basis.to(out_y.dtype)
+                    out_y.addmm_(out_y @ rb.T, rb, beta=1.0, alpha=-1.0)
+                out_y_v = out_y.view(orig_shape)
+                return out_y_v if orig_dtype == torch.bfloat16 else out_y_v.to(orig_dtype)
+
+            out_y_f32 = torch.zeros((n_toks, 5120), dtype=torch.float32, device=x.device)
+            bias = self.e_score_bias.unsqueeze(0)
+            if im_flat is not None and self.bias_vl is not None:
+                bias = torch.where(im_flat.view(-1, 1), self.bias_vl.unsqueeze(0), bias)
+            scores = F.softplus(raw_logits.float()).sqrt()
+            _, top_ids = torch.topk(scores + bias, k=k_act, dim=-1)
+            if os.environ.get("CHRONOS_LOG_ROUTING", "0") == "1":
+                self._last_prefill_top_ids = top_ids[:, :6].to(torch.int16)
+                r_step_row.copy_(self._last_prefill_top_ids[-1])
+            top_w = scores.gather(1, top_ids)
+            top_gates = (top_w / (top_w.sum(dim=-1, keepdim=True) + 1e-20)) * float(self.routed_scaling_factor)
+            routed_tslots = self.tier_slot_map_gpu[top_ids]
+
+            pbuf = _get_prefill_t2_bufs(x.device)
+            act_inter_buf = pbuf["act_inter"]
+            y_pair_buf = pbuf["y_pair_f32"]
+            h_mid_buf = pbuf["h_mid"]
+            max_pairs = act_inter_buf.shape[0]
+
+            # Pass 1: Batched GPU-Resident 4-Bit Hot-96 + Shared Expert
+            hot_mask = (routed_tslots >= 0) & (routed_tslots < 1024)
+            h_tok, h_k = torch.nonzero(hot_mask, as_tuple=True)
+            m_t1 = self._tier_cfg_gpu[0]
+            m_sh = self._tier_cfg_gpu[10]
+            h_slots = routed_tslots[h_tok, h_k].to(torch.int32)
+            h_gates = (top_gates[h_tok, h_k] * m_t1).to(torch.float32)
+
+            sh_tok = torch.arange(n_toks, device=x.device, dtype=torch.int32)
+            sh_slots = torch.full((n_toks,), self.shared_slot, device=x.device, dtype=torch.int32)
+            sh_gates = torch.full((n_toks,), float(m_sh.item()), device=x.device, dtype=torch.float32)
+
+            self._run_fp4_pair_chunks(
+                x,
+                self.w4_gu_u8,
+                self.s4_gu_bf16,
+                self.w4_d_u8,
+                self.s4_d_bf16,
+                torch.cat([h_tok.to(torch.int32), sh_tok], dim=0),
+                torch.cat([h_slots, sh_slots], dim=0),
+                torch.cat([h_gates, sh_gates], dim=0),
+                act_inter_buf,
+                y_pair_buf,
+                out_y_f32,
+                max_pairs,
+                n_toks,
+            )
+
+            # Pass 1.5 (v8): Batch-Coalesced CPU-Resident 4-Bit MXFP4 Tier-2 Experts
+            cpu4_mask = routed_tslots >= 2048
+            if t3_is_fp4 and cpu4_mask.any():
+                assert self.w4_cpu_gu_u8 is not None and self.s4_cpu_gu_u8 is not None
+                assert self.w4_cpu_d_u8 is not None and self.s4_cpu_d_u8 is not None
+                c4_tok, c4_k = torch.nonzero(cpu4_mask, as_tuple=True)
+                c4_s = (routed_tslots[c4_tok, c4_k] - 2048).to(torch.int32)
+                m_t3 = self._tier_cfg_gpu[2]
+                c4_gates = (top_gates[c4_tok, c4_k] * m_t3).to(torch.float32)
+                unique_c4, inv4 = torch.unique(c4_s, sorted=True, return_inverse=True)
+                n_uniq4 = unique_c4.numel()
+                fp4_buf = _get_v8_prefill_fp4_bufs(x.device)
+                max_fp4_slots = fp4_buf["w4_gu_u8"].shape[0]
+                pinned4 = bool(self.w4_cpu_gu_u8.is_pinned())
+                u4_cpu = None if pinned4 else unique_c4.cpu().long()
+                for c0 in range(0, n_uniq4, max_fp4_slots):
+                    c1 = min(n_uniq4, c0 + max_fp4_slots)
+                    c_len = c1 - c0
+                    if pinned4:
+                        _triton_gather_v8_cpu_fp4_kernel[(108,)](
+                            unique_c4[c0:c1].contiguous(),
+                            c_len,
+                            fp4_buf["w4_gu_u8"],
+                            self.w4_cpu_gu_u8,
+                            fp4_buf["s4_gu_bf16"].view(torch.int16),
+                            self.s4_cpu_gu_u8,
+                            fp4_buf["w4_d_u8"],
+                            self.w4_cpu_d_u8,
+                            fp4_buf["s4_d_bf16"].view(torch.int16),
+                            self.s4_cpu_d_u8,
+                            BLOCK_BYTES=1024,
+                            BLOCK_SCALES=512,
+                            num_warps=4,
+                        )
+                    else:
+                        assert u4_cpu is not None
+                        u_sub = u4_cpu[c0:c1]
+                        fp4_buf["w4_gu_u8"][:c_len].copy_(self.w4_cpu_gu_u8.index_select(0, u_sub), non_blocking=False)
+                        fp4_buf["w4_d_u8"][:c_len].copy_(self.w4_cpu_d_u8.index_select(0, u_sub), non_blocking=False)
+                        fp4_buf["s4_gu_bf16"][:c_len].copy_(
+                            _e8m0_scale_to_bf16(self.s4_cpu_gu_u8.index_select(0, u_sub).to(x.device))
+                        )
+                        fp4_buf["s4_d_bf16"][:c_len].copy_(
+                            _e8m0_scale_to_bf16(self.s4_cpu_d_u8.index_select(0, u_sub).to(x.device))
+                        )
+                    sel_mask = (inv4 >= c0) & (inv4 < c1)
+                    self._run_fp4_pair_chunks(
+                        x,
+                        fp4_buf["w4_gu_u8"],
+                        fp4_buf["s4_gu_bf16"],
+                        fp4_buf["w4_d_u8"],
+                        fp4_buf["s4_d_bf16"],
+                        c4_tok[sel_mask].to(torch.int32),
+                        (inv4[sel_mask] - c0).to(torch.int32),
+                        c4_gates[sel_mask],
+                        act_inter_buf,
+                        y_pair_buf,
+                        out_y_f32,
+                        max_pairs,
+                        n_toks,
+                    )
+
+            # Pass 2: Batch-Coalesced Cold 2-Bit Lloyd-Max (+ Optional Rank-64 FP8 SVD Healer for v7.5)
+            cold_mask = (routed_tslots >= 1024) & (routed_tslots < 2048)
+            if has_t2 and cold_mask.any():
+                c_tok, c_k = torch.nonzero(cold_mask, as_tuple=True)
+                cold_s2 = (routed_tslots[c_tok, c_k] - 1024).to(torch.int32)
+                m_t2 = self._tier_cfg_gpu[1]
+                cold_gates = (top_gates[c_tok, c_k] * m_t2).to(torch.float32)
+                unique_s2, inv_idx = torch.unique(cold_s2, sorted=True, return_inverse=True)
+                n_uniq = unique_s2.numel()
+                max_slots = pbuf["w2_gu_u8"].shape[0]
+                t2_uva_fast = bool(
+                    self.t2_on_cpu
+                    and self.w2_gu_cpu is not None
+                    and not has_healer
+                    and _HAS_TRITON
+                    and _triton_gather_v8_cpu_t2_kernel is not None
+                    and self.w2_gu_cpu.is_pinned()
                 )
-                if self.t3_on_cpu and mt3 > 0:
-                    self._stage_t3_bounce_slots(k_act)
-                _triton_dsv41_tiered_gu_swiglu_kernel[(2304 // 8, n_active)](
-                    x[t_i : t_i + 1],
-                    self.w4_gu_u8,
-                    self.s4_gu_bf16,
-                    self.w2_gu_u8,
-                    self.s2_gu_fp8,
-                    self.w1_gu_u8,
-                    self.s1_gu_fp8,
-                    self._active_slots_buf,
-                    self._active_gates_buf,
-                    self._tier_cfg_gpu,
-                    self._act_inter_buf,
-                    float(self.swiglu_limit),
-                    N_INTER=2304,
-                    N_BLOCKS_K4=160,
-                    N_GROUPS_K2=80,
-                    BLOCK_N=8,
-                    sub_blocks_k4=8,
-                    sub_groups_k2=4,
-                    HAS_TIER2=has_t2,
-                    HAS_TIER3=has_t3,
-                    TIER2_TERNARY=self.tier2_ternary,
-                    num_warps=4,
+                u_chunk_all_cpu = (
+                    unique_s2.cpu().long()
+                    if ((self.t2_on_cpu and not t2_uva_fast) or self.healer_on_cpu)
+                    else None
                 )
-                _triton_dsv41_tiered_down_kernel[(5120 // 8, n_active)](
-                    self._act_inter_buf,
-                    self.w4_d_u8,
-                    self.s4_d_bf16,
-                    self.w2_d_u8,
-                    self.s2_d_fp8,
-                    self.w1_d_u8,
-                    self.s1_d_fp8,
-                    self._active_slots_buf,
-                    self._y_partial_buf,
-                    D_OUT=5120,
-                    N_BLOCKS_K4=72,
-                    N_GROUPS_K2=36,
-                    BLOCK_D=8,
-                    sub_blocks_k4=8,
-                    sub_groups_k2=4,
-                    HAS_TIER2=has_t2,
-                    HAS_TIER3=has_t3,
-                    TIER2_TERNARY=self.tier2_ternary,
-                    num_warps=8,
-                )
-                _triton_dsv41_reduce_sum_bf16_kernel[(40,)](
-                    self._y_partial_buf,
-                    out_y[t_i],
-                    N_ACT=n_active,
-                    D_OUT=5120,
-                    num_warps=2,
-                )
+
+                for c0 in range(0, n_uniq, max_slots):
+                    c1 = min(n_uniq, c0 + max_slots)
+                    c_len = c1 - c0
+                    sel_mask = (inv_idx >= c0) & (inv_idx < c1)
+                    tok_c = c_tok[sel_mask].to(torch.int32)
+                    if t2_uva_fast:
+                        _triton_gather_v8_cpu_t2_kernel[(108,)](
+                            unique_s2[c0:c1].contiguous(),
+                            c_len,
+                            pbuf["w2_gu_u8"],
+                            self.w2_gu_cpu,
+                            pbuf["s2_gu_fp8"],
+                            self.s2_gu_cpu,
+                            pbuf["w2_d_u8"],
+                            self.w2_d_cpu,
+                            pbuf["s2_d_fp8"],
+                            self.s2_d_cpu,
+                            BLOCK_BYTES=1024,
+                            num_warps=4,
+                        )
+                        w2_gu_src, s2_gu_src = pbuf["w2_gu_u8"], pbuf["s2_gu_fp8"]
+                        w2_d_src, s2_d_src = pbuf["w2_d_u8"], pbuf["s2_d_fp8"]
+                        b_slot_c = (inv_idx[sel_mask] - c0).to(torch.int32)
+                    elif self.t2_on_cpu and self.w2_gu_cpu is not None and u_chunk_all_cpu is not None:
+                        u_sub = u_chunk_all_cpu[c0:c1]
+                        torch.index_select(self.w2_gu_cpu, 0, u_sub, out=pbuf["cpu_w2_gu"][:c_len])
+                        torch.index_select(self.s2_gu_cpu, 0, u_sub, out=pbuf["cpu_s2_gu"][:c_len])
+                        torch.index_select(self.w2_d_cpu, 0, u_sub, out=pbuf["cpu_w2_d"][:c_len])
+                        torch.index_select(self.s2_d_cpu, 0, u_sub, out=pbuf["cpu_s2_d"][:c_len])
+                        pbuf["w2_gu_u8"][:c_len].copy_(pbuf["cpu_w2_gu"][:c_len], non_blocking=False)
+                        pbuf["s2_gu_fp8"][:c_len].copy_(pbuf["cpu_s2_gu"][:c_len], non_blocking=False)
+                        pbuf["w2_d_u8"][:c_len].copy_(pbuf["cpu_w2_d"][:c_len], non_blocking=False)
+                        pbuf["s2_d_fp8"][:c_len].copy_(pbuf["cpu_s2_d"][:c_len], non_blocking=False)
+                        w2_gu_src, s2_gu_src = pbuf["w2_gu_u8"], pbuf["s2_gu_fp8"]
+                        w2_d_src, s2_d_src = pbuf["w2_d_u8"], pbuf["s2_d_fp8"]
+                        b_slot_c = (inv_idx[sel_mask] - c0).to(torch.int32)
+                    else:
+                        w2_gu_src, s2_gu_src = self.w2_gu_u8, self.s2_gu_fp8
+                        w2_d_src, s2_d_src = self.w2_d_u8, self.s2_d_fp8
+                        b_slot_c = cold_s2[sel_mask].to(torch.int32)
+
+                    if has_healer and self.healer_on_cpu and self.healer_u_gu_cpu is not None and u_chunk_all_cpu is not None:
+                        u_sub = u_chunk_all_cpu[c0:c1]
+                        torch.index_select(self.healer_u_gu_cpu, 0, u_sub, out=pbuf["cpu_h_u_gu"][:c_len])
+                        torch.index_select(self.healer_v_gu_cpu, 0, u_sub, out=pbuf["cpu_h_v_gu"][:c_len])
+                        torch.index_select(self.healer_u_d_cpu, 0, u_sub, out=pbuf["cpu_h_u_d"][:c_len])
+                        torch.index_select(self.healer_v_d_cpu, 0, u_sub, out=pbuf["cpu_h_v_d"][:c_len])
+                        pbuf["healer_u_gu"][:c_len].copy_(pbuf["cpu_h_u_gu"][:c_len], non_blocking=False)
+                        pbuf["healer_v_gu"][:c_len].copy_(pbuf["cpu_h_v_gu"][:c_len], non_blocking=False)
+                        pbuf["healer_u_d"][:c_len].copy_(pbuf["cpu_h_u_d"][:c_len], non_blocking=False)
+                        pbuf["healer_v_d"][:c_len].copy_(pbuf["cpu_h_v_d"][:c_len], non_blocking=False)
+                        h_ugu_src, h_vgu_src = pbuf["healer_u_gu"], pbuf["healer_v_gu"]
+                        h_ud_src, h_vd_src = pbuf["healer_u_d"], pbuf["healer_v_d"]
+                        h_slot_c = (inv_idx[sel_mask] - c0).to(torch.int32)
+                    elif has_healer:
+                        assert self.healer_u_gu is not None and self.healer_v_gu is not None
+                        assert self.healer_u_d is not None and self.healer_v_d is not None
+                        h_ugu_src, h_vgu_src = self.healer_u_gu, self.healer_v_gu
+                        h_ud_src, h_vd_src = self.healer_u_d, self.healer_v_d
+                        h_slot_c = cold_s2[sel_mask].to(torch.int32)
+                    else:
+                        h_ugu_src = h_vgu_src = h_ud_src = h_vd_src = self.w4_gu_u8
+                        h_slot_c = b_slot_c
+
+                    gates_c = cold_gates[sel_mask]
+                    order_c = torch.argsort(b_slot_c)
+                    tok_c = tok_c[order_c].contiguous()
+                    b_slot_c = b_slot_c[order_c].contiguous()
+                    h_slot_c = h_slot_c[order_c].contiguous()
+                    gates_c = gates_c[order_c].contiguous()
+
+                    n_pc = tok_c.numel()
+                    for p0 in range(0, n_pc, max_pairs):
+                        p1 = min(n_pc, p0 + max_pairs)
+                        m_len = p1 - p0
+                        tok_p = tok_c[p0:p1]
+                        bslot_p = b_slot_c[p0:p1]
+                        hslot_p = h_slot_c[p0:p1]
+                        gates_p = gates_c[p0:p1]
+                        if has_healer:
+                            _triton_dsv41_pair_healer_v_kernel[(4, m_len)](
+                                x,
+                                h_vgu_src,
+                                tok_p,
+                                hslot_p,
+                                h_mid_buf[:m_len],
+                                D_IN=5120,
+                                X_BY_PAIR=False,
+                                BLOCK_K=128,
+                                num_warps=4,
+                            )
+                        _triton_dsv41_pair_t2_gu_swiglu_kernel[(2304 // 8, m_len)](
+                            x,
+                            w2_gu_src,
+                            s2_gu_src,
+                            tok_p,
+                            bslot_p,
+                            gates_p,
+                            self._tier_cfg_gpu,
+                            h_ugu_src,
+                            h_mid_buf[:m_len],
+                            hslot_p,
+                            act_inter_buf[:m_len],
+                            float(self.swiglu_limit),
+                            N_INTER=2304,
+                            N_GROUPS_K2=80,
+                            BLOCK_N=8,
+                            sub_groups_k2=4,
+                            TIER2_TERNARY=self.tier2_ternary,
+                            HAS_HEALER=has_healer,
+                            num_warps=4,
+                        )
+                        if has_healer:
+                            _triton_dsv41_pair_healer_v_kernel[(4, m_len)](
+                                act_inter_buf[:m_len],
+                                h_vd_src,
+                                tok_p,
+                                hslot_p,
+                                h_mid_buf[:m_len],
+                                D_IN=2304,
+                                X_BY_PAIR=True,
+                                BLOCK_K=128,
+                                num_warps=4,
+                            )
+                        _triton_dsv41_pair_t2_down_kernel[(5120 // 8, m_len)](
+                            act_inter_buf[:m_len],
+                            w2_d_src,
+                            s2_d_src,
+                            bslot_p,
+                            h_ud_src,
+                            h_mid_buf[:m_len],
+                            hslot_p,
+                            y_pair_buf[:m_len],
+                            D_OUT=5120,
+                            N_GROUPS_K2=36,
+                            BLOCK_D=8,
+                            sub_groups_k2=4,
+                            TIER2_TERNARY=self.tier2_ternary,
+                            HAS_HEALER=has_healer,
+                            num_warps=8,
+                        )
+                        if n_toks <= 64:
+                            mask_f = (
+                                tok_p.unsqueeze(0)
+                                == torch.arange(n_toks, device=x.device, dtype=tok_p.dtype).unsqueeze(1)
+                            ).to(torch.float32)
+                            out_y_f32.addmm_(mask_f, y_pair_buf[:m_len])
+                        else:
+                            out_y_f32.index_add_(0, tok_p.long(), y_pair_buf[:m_len])
+
+            out_y = out_y_f32.to(torch.bfloat16)
             if self.r_basis is not None:
                 rb = self.r_basis.to(out_y.dtype)
                 out_y.addmm_(out_y @ rb.T, rb, beta=1.0, alpha=-1.0)

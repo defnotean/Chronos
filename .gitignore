@@ -22,3 +22,7 @@ Chimera-LSA/
 # GLM-5.3 Chronos test work dirs (synthetic checkpoints / downloaded source shards)
 .glm53_synth/
 .glm53_real_layer/
+
+# Large benchmark dataset caches (>100 MB; exceeds GitHub file limit)
+results/dsv41_v8_lcb_questions.json
+

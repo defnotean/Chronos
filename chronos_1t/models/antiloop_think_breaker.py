@@ -423,26 +423,23 @@ def _antiloop_think_kernel_dsv41(
     m4 = m3 & v_m4 & (prev4 == t4)
     m5 = m4 & v_m5 & (prev5 == t5)
 
-    prose_m2 = think_closed & (~in_code_block) & m2 & (offs >= (WIN_SIZE - 96)) & ((t1 >= 1050) | (t2 >= 1050))
-
+    # Only penalize repeated 4/5-grams (never single prior 2/3-grams) so multi-token
+    # identifiers like `TokenBucketRateLimiter` or `collections.OrderedDict` are never corrupted.
     pen_ngram = tl.where(
         m5,
         tl.where(in_code_block, -12.0, -18.0),
         tl.where(
             m4,
             tl.where(in_code_block, -6.0, -14.0),
-            tl.where(
-                (~in_code_block) & think_closed & m3,
-                -10.0,
-                tl.where(prose_m2, -6.5, 0.0),
-            ),
+            0.0,
         ),
     )
-    has_pen_ngram = (m5 | m4 | ((~in_code_block) & think_closed & m3) | prose_m2) & valid_pen_tok
+    has_pen_ngram = (m5 | m4) & valid_pen_tok
     tl.atomic_add(row_logits_ptr + tl.maximum(win_tok, 0), pen_ngram.to(tl.bfloat16), mask=has_pen_ngram)
 
     if in_code_block:
-        # Prevent multi-line triple-quote docstring and comment prose loops inside code blocks
+        # Prevent multi-line triple-quote docstring loops inside code blocks while preserving
+        # standard Python `#` comments (`5`, `372`) and indentation/space tokens (`223`, `262`).
         tl.atomic_add(row_logits_ptr + 16786, tl.full((), -15.0, dtype=tl.bfloat16))
         tl.atomic_add(row_logits_ptr + 26495, tl.full((), -15.0, dtype=tl.bfloat16))
         tl.atomic_add(row_logits_ptr + 26712, tl.full((), -15.0, dtype=tl.bfloat16))
@@ -455,8 +452,6 @@ def _antiloop_think_kernel_dsv41(
         tl.atomic_add(row_logits_ptr + 68612, tl.full((), -15.0, dtype=tl.bfloat16))
         tl.atomic_add(row_logits_ptr + 77319, tl.full((), -15.0, dtype=tl.bfloat16))
         tl.atomic_add(row_logits_ptr + 90268, tl.full((), -15.0, dtype=tl.bfloat16))
-        tl.atomic_add(row_logits_ptr + 5, tl.full((), -15.0, dtype=tl.bfloat16))
-        tl.atomic_add(row_logits_ptr + 372, tl.full((), -15.0, dtype=tl.bfloat16))
         tl.atomic_add(row_logits_ptr + 795, tl.full((), -15.0, dtype=tl.bfloat16))
         tl.atomic_add(row_logits_ptr + 1536, tl.full((), -15.0, dtype=tl.bfloat16))
         tl.atomic_add(row_logits_ptr + 1823, tl.full((), -15.0, dtype=tl.bfloat16))
@@ -484,15 +479,6 @@ def _antiloop_think_kernel_dsv41(
         # Block placeholder ellipsis inside code blocks so complete implementations are emitted
         tl.atomic_add(row_logits_ptr + 1613, tl.full((), -18.0, dtype=tl.bfloat16))
         tl.atomic_add(row_logits_ptr + 4588, tl.full((), -18.0, dtype=tl.bfloat16))
-        # Block two-space inline comment prefix '  ' (262) and trailing ' ' (223) after non-operators
-        tl.atomic_add(row_logits_ptr + 262, tl.full((), -18.0, dtype=tl.bfloat16))
-        is_op_or_kw = (
-            (t1 == 438) | (t1 == 565) | (t1 == 940) | (t1 == 1915)
-            | (t1 == 11) | (t1 == 25) | (t1 == 898) | (t1 == 1621)
-            | (t1 == 3465) | (t1 == 3767) | (t1 == 1897) | (t1 == 5356)
-        )
-        if ~is_op_or_kw:
-            tl.atomic_add(row_logits_ptr + 223, tl.full((), -18.0, dtype=tl.bfloat16))
         # On single-function tasks (~prompt_has_class), block nested 'def' inside indented function body
         if (~prompt_has_class) & ((t1 == 290) | (t1 == 361) | (t1 == 385) | (t1 == 528)):
             tl.atomic_add(row_logits_ptr + 3465, tl.full((), -18.0, dtype=tl.bfloat16))
@@ -505,23 +491,15 @@ def _antiloop_think_kernel_dsv41(
         tl.atomic_add(row_logits_ptr + 2605, tl.full((), -8.0, dtype=tl.bfloat16))
         if t1 == 2605:
             tl.atomic_add(row_logits_ptr + 201, tl.full((), 14.0, dtype=tl.bfloat16))
-        # Disallow BPE-invalid consecutive space tokens right after an indentation token
-        if (t1 == 290) | (t1 == 361) | (t1 == 385) | (t1 == 528) | (t1 == 775) | (t1 == 9212) | (t1 == 1032) | (t1 == 1507):
-            tl.atomic_add(row_logits_ptr + 223, tl.full((), -15.0, dtype=tl.bfloat16))
-            tl.atomic_add(row_logits_ptr + 262, tl.full((), -15.0, dtype=tl.bfloat16))
-            tl.atomic_add(row_logits_ptr + 290, tl.full((), -15.0, dtype=tl.bfloat16))
-            tl.atomic_add(row_logits_ptr + 361, tl.full((), -15.0, dtype=tl.bfloat16))
         # Cleanly close the code fence right after a self-contained `return sorted(...)` body finishes
         if (t3 == 24216) & ((t1 == 868) | (t1 == 797)):
             tl.atomic_add(row_logits_ptr + 9854, tl.full((), 25.0, dtype=tl.bfloat16))
 
     if fence_cnt >= 2:
         tl.atomic_add(row_logits_ptr + 9854, tl.full((), -20.0, dtype=tl.bfloat16))
-        if prompt_has_fence:
+        if prompt_has_fence | prompt_has_python:
             tl.store(row_logits_ptr + 1, tl.full((), 1000.0, dtype=tl.bfloat16))
-        elif gen_len < 165:
-            tl.store(row_logits_ptr + 1, tl.full((), -1000.0, dtype=tl.bfloat16))
-            tl.store(row_logits_ptr + 128805, tl.full((), -1000.0, dtype=tl.bfloat16))
+            tl.store(row_logits_ptr + 128805, tl.full((), 900.0, dtype=tl.bfloat16))
 
     is_prior = offs < (WIN_SIZE - 1)
     not_digit_t1 = (t1 < 18) | (t1 > 27)
@@ -602,17 +580,13 @@ def _antiloop_think_kernel_dsv41(
             tl.atomic_add(row_logits_ptr + 36490, tl.full((), 22.0, dtype=tl.bfloat16))
         elif prompt_has_python & (post_think_len == 3) & (t1 == 36490):
             tl.atomic_add(row_logits_ptr + 201, tl.full((), 22.0, dtype=tl.bfloat16))
-        elif (~in_code_block) & (post_think_len >= 80) & (
-            (prior_6gram >= 3) | (prior_6gram_all >= 4) | (prior_4gram >= 5) | stutter_4 | tandem_2 | tandem_3
+        elif (~in_code_block) & (post_think_len >= 24) & (
+            (prior_6gram >= 2) | (prior_4gram >= 3) | stutter_4 | tandem_2 | tandem_3
         ):
             tl.store(row_logits_ptr + 1, tl.full((), 1000.0, dtype=tl.bfloat16))
 
     # 4. Sentence-boundary-aware </think> transition so <think> never cuts off mid-clause or mid-question
-    eff_budget = tl.where(
-        prompt_has_python | (prefill_len >= 240),
-        32,
-        tl.where((prefill_len >= 108) & (prefill_len < 240), think_budget, 52),
-    )
+    eff_budget = think_budget
     is_sent_end = (
         (t1 == 16) | (t1 == 797) | (t1 == 2655) | (t1 == 3305)
         | (t1 == 603) | (t1 == 339)
@@ -652,7 +626,7 @@ def _antiloop_think_kernel_dsv41(
 
 _BAD_UTF8_CACHE: dict[torch.device, torch.Tensor] = {}
 _LIVE_TIER_CFG_MTIME: float = 0.0
-_LIVE_THINK_BUDGET: int = 160
+_LIVE_THINK_BUDGET: int = 192
 
 
 def apply_antiloop_and_think_breaker(
@@ -660,7 +634,7 @@ def apply_antiloop_and_think_breaker(
     input_batch,
     req_states,
     s_ids: torch.Tensor,
-    think_budget: int = 160,
+    think_budget: int = 192,
 ) -> torch.Tensor:
     global _LIVE_TIER_CFG_MTIME, _LIVE_THINK_BUDGET
     try:

@@ -1,0 +1,45 @@
+{
+  "upgrade_48k": {
+    "upgraded": false,
+    "max_seq_len": 49152,
+    "free_vram_before_gib": 2.506,
+    "free_vram_after_gib": 2.506
+  },
+  "smoke_1_real_prompt_550_vs_300_250": {
+    "logits_cos": 0.987382,
+    "top1_full": 361,
+    "top1_chunked": 361,
+    "top1_match": true
+  },
+  "smoke_1b_12k_prefix_cache": {
+    "prefill_logits_finite": true,
+    "decode_at_12000_finite": true,
+    "turn1_reused": 0,
+    "turn1_prefilled": 11500,
+    "turn1_s": 67.884,
+    "turn2_reused": 11492,
+    "turn2_prefilled": 508,
+    "turn2_s": 4.209,
+    "prefill_speedup_x": 16.13,
+    "free_vram_after_12k_gib": 2.506
+  },
+  "smoke_2_greedy_reproducibility": {
+    "tokens": 128,
+    "run1_decode_tok_s": 14.17,
+    "run1_decode_s": 8.9636,
+    "run2_decode_tok_s": 14.14,
+    "run2_decode_s": 8.9825,
+    "exact_match": "128/128"
+  },
+  "measured_speculative_comparison_from_task_2360": {
+    "greedy_m1_cudagraph_tok_s": 14.6,
+    "speculative_m7_tok_s": 12.31,
+    "drafted_tokens": 75,
+    "accepted_tokens": 62,
+    "spec_accept_rate": 0.8267,
+    "verify_calls": 13,
+    "single_calls": 52,
+    "greedy_token_match": "95/128",
+    "decision": "use_speculative=False (M=1 CUDAGraph decode is 1.19x faster and 100% greedy deterministic)"
+  }
+}

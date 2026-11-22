@@ -1,0 +1,94 @@
+{
+  "arm": "A1",
+  "config": {
+    "description": "No think caps (max_think_tokens=0, mmlu_pro/gsm8k=2048, mmlu thinking=1024, 384 safety ceiling kept, routing logged)",
+    "kv_limit": 4096,
+    "ablate_guards": "0",
+    "think_ceiling": "",
+    "log_routing": "1",
+    "suites": {
+      "mmlu": {
+        "thinking_mode": "thinking",
+        "max_new_tokens": 1024,
+        "max_think_tokens": 0
+      },
+      "mmlu_pro": {
+        "thinking_mode": "thinking",
+        "max_new_tokens": 2048,
+        "max_think_tokens": 0
+      },
+      "gsm8k": {
+        "thinking_mode": "thinking",
+        "max_new_tokens": 2048,
+        "max_think_tokens": 0
+      }
+    }
+  },
+  "status": "COMPLETE",
+  "elapsed_s": 993.73,
+  "total_n": 600,
+  "total_passed": 501,
+  "micro_pass_rate_pct": 83.5,
+  "micro_wilson_ci_95_pct": [
+    80.32,
+    86.26
+  ],
+  "macro_pass_rate_pct": 84.33,
+  "overall_mean_tokens": 249.21,
+  "overall_mean_think_tokens": 169.49,
+  "overall_think_forced_pct": 18.67,
+  "overall_think_unclosed_pct": 0.0,
+  "suites": {
+    "mmlu": {
+      "n": 300,
+      "passed": 243,
+      "pass_rate_pct": 81.0,
+      "wilson_ci_95_pct": [
+        76.18,
+        85.04
+      ],
+      "mean_tokens": 174.86,
+      "mean_think_tokens": 136.8,
+      "think_forced_count": 40,
+      "think_forced_pct": 13.33,
+      "think_forced_among_thinking_pct": 13.33,
+      "think_unclosed_count": 0,
+      "think_unclosed_pct": 0.0,
+      "mean_decode_tok_s": 14.83
+    },
+    "mmlu_pro": {
+      "n": 150,
+      "passed": 119,
+      "pass_rate_pct": 79.33,
+      "wilson_ci_95_pct": [
+        72.16,
+        85.04
+      ],
+      "mean_tokens": 341.19,
+      "mean_think_tokens": 227.81,
+      "think_forced_count": 53,
+      "think_forced_pct": 35.33,
+      "think_forced_among_thinking_pct": 35.33,
+      "think_unclosed_count": 0,
+      "think_unclosed_pct": 0.0,
+      "mean_decode_tok_s": 14.77
+    },
+    "gsm8k": {
+      "n": 150,
+      "passed": 139,
+      "pass_rate_pct": 92.67,
+      "wilson_ci_95_pct": [
+        87.35,
+        95.86
+      ],
+      "mean_tokens": 305.92,
+      "mean_think_tokens": 176.55,
+      "think_forced_count": 19,
+      "think_forced_pct": 12.67,
+      "think_forced_among_thinking_pct": 12.67,
+      "think_unclosed_count": 0,
+      "think_unclosed_pct": 0.0,
+      "mean_decode_tok_s": 15.32
+    }
+  }
+}

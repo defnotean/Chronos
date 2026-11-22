@@ -1,0 +1,396 @@
+{
+  "arms": {
+    "A0": {
+      "total_n": 600,
+      "total_passed": 495,
+      "micro_pass_rate_pct": 82.5,
+      "micro_wilson_ci95_pct": [
+        79.26,
+        85.33
+      ],
+      "macro_pass_rate_pct": 82.78,
+      "mean_tokens": 148.89,
+      "mean_think_tokens": 102.62,
+      "think_forced_count": 88,
+      "think_forced_pct": 14.67,
+      "by_suite": {
+        "mmlu": {
+          "n": 300,
+          "passed": 245,
+          "pass_rate_pct": 81.67,
+          "wilson_ci95_pct": [
+            76.9,
+            85.64
+          ],
+          "mean_tokens": 1.04,
+          "mean_think_tokens": 0.0,
+          "think_forced_count": 0,
+          "think_forced_pct": 0.0,
+          "mean_tok_s": 16.47,
+          "delta_vs_A0_pp": 0.0
+        },
+        "mmlu_pro": {
+          "n": 150,
+          "passed": 112,
+          "pass_rate_pct": 74.67,
+          "wilson_ci95_pct": [
+            67.15,
+            80.95
+          ],
+          "mean_tokens": 291.15,
+          "mean_think_tokens": 229.74,
+          "think_forced_count": 60,
+          "think_forced_pct": 40.0,
+          "mean_tok_s": 14.5,
+          "delta_vs_A0_pp": 0.0
+        },
+        "gsm8k": {
+          "n": 150,
+          "passed": 138,
+          "pass_rate_pct": 92.0,
+          "wilson_ci95_pct": [
+            86.54,
+            95.36
+          ],
+          "mean_tokens": 302.33,
+          "mean_think_tokens": 180.73,
+          "think_forced_count": 28,
+          "think_forced_pct": 18.67,
+          "mean_tok_s": 14.99,
+          "clean_rescore_passed": 142,
+          "clean_rescore_pct": 94.67,
+          "clean_rescore_ci95_pct": [
+            89.83,
+            97.27
+          ],
+          "delta_vs_A0_pp": 0.0
+        }
+      },
+      "delta_micro_vs_A0_pp": 0.0,
+      "delta_macro_vs_A0_pp": 0.0
+    },
+    "A1": {
+      "total_n": 600,
+      "total_passed": 501,
+      "micro_pass_rate_pct": 83.5,
+      "micro_wilson_ci95_pct": [
+        80.32,
+        86.26
+      ],
+      "macro_pass_rate_pct": 84.33,
+      "mean_tokens": 249.21,
+      "mean_think_tokens": 169.49,
+      "think_forced_count": 112,
+      "think_forced_pct": 18.67,
+      "by_suite": {
+        "mmlu": {
+          "n": 300,
+          "passed": 243,
+          "pass_rate_pct": 81.0,
+          "wilson_ci95_pct": [
+            76.18,
+            85.04
+          ],
+          "mean_tokens": 174.86,
+          "mean_think_tokens": 136.8,
+          "think_forced_count": 40,
+          "think_forced_pct": 13.33,
+          "mean_tok_s": 14.83,
+          "delta_vs_A0_pp": -0.67
+        },
+        "mmlu_pro": {
+          "n": 150,
+          "passed": 119,
+          "pass_rate_pct": 79.33,
+          "wilson_ci95_pct": [
+            72.16,
+            85.04
+          ],
+          "mean_tokens": 341.19,
+          "mean_think_tokens": 227.81,
+          "think_forced_count": 53,
+          "think_forced_pct": 35.33,
+          "mean_tok_s": 14.77,
+          "delta_vs_A0_pp": 4.66
+        },
+        "gsm8k": {
+          "n": 150,
+          "passed": 139,
+          "pass_rate_pct": 92.67,
+          "wilson_ci95_pct": [
+            87.35,
+            95.86
+          ],
+          "mean_tokens": 305.92,
+          "mean_think_tokens": 176.55,
+          "think_forced_count": 19,
+          "think_forced_pct": 12.67,
+          "mean_tok_s": 15.32,
+          "clean_rescore_passed": 142,
+          "clean_rescore_pct": 94.67,
+          "clean_rescore_ci95_pct": [
+            89.83,
+            97.27
+          ],
+          "delta_vs_A0_pp": 0.67
+        }
+      },
+      "delta_micro_vs_A0_pp": 1.0,
+      "delta_macro_vs_A0_pp": 1.55
+    },
+    "A2": {
+      "total_n": 600,
+      "total_passed": 510,
+      "micro_pass_rate_pct": 85.0,
+      "micro_wilson_ci95_pct": [
+        81.92,
+        87.63
+      ],
+      "macro_pass_rate_pct": 86.11,
+      "mean_tokens": 133.85,
+      "mean_think_tokens": 90.25,
+      "think_forced_count": 54,
+      "think_forced_pct": 9.0,
+      "by_suite": {
+        "mmlu": {
+          "n": 300,
+          "passed": 245,
+          "pass_rate_pct": 81.67,
+          "wilson_ci95_pct": [
+            76.9,
+            85.64
+          ],
+          "mean_tokens": 1.04,
+          "mean_think_tokens": 0.0,
+          "think_forced_count": 0,
+          "think_forced_pct": 0.0,
+          "mean_tok_s": 16.47,
+          "delta_vs_A0_pp": 0.0
+        },
+        "mmlu_pro": {
+          "n": 150,
+          "passed": 122,
+          "pass_rate_pct": 81.33,
+          "wilson_ci95_pct": [
+            74.34,
+            86.76
+          ],
+          "mean_tokens": 262.07,
+          "mean_think_tokens": 207.65,
+          "think_forced_count": 43,
+          "think_forced_pct": 28.67,
+          "mean_tok_s": 14.8,
+          "delta_vs_A0_pp": 6.66
+        },
+        "gsm8k": {
+          "n": 150,
+          "passed": 143,
+          "pass_rate_pct": 95.33,
+          "wilson_ci95_pct": [
+            90.68,
+            97.72
+          ],
+          "mean_tokens": 271.25,
+          "mean_think_tokens": 153.33,
+          "think_forced_count": 11,
+          "think_forced_pct": 7.33,
+          "mean_tok_s": 15.26,
+          "clean_rescore_passed": 145,
+          "clean_rescore_pct": 96.67,
+          "clean_rescore_ci95_pct": [
+            92.43,
+            98.57
+          ],
+          "delta_vs_A0_pp": 3.33
+        }
+      },
+      "delta_micro_vs_A0_pp": 2.5,
+      "delta_macro_vs_A0_pp": 3.33
+    },
+    "A_unleashed": {
+      "total_n": 600,
+      "total_passed": 514,
+      "micro_pass_rate_pct": 85.67,
+      "micro_wilson_ci95_pct": [
+        82.64,
+        88.24
+      ],
+      "macro_pass_rate_pct": 86.67,
+      "mean_tokens": 361.5,
+      "mean_think_tokens": 305.57,
+      "think_forced_count": 22,
+      "think_forced_pct": 3.67,
+      "by_suite": {
+        "mmlu": {
+          "n": 300,
+          "passed": 248,
+          "pass_rate_pct": 82.67,
+          "wilson_ci95_pct": [
+            77.98,
+            86.53
+          ],
+          "mean_tokens": 258.79,
+          "mean_think_tokens": 233.0,
+          "think_forced_count": 12,
+          "think_forced_pct": 4.0,
+          "mean_tok_s": 14.87,
+          "delta_vs_A0_pp": 1.0
+        },
+        "mmlu_pro": {
+          "n": 150,
+          "passed": 123,
+          "pass_rate_pct": 82.0,
+          "wilson_ci95_pct": [
+            75.08,
+            87.32
+          ],
+          "mean_tokens": 610.37,
+          "mean_think_tokens": 560.35,
+          "think_forced_count": 10,
+          "think_forced_pct": 6.67,
+          "mean_tok_s": 14.6,
+          "delta_vs_A0_pp": 7.33
+        },
+        "gsm8k": {
+          "n": 150,
+          "passed": 143,
+          "pass_rate_pct": 95.33,
+          "wilson_ci95_pct": [
+            90.68,
+            97.72
+          ],
+          "mean_tokens": 318.05,
+          "mean_think_tokens": 195.93,
+          "think_forced_count": 0,
+          "think_forced_pct": 0.0,
+          "mean_tok_s": 15.17,
+          "clean_rescore_passed": 143,
+          "clean_rescore_pct": 95.33,
+          "clean_rescore_ci95_pct": [
+            90.68,
+            97.72
+          ],
+          "delta_vs_A0_pp": 3.33
+        }
+      },
+      "delta_micro_vs_A0_pp": 3.17,
+      "delta_macro_vs_A0_pp": 3.89
+    }
+  },
+  "mcnemar_vs_A0": {
+    "A1": {
+      "overall": {
+        "n_paired": 600,
+        "both_pass": 446,
+        "both_fail": 50,
+        "b_A0_fail_arm_pass": 55,
+        "c_A0_pass_arm_fail": 49,
+        "net_diff": 6,
+        "exact_p_two_sided": 0.624144
+      },
+      "mmlu": {
+        "n_paired": 300,
+        "both_pass": 210,
+        "both_fail": 22,
+        "b_A0_fail_arm_pass": 33,
+        "c_A0_pass_arm_fail": 35,
+        "net_diff": -2,
+        "exact_p_two_sided": 0.903597
+      },
+      "mmlu_pro": {
+        "n_paired": 150,
+        "both_pass": 106,
+        "both_fail": 25,
+        "b_A0_fail_arm_pass": 13,
+        "c_A0_pass_arm_fail": 6,
+        "net_diff": 7,
+        "exact_p_two_sided": 0.167068
+      },
+      "gsm8k": {
+        "n_paired": 150,
+        "both_pass": 130,
+        "both_fail": 3,
+        "b_A0_fail_arm_pass": 9,
+        "c_A0_pass_arm_fail": 8,
+        "net_diff": 1,
+        "exact_p_two_sided": 1.0
+      }
+    },
+    "A2": {
+      "overall": {
+        "n_paired": 600,
+        "both_pass": 478,
+        "both_fail": 73,
+        "b_A0_fail_arm_pass": 32,
+        "c_A0_pass_arm_fail": 17,
+        "net_diff": 15,
+        "exact_p_two_sided": 0.044384
+      },
+      "mmlu": {
+        "n_paired": 300,
+        "both_pass": 238,
+        "both_fail": 48,
+        "b_A0_fail_arm_pass": 7,
+        "c_A0_pass_arm_fail": 7,
+        "net_diff": 0,
+        "exact_p_two_sided": 1.0
+      },
+      "mmlu_pro": {
+        "n_paired": 150,
+        "both_pass": 106,
+        "both_fail": 22,
+        "b_A0_fail_arm_pass": 16,
+        "c_A0_pass_arm_fail": 6,
+        "net_diff": 10,
+        "exact_p_two_sided": 0.052479
+      },
+      "gsm8k": {
+        "n_paired": 150,
+        "both_pass": 134,
+        "both_fail": 3,
+        "b_A0_fail_arm_pass": 9,
+        "c_A0_pass_arm_fail": 4,
+        "net_diff": 5,
+        "exact_p_two_sided": 0.266846
+      }
+    },
+    "A_unleashed": {
+      "overall": {
+        "n_paired": 600,
+        "both_pass": 462,
+        "both_fail": 53,
+        "b_A0_fail_arm_pass": 52,
+        "c_A0_pass_arm_fail": 33,
+        "net_diff": 19,
+        "exact_p_two_sided": 0.050251
+      },
+      "mmlu": {
+        "n_paired": 300,
+        "both_pass": 219,
+        "both_fail": 26,
+        "b_A0_fail_arm_pass": 29,
+        "c_A0_pass_arm_fail": 26,
+        "net_diff": 3,
+        "exact_p_two_sided": 0.787706
+      },
+      "mmlu_pro": {
+        "n_paired": 150,
+        "both_pass": 108,
+        "both_fail": 23,
+        "b_A0_fail_arm_pass": 15,
+        "c_A0_pass_arm_fail": 4,
+        "net_diff": 11,
+        "exact_p_two_sided": 0.019211
+      },
+      "gsm8k": {
+        "n_paired": 150,
+        "both_pass": 135,
+        "both_fail": 4,
+        "b_A0_fail_arm_pass": 8,
+        "c_A0_pass_arm_fail": 3,
+        "net_diff": 5,
+        "exact_p_two_sided": 0.226562
+      }
+    }
+  }
+}

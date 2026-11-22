@@ -1,0 +1,41 @@
+{
+  "captured_at": "2026-11-20T07:39:00-05:00",
+  "purpose": "Exact pre-ablation baseline settings recorded prior to Step 1 edits.",
+  "benchmarks/run_dsv41_full_long_benchmarks.py": {
+    "kv_limit": 2048,
+    "suites": {
+      "terminal": {"thinking_mode": "thinking", "max_new_tokens": 512, "max_think_tokens": 0},
+      "automation": {"thinking_mode": "chat", "max_new_tokens": 220, "max_think_tokens": 0},
+      "babyvision": {"thinking_mode": "thinking", "max_new_tokens": 512, "max_think_tokens": 0},
+      "humaneval": {"thinking_mode": "thinking", "max_new_tokens": 768, "max_think_tokens": 0},
+      "mbpp": {"thinking_mode": "thinking", "max_new_tokens": 768, "max_think_tokens": 0},
+      "apex": {"thinking_mode": "thinking", "max_new_tokens": 768, "max_think_tokens": 0},
+      "math": {"thinking_mode": "thinking", "max_new_tokens": 768, "max_think_tokens": 0},
+      "ale": {"thinking_mode": "thinking", "max_new_tokens": 768, "max_think_tokens": 0},
+      "zerobench": {"thinking_mode": "thinking", "max_new_tokens": 768, "max_think_tokens": 0},
+      "swe": {"thinking_mode": "thinking", "max_new_tokens": 768, "max_think_tokens": 0},
+      "chart": {"thinking_mode": "thinking", "max_new_tokens": 512, "max_think_tokens": 0},
+      "mmlu": {"thinking_mode": "chat", "max_new_tokens": 12, "max_think_tokens": 0},
+      "mmlu_pro": {
+        "thinking_mode": "thinking",
+        "max_new_tokens": 768,
+        "max_think_tokens": 0,
+        "historical_note": "Earlier 60-item run (63.33%) used max_new_tokens=256, max_think_tokens=128 before step 1163."
+      },
+      "gsm8k": {
+        "thinking_mode": "thinking",
+        "max_new_tokens": 768,
+        "max_think_tokens": 0,
+        "historical_note": "Earlier 60-item run (83.33%) used max_new_tokens=320, max_think_tokens=160 before step 1163."
+      },
+      "harmbench": {"thinking_mode": "chat", "max_new_tokens": 96, "max_think_tokens": 0}
+    }
+  },
+  "scripts/run_40layer_chimera_dsv41_a100.py": {
+    "max_seq_len": "int(os.environ.get('CHRONOS_MAX_SEQ_LEN', '4096')) == 4096",
+    "eff_think_budget_formula": "max_think_tokens if max_think_tokens > 0 else (min(384, max(128, max_new_tokens // 2)) if in_think else 0)",
+    "over_budget_trigger": "eff_think_budget > 0 and think_tok_count >= eff_think_budget and (at_sent or rep_hit or think_tok_count >= eff_think_budget + 16)",
+    "rep_thresh": "5 if in_code else 1 (inside <think>, in_code is False so rep_thresh == 1, plus norm_fourgrams -12.0 penalty)",
+    "should_close_early": "think_tok_count >= 48 and at_sent and rep_hit (where at_sent checks suffix in ('.', '!', '?', '\\n', ':') and rep_hit checks any cnt >= 2 in fourgram_counts[trig])"
+  }
+}

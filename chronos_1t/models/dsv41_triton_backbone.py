@@ -18,6 +18,7 @@ Provides drop-in Triton accelerations for the standalone DeepSeek-V4.1-Flash-101
 """
 from __future__ import annotations
 
+import builtins
 from typing import Any
 import torch
 import torch.nn as nn
@@ -546,7 +547,10 @@ def _get_block_decode_bufs(dev: torch.device) -> dict[str, Any]:
     return b
 
 
-_hc_block_bufs: dict[torch.device, dict[str, Any]] = {}
+_hc_block_bufs: dict[torch.device, dict[str, Any]] | None = getattr(builtins, "_CHRONOS_HC_BLOCK_BUFS", None)
+if _hc_block_bufs is None:
+    _hc_block_bufs = {}
+    builtins._CHRONOS_HC_BLOCK_BUFS = _hc_block_bufs
 
 
 def fast_block_forward(
@@ -557,7 +561,7 @@ def fast_block_forward(
     image_mask: torch.Tensor | None,
     *attn_args: Any,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if x.is_cuda and x.dtype == torch.bfloat16 and x.is_contiguous() and self.hc_mult == 4 and self.engram is None:
+    if x.is_cuda and x.dtype == torch.bfloat16 and x.is_contiguous() and self.hc_mult == 4:
         b, s, _, d = x.shape
         n_toks = b * s
         if n_toks == 1 and d == 5120 and image_mask is None and start_pos > 0:
@@ -649,12 +653,18 @@ def fast_block_forward(
                     num_warps=4,
                 )
 
-            use_cg = (
-                getattr(self.ffn, "w1_gu_u8", None) is None
-                or self.ffn.w1_gu_u8.is_cuda
-                or (not getattr(self.ffn, "t3_on_cpu", False))
-                or getattr(self.ffn, "_active_mt3", 6) == 0
+            t3_needs_cpu_sync = (
+                getattr(self.ffn, "t3_on_cpu", False)
+                and getattr(self.ffn, "_active_mt3", 6) != 0
+                and (getattr(self.ffn, "w1_gu_cpu", None) is None or not self.ffn.w1_gu_cpu.is_pinned())
             )
+            t2_needs_cpu_sync = getattr(self.ffn, "t2_on_cpu", False) and (
+                getattr(self.ffn, "w2_gu_cpu", None) is None or not self.ffn.w2_gu_cpu.is_pinned()
+            )
+            healer_needs_cpu_sync = getattr(self.ffn, "healer_on_cpu", False) and (
+                getattr(self.ffn, "healer_u_gu_cpu", None) is None or not self.ffn.healer_u_gu_cpu.is_pinned()
+            )
+            use_cg = not (t3_needs_cpu_sync or t2_needs_cpu_sync or healer_needs_cpu_sync)
             if not use_cg:
                 xa = _run_step1_and_attn()
                 _run_subblock2(xa)
@@ -664,43 +674,72 @@ def fast_block_forward(
             compress_len = ((start_pos + 1) // ratio) if ratio else 0
             can_full_graph = (not getattr(self.attn, "is_kv_source", False)) and (compress_len <= 512) and (not attn_args)
 
-            ffn_key = (id(self.ffn), getattr(self.ffn, "t3_on_cpu", False), id(self.attn))
-            if getattr(self, "_cg_ffn_key", None) != ffn_key:
-                self._cg_ffn_key = ffn_key
+            mt3 = int(getattr(self.ffn, "_active_mt3", 6))
+            ffn_fwd = getattr(self.ffn, "forward", None)
+            ffn_fwd_fn = getattr(ffn_fwd, "__func__", ffn_fwd)
+            base_key = (
+                id(self.ffn),
+                id(ffn_fwd_fn),
+                getattr(self.ffn, "t3_on_cpu", False),
+                id(self.attn),
+                bb["x_res_0"].data_ptr(),
+                bb["pos_gpu"].data_ptr(),
+                id(type(self.attn).forward),
+            )
+            ffn_key = (*base_key, mt3)
+            if getattr(self, "_cg_base_key", None) != base_key:
+                self._cg_base_key = base_key
+                self._cg_full_by_mt3 = {}
+                self._cg_sub2_by_mt3 = {}
+                self._cg_full_warmup_by_mt3 = {}
+                self._cg_sub2_warmup_by_mt3 = {}
+                self._cg_warmup_by_mt3 = self._cg_full_warmup_by_mt3
                 self._cg_full_block = None
                 self._cg_subblock2 = None
                 self._cg_warmup_count = 0
+            self._cg_ffn_key = ffn_key
 
             if can_full_graph:
-                cg_full = getattr(self, "_cg_full_block", None)
+                cg_full = self._cg_full_by_mt3.get(mt3)
                 if cg_full is not None:
+                    self._cg_full_block = cg_full
                     cg_full.replay()
                 else:
-                    if getattr(self, "_cg_warmup_count", 0) < 1:
+                    if self._cg_full_warmup_by_mt3.get(mt3, 0) < 1:
                         xa = _run_step1_and_attn()
                         _run_subblock2(xa)
-                        self._cg_warmup_count = getattr(self, "_cg_warmup_count", 0) + 1
+                        self._cg_full_warmup_by_mt3[mt3] = self._cg_full_warmup_by_mt3.get(mt3, 0) + 1
+                        self._cg_warmup_count = self._cg_full_warmup_by_mt3[mt3]
                     else:
                         g = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(g, pool=bb["graph_pool"]):
                             xa = _run_step1_and_attn()
                             _run_subblock2(xa)
+                        self._cg_full_by_mt3[mt3] = g
                         self._cg_full_block = g
                         g.replay()
                 return x_out_buf, pre_out_buf
 
             x_attn = _run_step1_and_attn()
-            cg = getattr(self, "_cg_subblock2", None)
+            # Stage attention output into a static buffer before subblock-2 CUDAGraph warmup/capture/replay,
+            # because orig_attn_forward (used when compress_len > 512) returns a freshly allocated tensor.
+            x_attn_buf = bb["x_attn"]
+            if x_attn.data_ptr() != x_attn_buf.data_ptr():
+                x_attn_buf.copy_(x_attn)
+            cg = self._cg_sub2_by_mt3.get(mt3)
             if cg is not None:
+                self._cg_subblock2 = cg
                 cg.replay()
             else:
-                if getattr(self, "_cg_warmup_count", 0) < 1:
-                    _run_subblock2(x_attn)
-                    self._cg_warmup_count = getattr(self, "_cg_warmup_count", 0) + 1
+                if self._cg_sub2_warmup_by_mt3.get(mt3, 0) < 1:
+                    _run_subblock2(x_attn_buf)
+                    self._cg_sub2_warmup_by_mt3[mt3] = self._cg_sub2_warmup_by_mt3.get(mt3, 0) + 1
+                    self._cg_warmup_count = self._cg_sub2_warmup_by_mt3[mt3]
                 else:
                     g = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(g, pool=bb["graph_pool"]):
-                        _run_subblock2(x_attn)
+                        _run_subblock2(x_attn_buf)
+                    self._cg_sub2_by_mt3[mt3] = g
                     self._cg_subblock2 = g
                     g.replay()
 
@@ -783,9 +822,6 @@ def fast_block_forward(
     residual = x
     attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
     x = self.hc_pre(x, pre_mix)
-    if self.engram is not None:
-        assert len(attn_args) >= 1
-        x = self.engram(x, attn_args[0])
     x = self.attn_norm(x)
     x = self.attn(x, start_pos, *attn_args)
     x = self.hc_post(x, residual, attn_post, attn_comb)
@@ -1292,16 +1328,21 @@ def install_dsv41_triton_backbone(dsv41_model_mod: Any, enable_direct_uva_t3: bo
         return orig_sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
 
     # Pre-allocated scratch buffers per CUDA device for zero-allocation decode attention
-    _decode_bufs: dict[torch.device, dict[str, torch.Tensor]] = {}
+    _decode_bufs: dict[torch.device, dict[str, torch.Tensor]] | None = getattr(
+        dsv41_model_mod, "_chronos_attn_decode_bufs", None
+    )
+    if _decode_bufs is None:
+        _decode_bufs = {}
+        dsv41_model_mod._chronos_attn_decode_bufs = _decode_bufs
 
     def _get_decode_bufs(dev: torch.device) -> dict[str, torch.Tensor]:
         b = _decode_bufs.get(dev)
-        if b is None or b["qr"].is_inference():
+        if b is None or b["qr"].is_inference() or b["scores"].size(-1) < 2048:
             with torch.inference_mode(False):
                 b = {
                     "qr": torch.empty((1, 1, 1280), dtype=torch.bfloat16, device=dev),
-                    "scores": torch.empty((64, 1024), dtype=torch.float32, device=dev),
-                    "p_bf16": torch.empty((64, 1024), dtype=torch.bfloat16, device=dev),
+                    "scores": torch.empty((64, 2048), dtype=torch.float32, device=dev),
+                    "p_bf16": torch.empty((64, 2048), dtype=torch.bfloat16, device=dev),
                     "inv_sum": torch.empty((64,), dtype=torch.float32, device=dev),
                     "o": torch.empty((1, 1, 64, 512), dtype=torch.bfloat16, device=dev),
                 }
@@ -1408,7 +1449,7 @@ def install_dsv41_triton_backbone(dsv41_model_mod: Any, enable_direct_uva_t3: bo
                     self.softmax_scale,
                     WIN_SIZE=win,
                     COMPRESS_RATIO=ratio_i,
-                    STRIDE_SCORES_H=1024,
+                    STRIDE_SCORES_H=2048,
                     num_warps=4,
                 )
                 _triton_mla_decode_out_rope_quant_tc_kernel[(8,)](
@@ -1421,7 +1462,7 @@ def install_dsv41_triton_backbone(dsv41_model_mod: Any, enable_direct_uva_t3: bo
                     pos_gpu,
                     WIN_SIZE=win,
                     COMPRESS_RATIO=ratio_i,
-                    STRIDE_SCORES_H=1024,
+                    STRIDE_SCORES_H=2048,
                     num_warps=4,
                 )
 

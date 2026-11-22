@@ -1,0 +1,21 @@
+{
+  "benchmark": "datacurve-ai/deep-swe v1.1 (Harbor)",
+  "updated_at_utc": "2026-11-21T09:23:35.476278+00:00",
+  "total_scheduled": 113,
+  "completed": 1,
+  "passed": 0,
+  "pass_rate_pct": 0.0,
+  "milestone25_completed": 1,
+  "milestone25_passed": 0,
+  "milestone25_pass_rate_pct": 0.0,
+  "mean_steps": 79.0,
+  "mean_elapsed_s": 2693.39,
+  "submitted_count": 0,
+  "by_language": {
+    "python": {
+      "n": 1,
+      "passed": 0,
+      "pass_rate_pct": 0.0
+    }
+  }
+}

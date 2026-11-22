@@ -18,12 +18,18 @@ import subprocess
 import sys
 import time
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 PROXY_URL = os.environ.get("CHRONOS_PROXY_URL", "http://127.0.0.1:18080/v1")
 DIRECT_URL = os.environ.get("CHRONOS_DIRECT_URL", "http://127.0.0.1:18080/v1")
 MODEL_NAME = os.environ.get("CHRONOS_MODEL_NAME", "deepseek-v4.1-flash")
-OUT_JSON = os.environ.get("CHRONOS_OUT_JSON", r"C:\Users\VPS\dsv41_vps_physical_benchmark_results.json")
+_DEFAULT_OUT_JSON = (
+    "/content/dsv41_vps_physical_benchmark_results.json"
+    if os.path.isdir("/content")
+    else str(Path(__file__).resolve().parent.parent / "results" / "dsv41_vps_physical_benchmark_results.json")
+)
+OUT_JSON = os.environ.get("CHRONOS_OUT_JSON", _DEFAULT_OUT_JSON)
 
 
 def _strip_think(text: str) -> tuple[str, str]:
@@ -735,6 +741,10 @@ def eval_core_4_opencode_and_concurrency() -> dict[str, Any]:
     except Exception as e:
         dt_oc = 0.0
         out_oc = str(e)
+    oc_tokens = 16
+    oc_tok_s = round(16.0 / max(dt_oc, 1e-6), 2)
+    oc_has_loop = False
+    oc_reasoning = ""
     if "READY_DSV41" not in out_oc:
         r_fb = chat_completion(
             [{"role": "user", "content": "Reply with the exact token READY_DSV41 and nothing else."}],
@@ -742,16 +752,20 @@ def eval_core_4_opencode_and_concurrency() -> dict[str, Any]:
         )
         out_oc = r_fb["content"] + " " + r_fb["reasoning"]
         dt_oc = r_fb["elapsed_s"]
+        oc_tokens = int(r_fb.get("completion_tokens", 0))
+        oc_tok_s = float(r_fb.get("tok_s", round(oc_tokens / max(dt_oc, 1e-6), 2)))
+        oc_has_loop = bool(r_fb.get("has_loop", False))
+        oc_reasoning = str(r_fb.get("reasoning", ""))
     p_oc = "READY_DSV41" in out_oc
     results.append({
         "id": "opencode_2_cli_ready",
         "passed": p_oc,
         "content": out_oc[:300],
-        "reasoning": "",
-        "completion_tokens": 16,
+        "reasoning": oc_reasoning[:300],
+        "completion_tokens": oc_tokens,
         "elapsed_s": dt_oc,
-        "tok_s": 18.5,
-        "has_loop": False,
+        "tok_s": oc_tok_s,
+        "has_loop": oc_has_loop,
     })
 
     # 3. 4-Stream Concurrent Batch Decode Throughput
@@ -890,18 +904,36 @@ def main() -> int:
     )
     conc_tok_s = suites_out[-1]["avg_tok_s"]
 
+    t1_slots = int(os.environ.get("CHRONOS_TIER1_4BIT_SLOTS", "52"))
+    t2_slots = int(os.environ.get("CHRONOS_TIER2_2BIT_SLOTS", "44"))
+    t3_slots = int(os.environ.get("CHRONOS_TIER3_1BIT_SLOTS", "288"))
+    opt_a_alpha = float(os.environ.get("CHRONOS_OPTION_A_ALPHA", "0.05"))
+    backend_name = os.environ.get("CHRONOS_BACKEND_NAME", "")
+    if not backend_name:
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _dev = _torch.cuda.get_device_name(0)
+                backend_name = f"Google Colab ({_dev})" if os.path.isdir("/content") else _dev
+        except Exception:
+            backend_name = ""
+    if not backend_name:
+        backend_name = "NVIDIA GB10 (DGX Spark, 121 GiB Unified Memory, SM120 Blackwell)"
+    hot_t12 = t1_slots + t2_slots
+    total_routed = t1_slots + t2_slots + t3_slots
+    hot_pct = round(100.0 * hot_t12 / max(total_routed, 1), 1)
     report = {
         "model": "defnoteatin/PseudoBrain-DeepSeek-V4.1-Flash-1017-Chronos-v7.5-Abliterated",
         "served_model": MODEL_NAME,
         "vps_hostname": platform.node(),
         "vps_os": platform.platform(),
-        "dgx_backend": "NVIDIA GB10 (DGX Spark, 121 GiB Unified Memory, SM120 Blackwell)",
+        "dgx_backend": backend_name,
         "tier_config": {
-            "tier1_4bit_slots": 56,
-            "tier2_2bit_slots": 40,
-            "tier3_1bit_slots": 144,
-            "option_a_alpha": 0.04,
-            "hot_experts_in_t1_t2": "96/96 (100%)",
+            "tier1_4bit_slots": t1_slots,
+            "tier2_2bit_slots": t2_slots,
+            "tier3_1bit_slots": t3_slots,
+            "option_a_alpha": opt_a_alpha,
+            "hot_experts_in_t1_t2": f"{hot_t12}/{total_routed} ({hot_pct}%)",
         },
         "summary": {
             "suites_passed": tot_passed_suites,

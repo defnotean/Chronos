@@ -1,0 +1,111 @@
+{
+  "model": "defnoteatin/PseudoBrain-DeepSeek-V4.1-Flash-1017-Chronos-v7.5-Abliterated",
+  "base_model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "evaluation_mode": "Genuine Autonomous 40-Layer Autoregressive Long-Run (Zero Thought Prefills, Zero Synthetic Vectors)",
+  "hardware": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "status": "COMPLETE",
+  "elapsed_wall_s": 962.83,
+  "official_11_benchmarks_440_real": {
+    "suites": [
+      "terminal",
+      "automation",
+      "babyvision",
+      "humaneval",
+      "mbpp",
+      "apex",
+      "math",
+      "ale",
+      "zerobench",
+      "swe",
+      "chart"
+    ],
+    "total_official_questions": 280,
+    "total_official_passed": 225,
+    "official_pass_rate_pct": 80.36,
+    "total_official_tokens": 73104
+  },
+  "total_tasks_evaluated": 834,
+  "total_tasks_passed": 729,
+  "overall_pass_rate_pct": 87.41,
+  "total_generated_tokens": 125731,
+  "vram_allocated_gib": 90.67,
+  "suites": {
+    "terminal": {
+      "tasks_completed": 40,
+      "tasks_passed": 39,
+      "accuracy_or_pass_rate_pct": 97.5,
+      "total_generated_tokens": 6821,
+      "mean_decode_tok_s": 15.98
+    },
+    "babyvision": {
+      "tasks_completed": 40,
+      "tasks_passed": 39,
+      "accuracy_or_pass_rate_pct": 97.5,
+      "total_generated_tokens": 5631,
+      "mean_decode_tok_s": 16.56
+    },
+    "humaneval": {
+      "tasks_completed": 40,
+      "tasks_passed": 34,
+      "accuracy_or_pass_rate_pct": 85.0,
+      "total_generated_tokens": 11609,
+      "mean_decode_tok_s": 16.06
+    },
+    "mbpp": {
+      "tasks_completed": 40,
+      "tasks_passed": 34,
+      "accuracy_or_pass_rate_pct": 85.0,
+      "total_generated_tokens": 10767,
+      "mean_decode_tok_s": 16.1
+    },
+    "automation": {
+      "tasks_completed": 40,
+      "tasks_passed": 40,
+      "accuracy_or_pass_rate_pct": 100.0,
+      "total_generated_tokens": 5726,
+      "mean_decode_tok_s": 17.37
+    },
+    "chart": {
+      "tasks_completed": 40,
+      "tasks_passed": 26,
+      "accuracy_or_pass_rate_pct": 65.0,
+      "total_generated_tokens": 2543,
+      "mean_decode_tok_s": 16.09
+    },
+    "mmlu": {
+      "tasks_completed": 114,
+      "tasks_passed": 96,
+      "accuracy_or_pass_rate_pct": 84.21,
+      "total_generated_tokens": 114,
+      "mean_decode_tok_s": 17.96
+    },
+    "mmlu_pro": {
+      "tasks_completed": 60,
+      "tasks_passed": 38,
+      "accuracy_or_pass_rate_pct": 63.33,
+      "total_generated_tokens": 8041,
+      "mean_decode_tok_s": 15.97
+    },
+    "gsm8k": {
+      "tasks_completed": 60,
+      "tasks_passed": 50,
+      "accuracy_or_pass_rate_pct": 83.33,
+      "total_generated_tokens": 13752,
+      "mean_decode_tok_s": 16.47
+    },
+    "harmbench": {
+      "tasks_completed": 320,
+      "tasks_passed": 320,
+      "accuracy_or_pass_rate_pct": 100.0,
+      "total_generated_tokens": 30720,
+      "mean_decode_tok_s": 16.03
+    },
+    "swe": {
+      "tasks_completed": 40,
+      "tasks_passed": 13,
+      "accuracy_or_pass_rate_pct": 32.5,
+      "total_generated_tokens": 30007,
+      "mean_decode_tok_s": 15.23
+    }
+  }
+}

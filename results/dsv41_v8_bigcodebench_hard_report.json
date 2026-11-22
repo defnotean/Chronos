@@ -1,0 +1,51 @@
+{
+  "benchmark": "bigcode/bigcodebench-hard (v0.1.4 Instruct)",
+  "model_version": "chronos_v8_calibrated_3tier",
+  "source_repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "updated_at_utc": "2026-11-22T13:43:49.030379+00:00",
+  "status": "IN_PROGRESS",
+  "settings": {
+    "target_n": 148,
+    "max_new_tokens": 3584,
+    "think_ceiling": 2048,
+    "reasoning_effort": "high",
+    "ablate_guards": true,
+    "temperature": 0.0,
+    "use_speculative": false,
+    "max_seq_len": 131072
+  },
+  "n": 9,
+  "total_target": 148,
+  "passed": 1,
+  "pass_at_1_pct": 11.11,
+  "wilson_ci_95_pct": [
+    1.99,
+    43.5
+  ],
+  "mean_tokens": 2724.2,
+  "mean_think_tokens": 2048.8,
+  "mean_decode_tok_s": 11.18,
+  "think_forced_pct": 100.0,
+  "think_unclosed_pct": 0.0,
+  "routing": {
+    "prefill_t1_pct": 58.3,
+    "prefill_t2_pct": 30.56,
+    "prefill_t3_pct": 11.13,
+    "prefill_4bit_pct": 88.87,
+    "decode_t1_pct": 43.54,
+    "decode_t2_pct": 35.69,
+    "decode_t3_pct": 20.77,
+    "decode_4bit_pct": 79.23,
+    "all_t1_pct": 44.76,
+    "all_t2_pct": 35.26,
+    "all_t3_pct": 19.98,
+    "all_4bit_pct": 80.02
+  },
+  "failure_breakdown": {
+    "assertion_fail": 3,
+    "pass": 1,
+    "runtime_error": 3,
+    "syntax_error": 1,
+    "timeout": 1
+  }
+}
