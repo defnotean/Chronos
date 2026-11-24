@@ -2,7 +2,7 @@
   "benchmark": "bigcode/bigcodebench-hard (v0.1.4 Instruct)",
   "model_version": "v8.5_748b_nvme_engram",
   "source_repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
-  "updated_at_utc": "2026-11-24T03:04:43.966260+00:00",
+  "updated_at_utc": "2026-11-24T04:42:20.777509+00:00",
   "status": "IN_PROGRESS",
   "settings": {
     "target_n": 148,
@@ -14,38 +14,38 @@
     "use_speculative": false,
     "max_seq_len": 131072
   },
-  "n": 82,
+  "n": 100,
   "total_target": 148,
-  "passed": 30,
-  "pass_at_1_pct": 36.59,
+  "passed": 35,
+  "pass_at_1_pct": 35.0,
   "wilson_ci_95_pct": [
-    26.98,
-    47.39
+    26.36,
+    44.75
   ],
-  "mean_tokens": 3020.4,
-  "mean_think_tokens": 2657.3,
-  "mean_decode_tok_s": 9.73,
-  "think_forced_pct": 65.85,
+  "mean_tokens": 3022.8,
+  "mean_think_tokens": 2660.8,
+  "mean_decode_tok_s": 9.76,
+  "think_forced_pct": 65.0,
   "think_unclosed_pct": 0.0,
   "routing": {
-    "prefill_t1_pct": 54.33,
-    "prefill_t2_pct": 32.03,
-    "prefill_t3_pct": 13.64,
-    "prefill_4bit_pct": 86.36,
-    "decode_t1_pct": 40.27,
-    "decode_t2_pct": 35.95,
-    "decode_t3_pct": 23.78,
-    "decode_4bit_pct": 76.22,
-    "all_t1_pct": 41.28,
-    "all_t2_pct": 35.67,
-    "all_t3_pct": 23.05,
-    "all_4bit_pct": 76.95
+    "prefill_t1_pct": 54.39,
+    "prefill_t2_pct": 31.98,
+    "prefill_t3_pct": 13.63,
+    "prefill_4bit_pct": 86.37,
+    "decode_t1_pct": 40.25,
+    "decode_t2_pct": 36.0,
+    "decode_t3_pct": 23.74,
+    "decode_4bit_pct": 76.26,
+    "all_t1_pct": 41.26,
+    "all_t2_pct": 35.72,
+    "all_t3_pct": 23.02,
+    "all_4bit_pct": 76.98
   },
   "failure_breakdown": {
-    "assertion_fail": 38,
-    "pass": 30,
+    "assertion_fail": 47,
+    "pass": 35,
     "timeout": 1,
     "truncated_code": 1,
-    "runtime_error": 12
+    "runtime_error": 16
   }
 }
