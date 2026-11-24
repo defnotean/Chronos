@@ -1,0 +1,70 @@
+{
+  "benchmark": "datacurve-ai/deep-swe v1.1 (Harbor)",
+  "model_version": "v8.5_748b_nvme_engram",
+  "source_repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "updated_at_utc": "2026-11-24T11:04:08.045754+00:00",
+  "settings": {
+    "max_new_tokens_per_turn": 4096,
+    "think_ceiling": 2048,
+    "reasoning_effort": "max",
+    "ablate_guards": true,
+    "temperature": 0.0,
+    "top_p": 0.95,
+    "step_limit": 120,
+    "max_context": 124000,
+    "max_seq_len": 131072,
+    "use_speculative": false,
+    "offline_isolation_mode": "unshare_r_net"
+  },
+  "offline_isolation_modes": [
+    "unshare_r_net"
+  ],
+  "total_scheduled": 113,
+  "completed": 1,
+  "passed": 1,
+  "pass_rate_pct": 100.0,
+  "wilson_ci_95_pct": [
+    20.65,
+    100.0
+  ],
+  "milestone25_completed": 1,
+  "milestone25_passed": 1,
+  "milestone25_pass_rate_pct": 100.0,
+  "milestone25_wilson_ci_95_pct": [
+    20.65,
+    100.0
+  ],
+  "mean_steps": 72.0,
+  "mean_elapsed_s": 8482.89,
+  "mean_decode_tok_s": 8.96,
+  "decode_nonzero_rows": 57242,
+  "spec_drafted": 0,
+  "spec_accepted": 0,
+  "spec_accept_rate": 0.0,
+  "routing": {
+    "prefill_t1_pct": 36.16,
+    "prefill_t2_pct": 34.93,
+    "prefill_t3_pct": 28.9,
+    "prefill_4bit_pct": 71.1,
+    "decode_t1_pct": 34.09,
+    "decode_t2_pct": 36.5,
+    "decode_t3_pct": 29.42,
+    "decode_4bit_pct": 70.58,
+    "all_t1_pct": 35.46,
+    "all_t2_pct": 35.47,
+    "all_t3_pct": 29.08,
+    "all_4bit_pct": 70.92
+  },
+  "submitted_count": 1,
+  "by_language": {
+    "go": {
+      "n": 1,
+      "passed": 1,
+      "pass_rate_pct": 100.0,
+      "wilson_ci_95_pct": [
+        20.65,
+        100.0
+      ]
+    }
+  }
+}
